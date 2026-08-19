@@ -34,3 +34,19 @@ Backlog-Retirement-Quote.)
 - **Konsument/Drain:** (a) Betreiber (env-Entscheid, eine Zeile in der
   MCP-Konfiguration); (b) nächste Wartungs-Session an diesem Repo. Drain
   beim Einbau oder Verwurf mit Ein-Zeilen-Begründung.
+
+## 2026-08-19 — searchMessages liefert ungekappte recipients-Listen; eine Trefferzeile kann 5+ KB wiegen
+
+- **Vorfall + Basis:** gleiche Session, Suche `Bergen` (maxResults 30): eine
+  einzelne Antwort ~44 KB (~11k Token), dominiert von Newsletter-Treffern,
+  deren `recipients`-Feld je 60–80 volle Adressen trägt (purusha.de-
+  Verteiler). Für die Suchentscheidung („relevant j/n") sind Betreff,
+  Absender, Datum, Preview nötig — die Empfängerliste fast nie.
+- **Klasse:** unbounded Feld in Listen-Antwort; Kosten skalieren mit fremdem
+  Verteilerverhalten statt mit dem Informationsbedarf des Suchenden.
+- **Vorformulierter Fix:** `recipients`/`ccList` in searchMessages-/
+  getRecentMessages-Zeilen serverseitig kappen (z. B. erste 3 Adressen +
+  `… (+N weitere)`), volle Listen weiterhin über getMessage; optional
+  Parameter `fullRecipients: true`.
+- **Konsument/Drain:** nächste Wartungs-Session an diesem Repo; Drain beim
+  Einbau oder Verwurf mit Ein-Zeilen-Begründung.
