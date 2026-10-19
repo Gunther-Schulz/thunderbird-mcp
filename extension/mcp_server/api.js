@@ -98,9 +98,12 @@ function ensureFreshConnectionInfo({
 const LISTENER_PROBE_TIMEOUT_MS = 3000;
 const LISTENER_PROBE_MAX_BYTES = 4096;
 
-function classifyListenerProbe({ observed, status, unproxied }) {
+function classifyListenerProbe({ observed, status, unproxied, completeHead }) {
   if (observed) return "ours";
-  if (unproxied === true && Number.isInteger(status) && status >= 100 && status <= 599) {
+  // Gecko substitutes 200 for missing/invalid status codes. Even a complete
+  // header event cannot distinguish those from a real 200, so keep that port.
+  if (completeHead === true && unproxied === true && Number.isInteger(status) &&
+      status >= 100 && status <= 599 && status !== 200) {
     return "foreign";
   }
   return "inconclusive";
@@ -112,10 +115,13 @@ function probeListenerOwnership({ server, port, NetUtil, generateNonce, startup 
   return new Promise((resolve) => {
     let channel = null;
     let timer = null;
+    let activityDistributor = null;
+    let activityObserver = null;
     let probePath = null;
     let observed = false;
     let status = null;
     let unproxied = false;
+    let completeHead = false;
     let receivedBytes = 0;
     let settled = false;
     const finish = (failed = false) => {
@@ -123,11 +129,12 @@ function probeListenerOwnership({ server, port, NetUtil, generateNonce, startup 
       settled = true;
       startup.cancelProbe = null;
       try { timer?.cancel(); } catch { failed = true; }
+      try { if (activityObserver) activityDistributor.removeObserver(activityObserver); } catch { failed = true; }
       try { channel?.cancel(Cr.NS_BINDING_ABORTED); } catch { failed = true; }
       try {
         if (probePath) server.registerPathHandler(probePath, null);
       } catch { failed = true; }
-      resolve(classifyListenerProbe({ observed, status: failed ? null : status, unproxied }));
+      resolve(classifyListenerProbe({ observed, status: failed ? null : status, unproxied, completeHead }));
     };
     startup.cancelProbe = () => finish(true);
     try {
@@ -156,6 +163,23 @@ function probeListenerOwnership({ server, port, NetUtil, generateNonce, startup 
       httpChannel.requestMethod = "GET";
       httpChannel.redirectionLimit = 0;
       httpChannel.setRequestHeader("Connection", "close", false);
+      activityDistributor = Cc["@mozilla.org/network/http-activity-distributor;1"].getService(Ci.nsIHttpActivityDistributor);
+      activityObserver = {
+        QueryInterface: ChromeUtils.generateQI(["nsIHttpActivityObserver"]),
+        isActive: true,
+        observeActivity(subject, type, subtype) {
+          if (settled || type !== Ci.nsIHttpActivityObserver.ACTIVITY_TYPE_HTTP_TRANSACTION ||
+              subtype !== Ci.nsIHttpActivityObserver.ACTIVITY_SUBTYPE_RESPONSE_HEADER) return;
+          try {
+            // nsHttpTransaction::ProcessData emits this after receiving the
+            // response head; Close's EOF repair does not. The event's text is
+            // normalized, so use its occurrence, not its reconstructed text.
+            if (subject.QueryInterface(Ci.nsIChannel) === channel) completeHead = true;
+          } catch { /* Unmatched activity supplies no evidence. */ }
+        },
+        observeConnectionActivity() {},
+      };
+      activityDistributor.addObserver(activityObserver);
       timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
       timer.initWithCallback(() => finish(), LISTENER_PROBE_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
       channel.asyncOpen({
@@ -200,7 +224,12 @@ function probeListenerOwnership({ server, port, NetUtil, generateNonce, startup 
             finish(true);
           }
         },
-        onStopRequest() { finish(); },
+        onStopRequest() {
+          // Activity delivery can trail onStopRequest. Keep the existing
+          // deadline for a possible foreign response without head evidence;
+          // the observer only records it, avoiding cleanup during delivery.
+          if (observed || completeHead || !unproxied || status === 200) finish();
+        },
       });
     } catch {
       finish(true);

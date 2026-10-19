@@ -7,6 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { HTTPD_PORT, createHttpdHarness } = require("./helpers/httpd.cjs");
 const REFRESH_TIMER_TYPE = 1;
+const HTTP_ACTIVITY = { ACTIVITY_TYPE_HTTP_TRANSACTION: 2, ACTIVITY_SUBTYPE_RESPONSE_HEADER: 0x5004 };
 
 // The existing marker loaders cover individual helpers, not start/status.
 // Load the complete production methods; only Thunderbird services are mocked.
@@ -29,6 +30,7 @@ function loadServerLifecycle(overrides = {}) {
     servers: [],
     timers: [],
     channels: [],
+    activityObservers: new Set(),
     nonce: 0,
     connectionWrites: [],
     pendingStops: [],
@@ -96,7 +98,7 @@ function loadServerLifecycle(overrides = {}) {
         bytesRead: 0, readSizes: [], responseStatusText: "OK",
         get responseStatus() {
           if (state.statusError) throw state.statusError;
-          return this.statusCode ?? (mode === "ours" ? 200 : 404);
+          return this.statusCode ?? state.responseStatus ?? (mode === "ours" ? 200 : 404);
         },
         get proxyInfo() {
           if (state.proxyError) throw state.proxyError;
@@ -123,6 +125,12 @@ function loadServerLifecycle(overrides = {}) {
         deliver(bytes) {
           this.listener.onDataAvailable(this, { bytes, channel: this }, this.bytesRead, bytes.length);
         },
+        reportResponseHead() {
+          for (const observer of state.activityObservers) {
+            observer.observeActivity(this, HTTP_ACTIVITY.ACTIVITY_TYPE_HTTP_TRANSACTION,
+              HTTP_ACTIVITY.ACTIVITY_SUBTYPE_RESPONSE_HEADER, 0, 0, "normalized headers");
+          }
+        },
         respond() {
           if (mode === "timeout") return;
           let body = "foreign response";
@@ -142,6 +150,7 @@ function loadServerLifecycle(overrides = {}) {
             this.handler({ path: url.pathname, method: this.requestMethod }, res);
           }
           if (mode !== "inconclusive") {
+            if (state.responseHeadReceived !== false) this.reportResponseHead();
             this.listener.onStartRequest(this);
             for (const chunk of state.bodyChunks || [body]) {
               if (!this.cancelled) this.deliver(chunk);
@@ -217,9 +226,25 @@ function loadServerLifecycle(overrides = {}) {
       nsIRequest: { LOAD_ANONYMOUS: 1, LOAD_BYPASS_CACHE: 2, INHIBIT_CACHING: 4, LOAD_FRESH_CONNECTION: 8 },
       nsIChannel: { LOAD_INITIAL_DOCUMENT_URI: 16 }, nsIHttpChannel: "http",
       nsIHttpChannelInternal: "httpInternal", nsIProxiedChannel: "proxy",
+      nsIHttpActivityObserver: HTTP_ACTIVITY, nsIHttpActivityDistributor: "activity",
     },
     Cr: { NS_BINDING_ABORTED: "aborted" },
     Cc: {
+      "@mozilla.org/network/http-activity-distributor;1": {
+        getService() {
+          if (state.activityServiceError) throw state.activityServiceError;
+          return {
+            addObserver(observer) {
+              if (state.activityAddError) throw state.activityAddError;
+              state.activityObservers.add(observer);
+            },
+            removeObserver(observer) {
+              state.activityObservers.delete(observer);
+              if (state.activityRemoveError) throw state.activityRemoveError;
+            },
+          };
+        },
+      },
       "@mozilla.org/network/file-output-stream;1": {
         createInstance: () => ({
           init() { if (state.writeError) throw state.writeError; },
@@ -328,10 +353,13 @@ describe("listener ownership classification", () => {
   for (const [name, evidence, expected] of [
     ["handler observation survives response failure", { observed: true }, "ours"],
     ["handler observation wins over a proxy", { observed: true, status: 200, unproxied: false }, "ours"],
-    ...[200, 302, 403, 404, 500].map(status => [`unproxied status ${status}`, { status, unproxied: true }, "foreign"]),
-    ["proxy", { status: 200, unproxied: false }, "inconclusive"],
-    ["unknown proxy state", { status: 200 }, "inconclusive"],
-    ...[undefined, null, 0, 99, 600, "200", NaN].map(status => [`missing/invalid status ${status}`, { status, unproxied: true }, "inconclusive"]),
+    ...[201, 302, 403, 404, 500].map(status => [`complete unproxied status ${status}`, { status, unproxied: true, completeHead: true }, "foreign"]),
+    ["possibly synthesized 200", { status: 200, unproxied: true, completeHead: true }, "inconclusive"],
+    ["missing head completion", { status: 404, unproxied: true }, "inconclusive"],
+    ["incomplete head", { status: 404, unproxied: true, completeHead: false }, "inconclusive"],
+    ["proxy", { status: 404, unproxied: false, completeHead: true }, "inconclusive"],
+    ["unknown proxy state", { status: 404, completeHead: true }, "inconclusive"],
+    ...[undefined, null, 0, 99, 600, "200", NaN].map(status => [`missing/invalid status ${status}`, { status, unproxied: true, completeHead: true }, "inconclusive"]),
   ]) {
     it(name, () => assert.equal(sandbox.classifyListenerProbe(evidence), expected));
   }
@@ -359,6 +387,123 @@ describe("post-bind listener ownership", () => {
       assert.notEqual(state.channels[0].url.pathname, state.channels[1].url.pathname);
     });
   }
+
+  // These fixtures model Gecko's normalized metadata and activity delivery,
+  // not a second implementation of its HTTP parser. Close() repairs missing
+  // terminators without emitting RESPONSE_HEADER; a version-only line becomes
+  // 200 even when a real header terminator was received by ProcessData().
+  for (const [name, responseStatus, responseHeadReceived] of [
+    ["version-only status line: HTTP/1.1\\r\\n\\r\\n", 200, true],
+    ["EOF-truncated status line: HTTP/1.1 404 Not Found", 404, false],
+    ["EOF-truncated response head: HTTP/1.1 404 Not Found\\r\\n", 404, false],
+    ["EOF-truncated version-only line: HTTP/1.1", 200, false],
+  ]) {
+    it(`keeps the port inconclusive after a ${name}`, async () => {
+      const { api, state } = loadServerLifecycle({
+        probeResult: port => port === 8765 ? "foreign" : "ours",
+        responseStatus, responseHeadReceived, bodyChunks: [],
+      });
+      const pending = api.start();
+      await new Promise(setImmediate);
+      if (!responseHeadReceived && responseStatus !== 200) {
+        assert.equal(state.connection, null);
+        state.timers[0].callback();
+      }
+      const result = await pending;
+      assert.equal(result.success, true);
+      assert.equal(result.port, 8765);
+      assert.deepEqual(state.servers[0].binds, [8765]);
+      assert.equal(state.servers[0].stops, 0);
+      assert.deepEqual(state.connectionWrites.map(info => info.port), [8765]);
+      assert.ok(state.logs.some(args => String(args[0]).includes("inconclusive on port 8765")));
+      assert.equal(state.activityObservers.size, 0);
+    });
+  }
+
+  for (const responseStatus of [201, 302, 403, 404, 500]) {
+    it(`advances after a complete ${responseStatus} response head without a body`, async () => {
+      const { api, state } = loadServerLifecycle({
+        probeResult: port => port === 8765 ? "foreign" : "ours",
+        responseStatus, bodyChunks: [],
+      });
+      assert.equal((await api.start()).port, 8766);
+      assert.deepEqual(state.servers[0].binds, [8765, 8766]);
+      assert.equal(state.servers[0].stops, 1);
+      assert.equal(state.activityObservers.size, 0);
+    });
+  }
+
+  it("keeps an unobserved complete 200 inconclusive because its status may be synthesized", async () => {
+    const { api, state } = loadServerLifecycle({
+      probeResult: port => port === 8765 ? "foreign" : "ours", responseStatus: 200,
+    });
+    assert.equal((await api.start()).port, 8765);
+    assert.deepEqual(state.servers[0].binds, [8765]);
+    assert.ok(state.channels[0].bytesRead > 0, "a body does not prove that a status code was present");
+    assert.ok(state.logs.some(args => String(args[0]).includes("inconclusive on port 8765")));
+  });
+
+  it("requires the head event to belong to this channel and response", async () => {
+    const { api, state } = loadServerLifecycle({ holdProbes: true, probeResult: "foreign", responseHeadReceived: false });
+    const pending = api.start();
+    const observer = [...state.activityObservers][0];
+    const channel = state.channels[0];
+    const type = HTTP_ACTIVITY.ACTIVITY_TYPE_HTTP_TRANSACTION;
+    const subtype = HTTP_ACTIVITY.ACTIVITY_SUBTYPE_RESPONSE_HEADER;
+    observer.observeActivity({ QueryInterface() { return this; } }, type, subtype);
+    observer.observeActivity({ QueryInterface() { throw new Error("not a channel"); } }, type, subtype);
+    observer.observeActivity(channel, type + 1, subtype);
+    observer.observeActivity(channel, type, subtype + 1);
+    channel.respond();
+    assert.equal(state.connection, null);
+    state.timers[0].callback();
+    assert.equal((await pending).port, 8765);
+    assert.ok(state.logs.some(args => String(args[0]).includes("inconclusive on port 8765")));
+    assert.equal(state.activityObservers.size, 0);
+    // A delayed event cannot revise a settled probe or its published port.
+    observer.observeActivity(channel, type, subtype);
+    assert.deepEqual(state.connectionWrites.map(info => info.port), [8765]);
+  });
+
+  it("accepts a matching head event delivered after onStartRequest", async () => {
+    const { api, state } = loadServerLifecycle({ holdProbes: true,
+      probeResult: port => port === 8765 ? "foreign" : "ours" });
+    const pending = api.start();
+    const channel = state.channels[0];
+    channel.listener.onStartRequest(channel);
+    channel.reportResponseHead();
+    channel.listener.onStopRequest(channel, 0);
+    await new Promise(setImmediate);
+    state.channels[1].respond();
+    assert.equal((await pending).port, 8766);
+    assert.equal(state.activityObservers.size, 0);
+  });
+
+  it("allows matching head activity to arrive after onStopRequest within the deadline", async () => {
+    const { api, state } = loadServerLifecycle({ holdProbes: true,
+      probeResult: port => port === 8765 ? "foreign" : "ours" });
+    const pending = api.start();
+    const channel = state.channels[0];
+    channel.listener.onStartRequest(channel);
+    channel.listener.onStopRequest(channel, 0);
+    assert.equal(state.connection, null);
+    assert.equal(state.activityObservers.size, 1);
+    channel.reportResponseHead();
+    assert.equal(state.activityObservers.size, 1, "do not remove observers during activity delivery");
+    state.timers[0].callback();
+    await new Promise(setImmediate);
+    state.channels[1].respond();
+    assert.equal((await pending).port, 8766);
+    assert.equal(state.activityObservers.size, 0);
+  });
+
+  it("accepts our handler observation without any response-head activity", async () => {
+    const { api, state } = loadServerLifecycle({ responseHeadReceived: false });
+    assert.equal((await api.start()).port, 8765);
+    assert.deepEqual(state.servers[0].binds, [8765]);
+    assert.ok(!state.logs.some(args => String(args[0]).includes("inconclusive")));
+    assert.equal(state.activityObservers.size, 0);
+  });
 
   it("uses anonymous, uncached, unredirected, fresh token-free requests", async () => {
     const { api, sandbox, state } = loadServerLifecycle();
@@ -394,7 +539,8 @@ describe("post-bind listener ownership", () => {
   }
 
   for (const property of ["nonceError", "handlerError", "channelError", "queryError", "asyncOpenError",
-    "probeTimerError", "probeTimerCancelError", "versionError", "statusError", "proxyError", "readError", "cancelError"]) {
+    "probeTimerError", "probeTimerCancelError", "versionError", "statusError", "proxyError", "readError", "cancelError",
+    "activityServiceError", "activityAddError", "activityRemoveError"]) {
     it(`keeps the bound port after ${property}`, async () => {
       const { api, state } = loadServerLifecycle({ probeResult: "foreign", [property]: new Error(property) });
       assert.equal((await api.start()).success, true);
@@ -403,6 +549,7 @@ describe("post-bind listener ownership", () => {
       assert.equal(state.connection.port, 8765);
       assert.deepEqual([...state.servers[0].handlers.keys()], ["/"]);
       assert.ok(state.logs.some(args => String(args[0]).includes("inconclusive")));
+      assert.equal(state.activityObservers.size, 0);
     });
   }
 
@@ -440,15 +587,22 @@ describe("post-bind listener ownership", () => {
     assert.equal(channel.bytesRead, 0);
     assert.strictEqual(state.connection, connection);
     assert.equal(state.servers[0].stops, 0);
+    assert.equal(state.activityObservers.size, 0);
   });
 
   it("does not let an earlier attempt's handler or events claim the next port", async () => {
     const { api, state } = loadServerLifecycle({ holdProbes: true, probeResult: "foreign" });
     const pending = api.start();
     const first = state.channels[0];
+    const firstObserver = [...state.activityObservers][0];
     first.respond();
     await new Promise(setImmediate);
     assert.equal(state.channels.length, 2);
+    const secondObserver = [...state.activityObservers][0];
+    firstObserver.observeActivity(state.channels[1], HTTP_ACTIVITY.ACTIVITY_TYPE_HTTP_TRANSACTION,
+      HTTP_ACTIVITY.ACTIVITY_SUBTYPE_RESPONSE_HEADER);
+    secondObserver.observeActivity(first, HTTP_ACTIVITY.ACTIVITY_TYPE_HTTP_TRANSACTION,
+      HTTP_ACTIVITY.ACTIVITY_SUBTYPE_RESPONSE_HEADER);
     first.handler({ path: first.url.pathname, method: "GET" }, { setStatusLine() {}, setHeader() {}, write() {} });
     first.listener.onStopRequest(first, 0);
     state.timers[0].callback();
@@ -528,6 +682,7 @@ describe("post-bind listener ownership", () => {
     assert.equal(state.channels[0].cancelled, true);
     assert.equal(state.servers[0].listening, false);
     assert.equal(state.connectionWrites.length, 0);
+    assert.equal(state.activityObservers.size, 0);
     assert.equal((await api.getServerInfo()).running, false);
     state.channels[0].respond();
     assert.equal((await api.getServerInfo()).running, false);
