@@ -210,6 +210,7 @@ function loadServerLifecycle(overrides = {}) {
       io: { newURI() { throw { name: "NS_ERROR_FILE_NOT_FOUND" }; } },
       dirsvc: {
         get: (key) => {
+          if (state.profileDirs?.[key]) return state.profileDirs[key];
           if (key !== "TmpD") throw new Error("Directory unavailable");
           return {
             append() {},
@@ -391,6 +392,68 @@ describe("post-bind listener ownership", () => {
       assert.deepEqual(state.connectionWrites.map(info => info.port), [8766]);
       assert.deepEqual([...state.servers[0].handlers.keys()], ["/"]);
       assert.notEqual(state.channels[0].url.pathname, state.channels[1].url.pathname);
+    });
+  }
+
+  for (const oversized of [false, true]) {
+    it(`publishes and refreshes profile metadata only for the final listener (${oversized ? "oversized root" : "normal roots"})`, async () => {
+      const roots = {
+        ProfD: `C:/profiles/${oversized ? "郵".repeat(1600) : "Łukasz"}`,
+        DefProfRt: "D:/Thunderbird/Profiles",
+      };
+      // Immutable profile files follow the directory-service mock pattern in
+      // write-connection-info-windows.test.cjs; real profile helpers run below.
+      const profileDirs = Object.fromEntries(Object.entries(roots).map(([key, root]) => [key, {
+        path: root, target: root, parent: null,
+        clone() { return { ...this }; },
+        normalize() {},
+        isReadable() { return true; },
+      }]));
+      const { api, state } = loadServerLifecycle({
+        profileDirs, holdProbes: true, holdStops: true,
+        probeResult: port => port === 8765 ? "foreign" : "ours",
+      });
+      const pending = api.start();
+      assert.deepEqual(state.connectionWrites, []);
+      state.channels[0].respond();
+      await new Promise(setImmediate);
+      assert.deepEqual(state.servers[0].binds, [8765]);
+      assert.equal(state.pendingStops.length, 1);
+      assert.deepEqual(state.connectionWrites, [], "do not publish the rejected port while stopping");
+      state.pendingStops.shift()();
+      await new Promise(setImmediate);
+      assert.deepEqual(state.servers[0].binds, [8765, 8766]);
+      assert.deepEqual(state.connectionWrites, [], "do not publish before the final probe settles");
+      assert.equal(state.timers.filter(timer => timer.type === REFRESH_TIMER_TYPE).length, 0);
+      state.channels[1].respond();
+      assert.equal((await pending).port, 8766);
+
+      const expected = {
+        port: 8766, token: "a".repeat(64), pid: 4242,
+        profileRoots: oversized ? [roots.DefProfRt] : Object.values(roots),
+      };
+      assert.deepEqual(state.connectionWrites, [expected]);
+      assert.deepEqual(state.connection, expected);
+      const refresh = state.timers.find(timer => timer.type === REFRESH_TIMER_TYPE);
+      refresh.callback();
+      assert.equal(state.connectionWrites.length, 1, "matching metadata must not cause a refresh write");
+
+      for (const stale of [
+        null,
+        { ...expected, port: 8765 },
+        { ...expected, profileRoots: undefined },
+        { ...expected, profileRoots: ["C:/stale-profile"] },
+      ]) {
+        const writes = state.connectionWrites.length;
+        state.connection = stale;
+        refresh.callback();
+        assert.equal(state.connectionWrites.length, writes + 1);
+        assert.deepEqual(state.connection, expected);
+      }
+      assert.deepEqual(state.connectionWrites, Array(5).fill(expected));
+      assert.ok(state.connectionWrites.every(info => Buffer.byteLength(JSON.stringify(info)) <= 4096));
+      refresh.callback();
+      assert.equal(state.connectionWrites.length, 5, "bounded metadata remains stable after refresh");
     });
   }
 

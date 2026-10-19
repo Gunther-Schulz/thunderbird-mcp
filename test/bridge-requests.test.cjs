@@ -352,7 +352,7 @@ describe('bridge response envelopes', () => {
       const { runtime, requests } = loadRequests({ candidates: 2 });
       const pending = runtime.forwardToThunderbird(toolCall('saveDraft'));
       finishResponse(requests[0], reply);
-      await assert.rejects(pending, /port 8765.*something that is not Thunderbird MCP/);
+      await assert.rejects(pending, new RegExp(`port ${runtime.cachedCandidateList[0].data.port}.*something that is not Thunderbird MCP`));
       assert.equal(requests.length, 1);
     });
   }
@@ -361,7 +361,7 @@ describe('bridge response envelopes', () => {
     const { runtime, requests } = loadRequests({ candidates: 2 });
     const pending = runtime.forwardToThunderbird({ ...toolCall('listFolders'), id: '0' });
     finishResponse(requests[0], { jsonrpc: '2.0', id: 0, result: {} });
-    await assert.rejects(pending, /port 8765.*something that is not Thunderbird MCP/);
+    await assert.rejects(pending, new RegExp(`port ${runtime.cachedCandidateList[0].data.port}.*something that is not Thunderbird MCP`));
     assert.equal(requests.length, 1);
   });
 
@@ -372,7 +372,7 @@ describe('bridge response envelopes', () => {
     res.emit('data', Buffer.from('<html>private reply contents</html>'));
     res.emit('end');
     await assert.rejects(pending, (error) => {
-      assert.match(error.message, /port 8765.*something that is not Thunderbird MCP.*invalid JSON/);
+      assert.match(error.message, new RegExp(`port ${runtime.cachedCandidateList[0].data.port}.*something that is not Thunderbird MCP.*invalid JSON`));
       assert.doesNotMatch(error.message, /private reply contents/);
       return true;
     });
@@ -400,7 +400,7 @@ describe('bridge response envelopes', () => {
     const res = response(requests[0], { complete: true });
     res.emit('data', Buffer.from('needs sanitizing'));
     res.emit('end');
-    await assert.rejects(pending, /port 8765.*something that is not Thunderbird MCP/);
+    await assert.rejects(pending, new RegExp(`port ${runtime.cachedCandidateList[0].data.port}.*something that is not Thunderbird MCP`));
     assert.equal(requests.length, 1);
   });
 
@@ -412,7 +412,7 @@ describe('bridge response envelopes', () => {
     await new Promise(setImmediate);
     assert.equal(requests.length, 2);
     finishResponse(requests[1], { error: 'not a JSON-RPC response' });
-    await assert.rejects(pending, /port 8766.*something that is not Thunderbird MCP/);
+    await assert.rejects(pending, new RegExp(`port ${runtime.cachedCandidateList[1].data.port}.*something that is not Thunderbird MCP`));
     assert.equal(requests.length, 2);
   });
 });
