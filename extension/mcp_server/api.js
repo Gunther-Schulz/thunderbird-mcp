@@ -733,7 +733,13 @@ const _tempAttachFiles = new Set();
 // original message never bind two observers to the same compose window
 // (which would double-inject the body/attachments).
 // WeakSet so entries are collected automatically when the window is destroyed.
+// BEGIN COMPOSE WINDOW CLAIM STATE
 const _claimedComposeWindows = new WeakSet();
+// Native forwards create their own compose params asynchronously. Allow only
+// one unclaimed opening per type, including a bounded recovery period for an
+// abandoned opening. Exact header tokens keep late windows ineligible afterward.
+const _composeWindowOpenClaims = new Map();
+// END COMPOSE WINDOW CLAIM STATE
 // BEGIN INLINE ATTACHMENT BASE64 HELPERS
 // Require canonical RFC 4648 base64: complete quartets with padding only in
 // the final quartet. In particular, do not silently discard invalid bytes.
@@ -4023,7 +4029,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Converts attachment descriptors to nsIMsgAttachment objects.
              * Shared by the new-compose path (composeFields.addAttachment),
              * the reply/forward observer path (addAttachmentsToComposeWindow),
-             * and sendMessageDirectly (headless send).
+             * sendThroughCompose (windowless send) and sendMessageDirectly (drafts).
              */
             // BEGIN NATIVE ATTACHMENT CONVERSION
             function descsToMsgAttachments(attachDescs) {
@@ -4267,9 +4273,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN COMPOSE OPEN DISPATCH
             function shouldUseDirectComposeOpen(compType) {
               return compType === Ci.nsIMsgCompType.ForwardInline;
             }
+            // END COMPOSE OPEN DISPATCH
 
             /**
              * Saves an open compose window to the identity's Drafts folder via
@@ -4380,164 +4388,264 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // END COMPOSE WINDOW DRAFT HELPER
 
-            function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs, afterInsert) {
-              return new Promise((resolve) => {
-                const OPEN_TIMEOUT_MS = shouldUseDirectComposeOpen(compType) ? 60000 : 15000;
-                let settled = false;
-                let matchedWindow = null;
-                let pendingStateListener = null;
-                let pendingStateCompose = null;
+            // BEGIN COMPOSE WINDOW OPEN HELPER
+            function createComposeWindowHeader(originalHeader) {
+              // libmime preserves origMsgHdr in the new window's compose params.
+              // A distinct JS implementation supplies a per-opening token without
+              // changing the message URI, identity, or any header data. Keep our
+              // own QI: returning the native header would discard that identity.
+              const header = new Proxy({ QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]) }, {
+                get(target, property) {
+                  if (property === "QueryInterface") return target.QueryInterface;
+                  if (property === "wrappedJSObject") return header;
+                  const value = originalHeader[property];
+                  return typeof value === "function" ? value.bind(originalHeader) : value;
+                },
+                set(_target, property, value) {
+                  originalHeader[property] = value;
+                  return true;
+                },
+              });
+              return header;
+            }
 
-                const finish = (result) => {
-                  if (settled) return;
-                  settled = true;
-                  try { Services.ww.unregisterNotification(windowObserver); } catch {}
-                  try { timeout.cancel(); } catch {}
-                  // Unregister any dangling state listener so a late
-                  // NotifyComposeBodyReady cannot mutate the compose window
-                  // after we have already resolved (e.g. after a timeout).
-                  if (pendingStateListener && pendingStateCompose) {
-                    try { pendingStateCompose.UnregisterStateListener(pendingStateListener); } catch {}
-                  }
-                  pendingStateListener = null;
-                  pendingStateCompose = null;
-                  resolve(result);
-                };
+            async function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs, afterInsert) {
+              const nativeOpen = shouldUseDirectComposeOpen(compType);
+              let releaseOpen = null;
+              let nativeOpenStarted = false;
+              let recovering = false;
+              try {
+                if (nativeOpen) {
+                  const previousOpen = _composeWindowOpenClaims.get(compType);
+                  let resolveOpen;
+                  const pendingOpen = new Promise(resolve => { resolveOpen = resolve; });
+                  _composeWindowOpenClaims.set(compType, pendingOpen);
+                  releaseOpen = () => {
+                    resolveOpen();
+                    if (_composeWindowOpenClaims.get(compType) === pendingOpen) {
+                      _composeWindowOpenClaims.delete(compType);
+                    }
+                    releaseOpen = null;
+                  };
+                  if (previousOpen) await previousOpen;
+                }
+                return await new Promise((resolve) => {
+                  const OPEN_TIMEOUT_MS = nativeOpen ? 60000 : 15000;
+                  const RECOVERY_TIMEOUT_MS = 15000;
+                  const COMPOSE_INIT_EVENT = "compose-window-init";
+                  let settled = false;
+                  let matchedWindow = null;
+                  let pendingStateListener = null;
+                  let pendingStateCompose = null;
+                  let recoveryTimer = null;
+                  const openingHeader = nativeOpen ? createComposeWindowHeader(msgComposeParams.origMsgHdr) : null;
+                  const initListeners = new Map();
 
-                const timeout = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                timeout.initWithCallback({
-                  notify() {
-                    finish({ error: "Timed out waiting for compose window" });
-                  }
-                }, OPEN_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+                  const ownsNativeWindow = win => {
+                    const header = win?.arguments?.[0]?.origMsgHdr;
+                    return (header?.wrappedJSObject || header) === openingHeader;
+                  };
 
-                const maybeCustomizeWindow = (composeWin) => {
-                  try {
-                    if (!composeWin || composeWin === matchedWindow) return;
-                    if (composeWin.document?.documentElement?.getAttribute("windowtype") !== "msgcompose") return;
-                    if (!composeWin.gMsgCompose) return;
-                    if (composeWin.gMsgCompose.originalMsgURI !== originalMsgURI) return;
-                    if (composeWin.gComposeType !== compType) return;
-                    // When two callers reply to the same message concurrently,
-                    // both observers see both compose windows. Skip any window
-                    // that has already been claimed by a prior observer so each
-                    // call binds to exactly one compose window.
-                    if (_claimedComposeWindows.has(composeWin)) return;
-                    _claimedComposeWindows.add(composeWin);
-
-                    matchedWindow = composeWin;
+                  const stopObserving = () => {
                     try { Services.ww.unregisterNotification(windowObserver); } catch {}
+                    for (const [win, listener] of initListeners) {
+                      try { win.removeEventListener(COMPOSE_INIT_EVENT, listener, true); } catch {}
+                    }
+                    initListeners.clear();
+                  };
 
-                    const stateListener = {
-                      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
-                      NotifyComposeFieldsReady() {},
-                      ComposeProcessDone() {},
-                      SaveInFolderDone() {},
-                      NotifyComposeBodyReady() {
-                        // Guard against a late body-ready firing after the
-                        // caller already timed out -- don't mutate the compose
-                        // window once the promise is settled.
-                        if (settled) {
-                          try { composeWin.gMsgCompose.UnregisterStateListener(stateListener); } catch {}
-                          return;
-                        }
+                  const completeOpening = () => {
+                    stopObserving();
+                    try { recoveryTimer?.cancel(); } catch {}
+                    recoveryTimer = null;
+                    recovering = false;
+                    if (releaseOpen) releaseOpen();
+                  };
 
-                        try {
-                          composeWin.gMsgCompose.UnregisterStateListener(stateListener);
-                        } catch {}
-                        pendingStateListener = null;
-                        pendingStateCompose = null;
+                  const finish = (result) => {
+                    if (settled) return;
+                    settled = true;
+                    try { timeout.cancel(); } catch {}
+                    // Unregister any dangling state listener so a late
+                    // NotifyComposeBodyReady cannot mutate the compose window
+                    // after we have already resolved (e.g. after a timeout).
+                    if (pendingStateListener && pendingStateCompose) {
+                      try { pendingStateCompose.UnregisterStateListener(pendingStateListener); } catch {}
+                    }
+                    pendingStateListener = null;
+                    pendingStateCompose = null;
+                    if (nativeOpenStarted && !matchedWindow) {
+                      // The opener may still produce a window. Drain its init or
+                      // close notification before opening the next review, but
+                      // never block the queue indefinitely. Its unique header
+                      // keeps it ineligible even after this recovery period.
+                      recovering = true;
+                      try {
+                        recoveryTimer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                        recoveryTimer.initWithCallback({ notify: completeOpening }, RECOVERY_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+                      } catch {
+                        completeOpening();
+                      }
+                    } else {
+                      completeOpening();
+                    }
+                    resolve(result);
+                  };
 
-                        try {
-                          applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc);
-                          insertReplyBodyIntoComposeWindow(composeWin, body, isHtml);
-                          addAttachmentsToComposeWindow(composeWin, attachDescs);
-                          if (typeof afterInsert === "function") {
-                            // The follow-up step owns its own timeout; stop the
-                            // open timeout so it cannot fire mid-step.
-                            try { timeout.cancel(); } catch {}
-                            Promise.resolve(afterInsert(composeWin))
-                              .then(finish)
-                              .catch((e) => finish({ error: e.toString() }));
-                          } else {
-                            finish({ success: true });
+                  const timeout = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timeout.initWithCallback({
+                    notify() {
+                      finish({ error: "Timed out waiting for compose window" });
+                    }
+                  }, OPEN_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+
+                  const maybeCustomizeWindow = (composeWin) => {
+                    try {
+                      if ((settled && !recovering) || matchedWindow || !composeWin) return;
+                      if (composeWin.document?.documentElement?.getAttribute("windowtype") !== "msgcompose") return;
+                      if (!composeWin.gMsgCompose) return;
+                      if (composeWin.gMsgCompose.originalMsgURI !== originalMsgURI) return;
+                      if (composeWin.gComposeType !== compType) return;
+                      // Replies retain our exact fields object. URI and type alone
+                      // cannot distinguish concurrent replies to the same message.
+                      // Native forwards preserve our per-opening header wrapper.
+                      if (!nativeOpen && composeWin.gMsgCompose.compFields !== msgComposeParams.composeFields) return;
+                      if (nativeOpen && !ownsNativeWindow(composeWin)) return;
+                      // When two callers reply to the same message concurrently,
+                      // both observers see both compose windows. Skip any window
+                      // that has already been claimed by a prior observer so each
+                      // call binds to exactly one compose window.
+                      if (_claimedComposeWindows.has(composeWin)) return;
+                      _claimedComposeWindows.add(composeWin);
+
+                      matchedWindow = composeWin;
+                      // Ownership is now fixed; the next native forward may open
+                      // while this window is still waiting for its body/editor.
+                      completeOpening();
+                      // A late abandoned window is left untouched for the user.
+                      // It is claimed permanently, but receives no customization.
+                      if (settled) return;
+
+                      const stateListener = {
+                        QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+                        NotifyComposeFieldsReady() {},
+                        ComposeProcessDone() {},
+                        SaveInFolderDone() {},
+                        NotifyComposeBodyReady() {
+                          // Guard against a late body-ready firing after the
+                          // caller already timed out -- don't mutate the compose
+                          // window once the promise is settled.
+                          if (settled) {
+                            try { composeWin.gMsgCompose.UnregisterStateListener(stateListener); } catch {}
+                            return;
                           }
-                        } catch (e) {
-                          finish({ error: e.toString() });
-                        }
-                      },
-                    };
 
-                    pendingStateListener = stateListener;
-                    pendingStateCompose = composeWin.gMsgCompose;
-                    composeWin.gMsgCompose.RegisterStateListener(stateListener);
+                          try {
+                            composeWin.gMsgCompose.UnregisterStateListener(stateListener);
+                          } catch {}
+                          pendingStateListener = null;
+                          pendingStateCompose = null;
+
+                          try {
+                            applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc);
+                            insertReplyBodyIntoComposeWindow(composeWin, body, isHtml);
+                            addAttachmentsToComposeWindow(composeWin, attachDescs);
+                            if (typeof afterInsert === "function") {
+                              // The follow-up step owns its own timeout; stop the
+                              // open timeout so it cannot fire mid-step.
+                              try { timeout.cancel(); } catch {}
+                              Promise.resolve(afterInsert(composeWin))
+                                .then(finish)
+                                .catch((e) => finish({ error: e.toString() }));
+                            } else {
+                              finish({ success: true });
+                            }
+                          } catch (e) {
+                            finish({ error: e.toString() });
+                          }
+                        },
+                      };
+
+                      pendingStateListener = stateListener;
+                      pendingStateCompose = composeWin.gMsgCompose;
+                      composeWin.gMsgCompose.RegisterStateListener(stateListener);
+                    } catch (e) {
+                      finish({ error: e.toString() });
+                    }
+                  };
+
+                  const windowObserver = {
+                    observe(subject, topic) {
+                      if ((settled && !recovering) || matchedWindow) return;
+                      const composeWin = subject;
+                      if (nativeOpen && topic === "domwindowclosed") {
+                        try {
+                          if (ownsNativeWindow(composeWin)) {
+                            _claimedComposeWindows.add(composeWin);
+                            matchedWindow = composeWin;
+                            completeOpening();
+                            finish({ error: "Compose window closed before initialization" });
+                          }
+                        } catch {}
+                        return;
+                      }
+                      if (topic !== "domwindowopened") return;
+                      if (!composeWin || typeof composeWin.addEventListener !== "function") return;
+
+                      // Thunderbird dispatches a non-bubbling compose-window-init event
+                      // from MsgComposeCommands.js after gMsgCompose is initialized and
+                      // the built-in state listener is registered, but before editor
+                      // creation begins. Capturing it on the window lets us register our
+                      // own ComposeBodyReady listener for the specific reply window
+                      // without relying on getMostRecentWindow("msgcompose").
+                      const onInit = () => {
+                        initListeners.delete(composeWin);
+                        maybeCustomizeWindow(composeWin);
+                      };
+                      initListeners.set(composeWin, onInit);
+                      composeWin.addEventListener(COMPOSE_INIT_EVENT, onInit, { once: true, capture: true });
+                    },
+                  };
+
+                  try {
+                    Services.ww.registerNotification(windowObserver);
+                    const msgComposeService = MailServices.compose || Cc["@mozilla.org/messengercompose;1"]
+                      .getService(Ci.nsIMsgComposeService);
+                    if (nativeOpen) {
+                      // Native inline-forward body/attachment population only runs through OpenComposeWindow.
+                      nativeOpenStarted = true;
+                      msgComposeService.OpenComposeWindow(
+                        null,
+                        openingHeader,
+                        originalMsgURI,
+                        compType,
+                        msgComposeParams.format,
+                        identity,
+                        identity?.email || "",
+                        null
+                      );
+                    } else {
+                      msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+                    }
                   } catch (e) {
                     finish({ error: e.toString() });
                   }
-                };
-
-                const windowObserver = {
-                  observe(subject, topic) {
-                    if (topic !== "domwindowopened") return;
-                    const composeWin = subject;
-                    if (!composeWin || typeof composeWin.addEventListener !== "function") return;
-
-                    // Thunderbird dispatches a non-bubbling compose-window-init event
-                    // from MsgComposeCommands.js after gMsgCompose is initialized and
-                    // the built-in state listener is registered, but before editor
-                    // creation begins. Capturing it on the window lets us register our
-                    // own ComposeBodyReady listener for the specific reply window
-                    // without relying on getMostRecentWindow("msgcompose").
-                    composeWin.addEventListener("compose-window-init", () => {
-                      maybeCustomizeWindow(composeWin);
-                    }, { once: true, capture: true });
-                  },
-                };
-
-                try {
-                  Services.ww.registerNotification(windowObserver);
-                  const msgComposeService = MailServices.compose || Cc["@mozilla.org/messengercompose;1"]
-                    .getService(Ci.nsIMsgComposeService);
-                  if (shouldUseDirectComposeOpen(compType)) {
-                    // Native inline-forward body/attachment population only runs through OpenComposeWindow.
-                    msgComposeService.OpenComposeWindow(
-                      null,
-                      msgComposeParams.origMsgHdr,
-                      originalMsgURI,
-                      compType,
-                      msgComposeParams.format,
-                      identity,
-                      identity?.email || "",
-                      null
-                    );
-                  } else {
-                    msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-                  }
-                } catch (e) {
-                  finish({ error: e.toString() });
-                }
-              });
+                });
+              } finally {
+                // Abandoned native openings release their queue slot when the
+                // late window resolves or the bounded recovery timer expires.
+                if (releaseOpen && !recovering) releaseOpen();
+              }
             }
-
-            function markMessageDispositionState(msgHdr, dispositionState) {
-              try {
-                const folder = msgHdr?.folder;
-                if (!folder || dispositionState == null) return false;
-                if (typeof folder.addMessageDispositionState === "function") {
-                  folder.addMessageDispositionState(msgHdr, dispositionState);
-                  return true;
-                }
-                if (typeof folder.AddMessageDispositionState === "function") {
-                  folder.AddMessageDispositionState(msgHdr, dispositionState);
-                  return true;
-                }
-              } catch {}
-              return false;
-            }
+            // END COMPOSE WINDOW OPEN HELPER
 
             /**
-             * Sends a message directly via nsIMsgSend without opening a compose window.
-             * Used by composeMail, replyToMessage, forwardMessage when skipReview=true.
+             * Saves a message directly via nsIMsgSend without opening a compose window.
+             * Used by saveDraft. Sending goes through sendThroughCompose instead.
+             *
+             * Drafts stay on nsIMsgSend because replacing a draft needs msgToReplace,
+             * which nsMsgCompose::SendMsgToServer always passes as null (the compose
+             * window deletes the old draft itself after saving).
              *
              * Handles two createAndSendMessage signatures:
              * - TB 102-127 (C++): 18 args, includes aAttachments + aPreloadedAttachments
@@ -4723,6 +4831,147 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             // END DIRECT SEND HELPER
+
+            /**
+             * Sends a message without opening a compose window, through the same
+             * windowless nsIMsgCompose lifecycle the compose window uses. Used by
+             * sendMail, replyToMessage and forwardMessage when skipReview=true.
+             *
+             * Going through nsIMsgCompose rather than a bare nsIMsgSend matters for
+             * accounts whose provider replaces the sender: nsMsgCompose::SendMsgToServer
+             * notifies "mail-set-sender" before it creates the default nsIMsgSend, and
+             * Exchange providers such as Owl supply their own sender there. A bare
+             * nsIMsgSend skips that, so mail from such an identity went out through
+             * the default SMTP server of another account. nsIMsgCompose also builds
+             * From with MakeMimeAddress, applies the identity's Organization, Reply-To
+             * and auto Cc/Bcc, and marks the original replied/forwarded on success
+             * (ProcessReplyFlags).
+             *
+             * sendMsg dropped its nsIMsgWindow argument after TB 140. Passing null for
+             * both trailing arguments fits the old five-argument and the new
+             * four-argument signature.
+             *
+             * Based on #229 by Kieran Hannigan.
+             */
+            // BEGIN COMPOSE SEND HELPER
+            function sendThroughCompose(msgComposeParams, attachDescs, useHtml) {
+              const identity = msgComposeParams.identity;
+              if (!identity) {
+                return Promise.resolve({ error: "No identity available for direct send" });
+              }
+
+              const SEND_TIMEOUT_MS = 120000; // 2 min safety timeout
+
+              return new Promise((resolve) => {
+                let msgCompose = null;
+                let sendListener = null;
+                let stateListener = null;
+                let settled = false;
+                let timer = null;
+                const settle = (result) => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer?.cancel(); } catch {}
+                  if (msgCompose && stateListener) {
+                    try { msgCompose.UnregisterStateListener(stateListener); } catch {}
+                  }
+                  if (msgCompose && sendListener) {
+                    try { msgCompose.removeMsgSendListener(sendListener); } catch {}
+                  }
+                  // nsIMsgCompose retains send listeners strongly and is not
+                  // cycle-collected. Break both registrations and the closure's
+                  // ownership, including when a late callback is still queued.
+                  stateListener = null;
+                  sendListener = null;
+                  msgCompose = null;
+                  timer = null;
+                  resolve(result);
+                };
+
+                try {
+                  // Before Thunderbird 153, this armed timer's closure (through
+                  // settle) is the only strong owner of msgCompose after delivery
+                  // starts. Keep it alive until the send outcome settles.
+                  timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timer.initWithCallback({
+                    notify() {
+                      settle({ error: "Send timed out after 120s. The outcome is unknown; check Sent and the Outbox before retrying." });
+                    }
+                  }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+
+                  for (const att of descsToMsgAttachments(attachDescs)) {
+                    msgComposeParams.composeFields.addAttachment(att);
+                  }
+
+                  const accountKey = MailServices.accounts.accounts.find(account =>
+                    account.identities.some(id => id.key === identity.key)
+                  )?.key;
+                  if (typeof accountKey !== "string" || !accountKey.trim()) {
+                    throw new Error("Cannot send: the identity's owning account key could not be resolved");
+                  }
+
+                  // Initialize accepts explicit formats even for ForwardInline.
+                  // Use the same decision that shaped the body, rather than
+                  // re-reading identity defaults when choosing the MIME type.
+                  msgComposeParams.format = useHtml ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.PlainText;
+                  msgCompose = Cc["@mozilla.org/messengercompose/compose;1"]
+                    .createInstance(Ci.nsIMsgCompose);
+                  msgCompose.initialize(msgComposeParams, null, null);
+
+                  // A send is done once the message is delivered. The Sent copy
+                  // runs afterwards and can stall on a recovery prompt or fail, and
+                  // reporting that as a failed send would invite a retry that
+                  // delivers the message twice.
+                  sendListener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
+                    onStartSending() {},
+                    onSendProgress() {},
+                    onStatus() {},
+                    onGetDraftFolderURI() {},
+                    onStopSending(msgID, status) {
+                      if (Components.isSuccessCode(status)) {
+                        settle({ success: true, message: "Message sent" });
+                      } else {
+                        settle({ error: `Send failed (status: 0x${(status >>> 0).toString(16)})` });
+                      }
+                    },
+                    onSendNotPerformed() {
+                      settle({ error: "Send was not performed" });
+                    },
+                    onTransportSecurityError(msgID, status, secInfo, location) {
+                      settle({ error: `Transport security error${location ? ": " + location : ""}` });
+                    },
+                  };
+                  msgCompose.addMsgSendListener(sendListener);
+
+                  // ComposeProcessDone is the final notification for every outcome.
+                  // It reports failures the send listener did not see; a success
+                  // here only follows delivery.
+                  stateListener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+                    NotifyComposeFieldsReady() {},
+                    NotifyComposeBodyReady() {},
+                    SaveInFolderDone() {},
+                    ComposeProcessDone(result) {
+                      if (Components.isSuccessCode(result)) {
+                        settle({ success: true, message: "Message sent" });
+                      } else {
+                        settle({ error: `Send failed (status: 0x${(result >>> 0).toString(16)})` });
+                      }
+                    },
+                  };
+                  msgCompose.RegisterStateListener(stateListener);
+
+                  const sendPromise = msgCompose.sendMsg(Ci.nsIMsgCompDeliverMode.Now, identity, accountKey, null, null);
+                  if (sendPromise && typeof sendPromise.then === "function") {
+                    sendPromise.catch(e => settle({ error: e.toString() }));
+                  }
+                } catch (e) {
+                  settle({ error: e.toString() });
+                }
+              });
+            }
+            // END COMPOSE SEND HELPER
 
             function escapeHtml(s) {
               return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -5174,9 +5423,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *
              * Thunderbird inserts signatures from its compose window only
              * (gMsgCompose reads htmlSigText/sig_file and honours sig_bottom).
-             * The createAndSendMessage path behind saveDraft and skipReview
-             * sends never opens that window, so without this the message ships
-             * with no signature at all. New messages carry no quote, so
+             * Neither saveDraft's nsIMsgSend nor skipReview's windowless
+             * nsIMsgCompose has an editor to insert a signature, so new mail
+             * and drafts append it here. New messages carry no quote, so
              * sig_bottom does not apply: the signature always goes last.
              *
              * Returns "" when the identity has no signature.
@@ -5231,7 +5480,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * mode, and returns the matching msgComposeParams.format value.
              *
              * The caller's explicit isHtml wins (true/false). When isHtml is
-             * omitted, the identity's compose-format preference is consulted.
+             * omitted or null, the identity's compose-format preference is consulted.
              *
              * ForwardInline is a special case: Thunderbird's compose service
              * only passes format through when it's Default or OppositeOfDefault
@@ -5241,6 +5490,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *
              * Identity must be resolved (setComposeIdentity) before calling this.
              */
+            // BEGIN COMPOSE FORMAT HELPER
             function resolveComposeFormat(identity, isHtml, compType) {
               const identityUsesHtml = identity?.composeHtml !== false;
               const useHtml = isHtml === true || (isHtml !== false && identityUsesHtml);
@@ -5248,7 +5498,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                              || compType === Ci.nsIMsgCompType.ForwardAsAttachment;
 
               let format;
-              if (isHtml === undefined) {
+              if (isHtml === undefined || isHtml === null) {
                 format = Ci.nsIMsgCompFormat.Default;
               } else if (isForward) {
                 const explicitMatchesPref = (isHtml === true) === identityUsesHtml;
@@ -5260,6 +5510,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               return { useHtml, format };
             }
+            // END COMPOSE FORMAT HELPER
 
             /**
              * Sets compose identity from `from` param or falls back to default.
@@ -9663,7 +9914,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // must NOT get it -- Thunderbird adds it when the window
                   // opens, and doing both would duplicate it.
                   composeFields.body = buildBodyWithSignature(body, msgComposeParams.identity, useHtml, isHtml, includeSignature);
-                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain").then(result => {
+                  return sendThroughCompose(msgComposeParams, fileDescs, useHtml).then(result => {
                     if (result.success) {
                       let msg = "Message sent";
                       result.message = msg;
@@ -9679,7 +9930,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // sendMail call -- or the user simply clicking an older compose
                 // window while this one opens -- would steal or drop the
                 // attachments. composeFields binds them to this exact message,
-                // exactly like the direct-send path (sendMessageDirectly).
+                // exactly like the direct-send path (sendThroughCompose).
                 for (const att of descsToMsgAttachments(fileDescs)) {
                   composeFields.addAttachment(att);
                 }
@@ -9857,8 +10108,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Review path uses Thunderbird's native reply compose flow so it can
              * build the quoted original, place the identity signature according
              * to user preferences, and set threading headers/disposition flags.
-             * skipReview still uses direct send, so it keeps a manual quoted body
-             * and manually marks the original as replied after a successful send.
+             * skipReview sends through a windowless nsIMsgCompose, so it keeps a
+             * manual quoted body. Thunderbird marks the original as replied.
              *
              * saveAsDraft runs the same native review flow, then saves the reply
              * to Drafts and closes the window instead of leaving it open.
@@ -9959,17 +10210,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                        composeFields.bcc = bcc || "";
 
-	                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-	                        composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
+	                        // nsIMsgCompose.initialize sets the "Re:" subject from msgHdr.
 	                        composeFields.references = `<${messageId}>`;
 	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
 
 	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
 	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
 
-	                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
-	                        // it still uses a hand-built quoted body and cannot place the
-	                        // identity signature according to reply preferences. The shape
+	                        // Quoting and signature placement run in the compose window's
+	                        // editor, so direct send uses a hand-built quoted body. The shape
 	                        // matches the resolved compose mode -- shipping an HTML envelope
 	                        // for a plain-format send would otherwise render as literal
 	                        // markup in the recipient's mail client.
@@ -9987,14 +10236,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
 	                        }
 
-	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, replyUseHtml ? "text/html" : "text/plain").then(result => {
+	                        // On success Thunderbird marks the original replied.
+	                        sendThroughCompose(msgComposeParams, fileDescs, replyUseHtml).then(result => {
 	                          if (result.success) {
-	                            let repliedDisposition = null;
-	                            try {
-	                              repliedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Replied;
-	                            } catch {}
-	                            markMessageDispositionState(msgHdr, repliedDisposition);
-
 	                            let msg = "Reply sent";
 	                            result.message = msg;
 	                          }
@@ -10063,9 +10307,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * intro body is injected via NotifyComposeBodyReady, mirroring how
              * replyToMessage handles intro injection.
              *
-             * skipReview still uses direct send, so it keeps a manual forward
-             * block + auto-attaches originals from MsgHdrToMimeMessage + manually
-             * marks the original as forwarded after a successful send.
+             * skipReview sends through a windowless nsIMsgCompose, so it keeps a
+             * manual forward block and attaches originals from MsgHdrToMimeMessage.
+             * Thunderbird sets the subject, References and $Forwarded disposition.
              */
             // BEGIN FORWARD TOOL
             function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
@@ -10140,15 +10384,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         composeFields.cc = cc || "";
                         composeFields.bcc = bcc || "";
 
+                        // nsIMsgCompose.initialize sets the "Fwd:" subject and References from msgHdr.
                         const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                        composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
                         const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
                         const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
                         const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
 
-                        // Direct send goes through nsIMsgSend, not nsIMsgCompose,
-                        // so we hand-build the forward block. The shape matches the
+                        // Forward body population runs in the compose window, so
+                        // direct send hand-builds the forward block. The shape matches the
                         // resolved compose mode -- shipping an HTML envelope for a
                         // plain-format send would render as literal markup in the
                         // recipient's mail client.
@@ -10206,14 +10450,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         }
                         const allDescs = [...origDescs, ...fileDescs];
 
-                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, fwdUseHtml ? "text/html" : "text/plain").then(result => {
+                        // On success Thunderbird marks the original forwarded.
+                        sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml).then(result => {
                           if (result.success) {
-                            let forwardedDisposition = null;
-                            try {
-                              forwardedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Forwarded;
-                            } catch {}
-                            markMessageDispositionState(msgHdr, forwardedDisposition);
-
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                             result.message = msg;
                           }

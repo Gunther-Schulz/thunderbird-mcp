@@ -20,32 +20,76 @@ function snippet(name) {
 }
 
 function loadSend(options = {}) {
-  const state = { calls: [], dispositions: [], result: undefined };
+  const state = { calls: [], composes: [], attached: [], result: undefined };
   const identity = { key: "sender", email: "sender@example.test" };
   const timer = {
     cancelled: false,
-    initWithCallback(callback, delay) { this.callback = callback; this.delay = delay; },
+    initWithCallback(callback, delay) {
+      this.callback = callback;
+      this.delay = delay;
+      if (options.timerInitError) throw options.timerInitError;
+    },
     cancel() { this.cancelled = true; },
   };
   const creation = new Promise((resolve, reject) => {
     state.deliveryStarted = resolve;
     state.creationFailed = reject;
   });
-  const folder = {
-    server: {}, getUriForMsg: () => "message-uri",
-    addMessageDispositionState(hdr, disposition) { state.dispositions.push({ hdr, disposition }); },
-  };
+  const folder = { server: {}, getUriForMsg: () => "message-uri" };
   const hdr = { folder, messageId: "original", author: "author@example.test", subject: "Original", date: 0 };
+  // Windowless nsIMsgCompose: it shares the listener slot and creation promise
+  // with the nsIMsgSend mock so one error table drives both send paths.
+  const makeCompose = () => {
+    const compose = {
+      stateListener: null, unregistered: 0,
+      sendListeners: new Set(), stateListeners: new Set(),
+      initialize(params, win, editor) {
+        compose.init = { params, win, editor };
+        if (options.initError) throw options.initError;
+      },
+      addMsgSendListener(listener) {
+        // Keep callback handles for late-notification tests, independently of
+        // the native object's strong listener registrations.
+        state.listener = listener;
+        compose.sendListeners.add(listener);
+        if (options.sendListenerError) throw options.sendListenerError;
+      },
+      removeMsgSendListener(listener) { compose.sendListeners.delete(listener); },
+      RegisterStateListener(listener) {
+        compose.stateListener = listener;
+        compose.stateListeners.add(listener);
+        if (options.stateListenerError) throw options.stateListenerError;
+      },
+      UnregisterStateListener(listener) {
+        if (compose.stateListeners.delete(listener)) compose.unregistered++;
+      },
+      sendMsg(...args) {
+        compose.sendArgs = args;
+        if (options.createError) throw options.createError;
+        return options.legacy ? undefined : creation;
+      },
+    };
+    state.composes.push(compose);
+    return compose;
+  };
   const sandbox = {
     Ci: {
       nsIMsgCompDeliverMode: modes, nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
+      nsIMsgCompFormat: { Default: 0, HTML: 1, PlainText: 2, OppositeOfDefault: 3 },
       nsIMsgFolder: { nsMsgDispositionState_Replied: 10, nsMsgDispositionState_Forwarded: 11 },
     },
     Cc: {
-      "@mozilla.org/timer;1": { createInstance: () => timer },
+      "@mozilla.org/timer;1": { createInstance() {
+        if (options.timerCreateError) throw options.timerCreateError;
+        state.timerCreated = true;
+        return timer;
+      } },
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
-      "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ setHeader() {}, addAttachment() {} }) },
+      "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({
+        headers: {}, setHeader(name, value) { this.headers[name] = value; }, addAttachment(att) { state.attached.push(att); },
+      }) },
+      "@mozilla.org/messengercompose/compose;1": { createInstance: makeCompose },
       "@mozilla.org/messengercompose/send;1": { createInstance: () => ({
         createAndSendMessage(...args) {
           state.calls.push(args);
@@ -63,7 +107,15 @@ function loadSend(options = {}) {
       importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, {}) }),
     },
     Components: { isSuccessCode: status => status === 0 },
-    MailServices: { accounts: { accounts: [{ key: "account", identities: [identity] }] } },
+    MailServices: { accounts: { get accounts() {
+      if (options.accountError) throw options.accountError;
+      return [
+        { key: "other", identities: [{ key: "someone-else" }] },
+        ...(options.noAccount ? [] : [{
+          key: Object.hasOwn(options, "accountKey") ? options.accountKey : "account", identities: [identity],
+        }]),
+      ];
+    } } },
     descsToMsgAttachments(descs) {
       if (options.attachmentError) throw options.attachmentError;
       return descs;
@@ -77,19 +129,22 @@ function loadSend(options = {}) {
     isPrivacyOptInEnabled: () => false,
     getDirectQuoteContent: () => ({ body: "Original body" }),
   };
-  const dispositionStart = source.indexOf("function markMessageDispositionState(");
-  const dispositionEnd = source.indexOf("// BEGIN DIRECT SEND HELPER", dispositionStart);
-  assert.ok(dispositionStart >= 0 && dispositionEnd > dispositionStart, "Missing disposition helper boundaries");
   vm.createContext(sandbox);
   vm.runInContext([
-    source.slice(dispositionStart, dispositionEnd), snippet("DIRECT SEND HELPER"),
+    snippet("DIRECT SEND HELPER"), snippet("COMPOSE SEND HELPER"),
     snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   return {
-    state, timer, hdr,
+    state, timer, hdr, identity,
+    get compose() { return state.composes.at(-1); },
     start(tool = "direct", mode) {
       let result;
-      if (tool === "reply") {
+      if (tool === "compose") {
+        const composeFields = sandbox.Cc["@mozilla.org/messengercompose/composefields;1"].createInstance();
+        result = sandbox.sendThroughCompose(
+          { identity: options.noIdentity ? null : identity, composeFields, type: 0 },
+          options.attachments || [], options.useHtml ?? false);
+      } else if (tool === "reply") {
         result = sandbox.replyToMessage("original", "folder", "Reply", false, false,
           undefined, undefined, undefined, undefined, undefined, true);
       } else if (tool === "forward") {
@@ -109,7 +164,20 @@ async function assertPending(harness) {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(harness.state.result, undefined, "SMTP outcome must still be pending");
   assert.equal(harness.timer.cancelled, false, "delivery timer must stay active");
-  assert.equal(harness.state.dispositions.length, 0);
+  for (const compose of harness.state.composes) {
+    assert.equal(compose.sendListeners.size, 1, "send listener must stay registered until settlement");
+    assert.equal(compose.stateListeners.size, 1, "state listener must stay registered until settlement");
+  }
+}
+
+// Searched for listener-cleanup assertions: compose-window-claim has a local
+// window-specific assertClean, but no shared send-lifecycle assertion exists.
+function assertComposeReleased(harness) {
+  for (const compose of harness.state.composes) {
+    assert.equal(compose.sendListeners.size, 0, "send listener is released");
+    assert.equal(compose.stateListeners.size, 0, "state listener is released");
+  }
+  assert.equal(harness.timer.cancelled, !!harness.state.timerCreated, "created timer is cancelled");
 }
 
 const errors = [
@@ -214,40 +282,172 @@ describe("draft and queued completion", () => {
   }
 });
 
-describe("reply and forward dispositions follow the SMTP result", () => {
+describe("windowless nsIMsgCompose send", () => {
+  it("initializes a windowless compose and sends Now with the identity's account", async () => {
+    const h = loadSend({ attachments: [{ url: "file:///a.pdf" }] });
+    const result = h.start("compose");
+    const compose = h.compose;
+    assert.equal(compose.init.win, null);
+    assert.equal(compose.init.editor, null);
+    assert.equal(compose.init.params.identity, h.identity);
+    assert.deepEqual(compose.sendArgs, [modes.Now, h.identity, "account", null, null]);
+    assert.deepEqual(h.state.attached, [{ url: "file:///a.pdf" }]);
+    assert.equal(h.state.calls.length, 0, "must not create a bare nsIMsgSend");
+    h.state.deliveryStarted();
+    await assertPending(h);
+    h.state.listener.onStopSending("id", 0);
+    assert.equal((await result).success, true);
+    assert.equal(h.timer.cancelled, true);
+    assert.equal(compose.unregistered, 1, "state listener is released");
+    assertComposeReleased(h);
+  });
+
+  it("succeeds on ComposeProcessDone when the send listener stays silent", async () => {
+    const h = loadSend();
+    const result = h.start("compose");
+    h.compose.stateListener.ComposeProcessDone(0);
+    assert.equal((await result).success, true);
+    assertComposeReleased(h);
+  });
+
+  it("reports a failed ComposeProcessDone", async () => {
+    const h = loadSend();
+    const result = h.start("compose");
+    h.compose.stateListener.ComposeProcessDone(failure);
+    assert.match((await result).error, /Send failed.*80004005/);
+    assertComposeReleased(h);
+  });
+
+  it("retains confirmed delivery when ComposeProcessDone or the promise fails afterward", async () => {
+    const h = loadSend();
+    const result = h.start("compose");
+    h.state.listener.onStopSending("id", 0);
+    h.compose.stateListener.ComposeProcessDone(failure);
+    h.state.creationFailed(new Error("late rejection"));
+    h.state.listener.onSendNotPerformed("id", failure);
+    assert.equal((await result).success, true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.state.result.error, undefined);
+    assert.equal(h.compose.unregistered, 1);
+    h.timer.callback.notify();
+    assertComposeReleased(h);
+  });
+
+  for (const [label, options, pattern] of [
+    ["missing owning account", { noAccount: true }, /account/i],
+    ["empty account key", { accountKey: "" }, /account/i],
+    ["missing account key", { accountKey: undefined }, /account/i],
+    ["account lookup exception", { accountError: new Error("account lookup failed") }, /account lookup failed/],
+  ]) {
+    it(`refuses a ${label} before constructing or sending a compose`, async () => {
+      const h = loadSend(options);
+      const result = await h.start("compose");
+      assert.match(result.error, pattern);
+      assert.equal(result.success, undefined);
+      assert.equal(h.state.composes.length, 0);
+      assert.equal(h.state.calls.length, 0);
+      assertComposeReleased(h);
+    });
+  }
+
+  for (const [label, trigger, pattern] of errors) {
+    it(`reports ${label} and ignores later completion`, async () => {
+      const h = loadSend();
+      const result = h.start("compose");
+      if (label !== "promise rejection") h.state.deliveryStarted();
+      await assertPending(h);
+      trigger(h);
+      assert.match((await result).error, pattern);
+      assertComposeReleased(h);
+      const original = h.state.result;
+      h.state.listener.onStopSending("id", 0);
+      h.compose.stateListener.ComposeProcessDone(0);
+      h.timer.callback.notify();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(h.state.result, original);
+      assert.equal(h.compose.unregistered, 1);
+      assertComposeReleased(h);
+    });
+  }
+
+  for (const [label, options, pattern] of [
+    ["missing identity", { noIdentity: true }, /No identity/],
+    ["timer creation failure", { timerCreateError: new Error("timer creation threw") }, /timer creation threw/],
+    ["timer initialization failure", { timerInitError: new Error("timer init threw") }, /timer init threw/],
+    ["initialize failure", { initError: new Error("init threw") }, /init threw/],
+    ["send listener registration failure", { sendListenerError: new Error("send listener threw") }, /send listener threw/],
+    ["state listener registration failure", { stateListenerError: new Error("state listener threw") }, /state listener threw/],
+    ["sendMsg failure", { createError: new Error("sendMsg threw") }, /sendMsg threw/],
+    ["attachment failure", { attachmentError: new Error("attachments invalid") }, /attachments invalid/],
+  ]) {
+    it(`reports ${label} without success`, async () => {
+      const h = loadSend(options);
+      const result = await h.start("compose");
+      assert.match(result.error, pattern);
+      assert.equal(result.success, undefined);
+      assert.equal(h.state.calls.length, 0);
+      assertComposeReleased(h);
+      // Even a callback retained before a partially successful registration
+      // must not change the failure or re-register either listener.
+      h.state.listener?.onStopSending("late", 0);
+      h.compose?.stateListener?.ComposeProcessDone(0);
+      h.timer.callback?.notify();
+      assert.equal(h.state.result, result);
+      assertComposeReleased(h);
+    });
+  }
+
+  it("does not depend on sendMsg returning a promise", async () => {
+    const h = loadSend({ legacy: true });
+    const result = h.start("compose");
+    h.state.listener.onStopSending("id", 0);
+    assert.equal((await result).success, true);
+    assertComposeReleased(h);
+  });
+});
+
+describe("reply and forward send through nsIMsgCompose", () => {
   for (const tool of ["reply", "forward"]) {
-    it(`marks ${tool} only after SMTP success`, async () => {
+    it(`sends ${tool} with the original's URI and type so Thunderbird threads and flags it`, async () => {
       const h = loadSend();
       const result = h.start(tool);
-      h.state.deliveryStarted();
-      h.state.listener.onStopCopy(0);
-      await assertPending(h);
+      const { params } = h.compose.init;
+      assert.equal(params.originalMsgURI, "message-uri");
+      assert.equal(params.type, tool === "reply" ? 1 : 3);
+      assert.equal(params.composeFields.subject, undefined, "initialize sets the Re:/Fwd: subject");
+      assert.equal(h.state.calls.length, 0);
       h.state.listener.onStopSending("id", 0);
-      assert.equal((await result).success, true);
-      assert.deepEqual(h.state.dispositions, [{ hdr: h.hdr, disposition: tool === "reply" ? 10 : 11 }]);
-      h.state.listener.onStopSending("id", 0);
-      await new Promise(resolve => setImmediate(resolve));
-      assert.equal(h.state.dispositions.length, 1);
+      const value = await result;
+      assert.equal(value.success, true);
+      assert.match(value.message, tool === "reply" ? /^Reply sent$/ : /^Forward sent/);
     });
-    for (const [label, trigger, pattern] of errors) {
-      it(`does not mark ${tool} on ${label}, including late SMTP completion`, async () => {
+
+    if (tool === "reply") {
+      it("keeps the reply threading headers", async () => {
         const h = loadSend();
-        const result = h.start(tool);
-        h.state.listener.onStopCopy(0);
-        trigger(h);
-        assert.match((await result).error, pattern);
-        h.state.listener.onStopSending("id", 0);
-        h.state.deliveryStarted();
-        await new Promise(resolve => setImmediate(resolve));
-        assert.equal(h.state.dispositions.length, 0);
-        assert.equal(h.state.result.success, undefined);
+        h.start(tool);
+        const fields = h.compose.init.params.composeFields;
+        assert.equal(fields.references, "<original>");
+        assert.equal(fields.headers["In-Reply-To"], "<original>");
       });
     }
+
+    for (const [label, trigger, pattern] of errors) {
+      it(`reports ${tool} ${label}`, async () => {
+        const h = loadSend();
+        const result = h.start(tool);
+        trigger(h);
+        const value = await result;
+        assert.match(value.error, pattern);
+        assert.equal(value.success, undefined);
+      });
+    }
+
     it(`keeps the skipReview block ahead of ${tool} delivery`, async () => {
       const h = loadSend({ blocked: true });
       assert.match((await h.start(tool)).error, /blocks skipReview/);
       assert.equal(h.state.calls.length, 0);
-      assert.equal(h.state.dispositions.length, 0);
+      assert.equal(h.state.composes.length, 0);
     });
   }
 });

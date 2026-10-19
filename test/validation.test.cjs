@@ -1764,11 +1764,21 @@ function makeOutboundMailRuntime(options = {}) {
     openComposeWindowWithCustomizations() { state.windows++; return Promise.resolve({ success: true }); },
     ChromeUtils: { importESModule() { state.mimeReads++; throw new Error('unexpected MIME read'); } },
   });
+  // Both send paths must trip the existing no-send assertions.
+  runtime.sendThroughCompose = runtime.sendMessageDirectly;
   runtime._tempAttachFiles.add('/prior-call.txt');
   return { runtime, state };
 }
 
 describe('Outbound attachment failures are atomic', () => {
+  it('observes a successful compose send with the same counter used by no-send assertions', async () => {
+    const { runtime, state } = makeOutboundMailRuntime();
+    const result = await runtime.composeMail('to@example.com', 'subject', 'body', null, null, false, null, [], true);
+    assert.equal(result.success, true);
+    assert.equal(state.sent, 1);
+    assert.equal(state.drafts + state.windows + state.mimeReads, 0);
+  });
+
   const calls = [
     ['sendMail direct', (r, a) => r.composeMail('to@example.com', 'subject', 'body', null, null, false, null, a, true)],
     ['sendMail review', (r, a) => r.composeMail('to@example.com', 'subject', 'body', null, null, false, null, a, false)],
