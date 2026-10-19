@@ -312,24 +312,26 @@ describe("Experiment parent globals", () => {
   });
 
   it("keeps ternary values and switch cases distinct from object property keys", () => {
+    const code = changeImports(source, [...importedGlobals(source)].filter(name => name !== "TextEncoder"));
     for (const statement of [
       "enabled ? TextEncoder : null;",
       "switch (value) { case TextEncoder: break; }",
       "const options = { value: enabled ? first, TextEncoder : null };",
     ]) {
-      assert.ok(auditGlobals(`${source}\n${statement}`).missing.includes("TextEncoder"), statement);
+      assert.ok(auditGlobals(`${code}\n${statement}`).missing.includes("TextEncoder"), statement);
     }
     assert.deepEqual([...referencedGlobals("const options = { TextEncoder: null, URL: enabled ?? null, Blob: null };" )], []);
   });
 
   it("limits named function and class expression bindings to the expression itself", () => {
+    const code = changeImports(source, [...importedGlobals(source)].filter(name => name !== "TextEncoder"));
     for (const expression of [
       "function TextEncoder() { return new TextEncoder(); }",
       "class TextEncoder { static create() { return new TextEncoder(); } }",
     ]) {
       const declaration = `const local = ${expression};`;
       assert.deepEqual([...referencedGlobals(declaration)], [], declaration);
-      assert.ok(auditGlobals(`${source}\n${declaration}\nnew TextEncoder();`).missing.includes("TextEncoder"), declaration);
+      assert.ok(auditGlobals(`${code}\n${declaration}\nnew TextEncoder();`).missing.includes("TextEncoder"), declaration);
     }
     assert.deepEqual([...referencedGlobals([
       "function TextEncoder() {} new TextEncoder();",

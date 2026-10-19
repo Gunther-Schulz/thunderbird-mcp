@@ -7,7 +7,7 @@
 // addon_parent is a sandbox, not a window or a system ES module. These names
 // are supported by xpc::GlobalProperties in js/xpconnect/src/Sandbox.cpp.
 try {
-  Cu.importGlobalProperties(["DOMParser", "atob", "btoa", "TextDecoder"]);
+  Cu.importGlobalProperties(["DOMParser", "atob", "btoa", "TextDecoder", "TextEncoder"]);
 } catch (e) {
   console.warn("thunderbird-mcp: failed to import Experiment globals:", e);
 }
@@ -70,6 +70,7 @@ function ensureFreshConnectionInfo({
   port,
   token,
   expectedPid,
+  expectedProfileRoots,
   readConnectionInfo,
   writeConnectionInfo,
   onCheckError,
@@ -81,7 +82,8 @@ function ensureFreshConnectionInfo({
       data &&
       data.port === port &&
       data.token === token &&
-      data.pid === expectedPid
+      data.pid === expectedPid &&
+      JSON.stringify(data.profileRoots) === JSON.stringify(expectedProfileRoots)
     ) {
       return current.path;
     }
@@ -974,6 +976,9 @@ const SENSITIVE_ATTACHMENT_PATTERNS = [
   /\.key$/,
   /\.asc$/,
   /\.gpg$/,
+  /\.(ppk|ovpn|jks|keystore|p8|kdb)$/,
+  /(^|\/)wallet\.dat$/,
+  /\/snap\/chromium\/common\/chromium(\/|$)/,
   // Linux / macOS system directories
   /^\/etc\//,
   /^\/proc\//,
@@ -1039,7 +1044,23 @@ function getWindowsTempPrefixLength(parts, exportRoots) {
   return prefixLength;
 }
 
-function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
+// Optional connection metadata is ignored as a whole if malformed. Older peers
+// still use the static policy; runtime profile protection needs both upgraded.
+function normalizeAttachmentProfileRoots(profileRoots, windows = false) {
+  const roots = typeof profileRoots === 'function' ? profileRoots() : profileRoots;
+  if (!Array.isArray(roots)) return [];
+  const normalized = [];
+  for (const root of roots) {
+    if (typeof root !== 'string' || root.includes('\0')) return [];
+    const nativeRoot = windows ? root.replace(/\\/g, '/').toLowerCase() : root;
+    if ((windows ? !/^[a-z]:\//.test(nativeRoot) : !nativeRoot.startsWith('/')) ||
+        nativeRoot.startsWith('//') || nativeRoot.split('/').some(part => part === '.' || part === '..')) return [];
+    normalized.push(nativeRoot.replace(/\/+/g, '/').replace(/\/$/, '') + '/');
+  }
+  return [...new Set(normalized)];
+}
+
+function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [], profileRoots = [], profileCaseInsensitive = windows } = {}) {
   if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
   const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
   const parts = normalized.split('/');
@@ -1048,6 +1069,12 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
   // Traversal must never gain the export-directory exemption.
   if (parts.some(part => part === '.' || part === '..')) return true;
   if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  const nativePath = windows ? normalized : attachmentPath;
+  const profilePath = profileCaseInsensitive ? nativePath.toLowerCase() : nativePath;
+  if (normalizeAttachmentProfileRoots(profileRoots, windows).some(root => {
+    const prefix = profileCaseInsensitive ? root.toLowerCase() : root;
+    return profilePath === prefix.slice(0, -1) || profilePath.startsWith(prefix);
+  })) return true;
   // Refuse short names outside the trusted temp prefix. Roots are resolved only
   // after the network-namespace patterns above have passed.
   if (windows && parts.some(part => WINDOWS_SHORT_NAME.test(part))) {
@@ -1061,6 +1088,51 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
   return false;
 }
 // END SENSITIVE ATTACHMENT PATH HELPERS
+
+// BEGIN THUNDERBIRD PROFILE ROOTS
+function getThunderbirdProfileRoots() {
+  const roots = new Set();
+  for (const key of ["ProfD", "DefProfRt"]) {
+    try {
+      const file = Services.dirsvc.get(key, Ci.nsIFile);
+      roots.add(file.path);
+      const canonical = file.clone();
+      canonical.normalize();
+      // Windows normalize() only normalizes syntax. As in attachment
+      // validation, resolve each ancestor before inspecting its target.
+      if (Services.appinfo?.OS === "WINNT") {
+        const seen = new Set();
+        for (;;) {
+          const current = canonical.path.replace(/\\/g, "/").toLowerCase();
+          if (seen.has(current)) throw new Error("Profile path resolution cycle");
+          seen.add(current);
+          const suffix = [];
+          let redirected = false;
+          for (let component = canonical.clone(); component; component = component.parent) {
+            if (!component.isReadable()) throw new Error("Profile path resolution failed");
+            const target = component.target;
+            if (!target) throw new Error("Profile path target unavailable");
+            if (target.replace(/\\/g, "/").toLowerCase() !== component.path.replace(/\\/g, "/").toLowerCase()) {
+              canonical.initWithPath(target);
+              for (const part of suffix.reverse()) canonical.append(part);
+              redirected = true;
+              break;
+            }
+            suffix.push(component.leafName);
+          }
+          // A target can itself have redirected ancestors; resolve it again.
+          if (!redirected) break;
+        }
+      }
+      roots.add(canonical.path);
+    } catch {
+      // Some directory providers cannot resolve a root. Keep any lexical
+      // location already obtained, and retain the static policy regardless.
+    }
+  }
+  return [...roots].filter(root => typeof root === "string" && root.length > 0);
+}
+// END THUNDERBIRD PROFILE ROOTS
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
@@ -2913,6 +2985,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       }
     }
 
+    // BEGIN CONNECTION INFO READER
     function readConnectionInfo() {
       const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
       tmpDir.append("thunderbird-mcp");
@@ -2927,10 +3000,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       const sis = Cc["@mozilla.org/scriptableinputstream;1"]
         .createInstance(Ci.nsIScriptableInputStream);
       sis.init(fis);
-      const text = sis.read(sis.available());
+      const raw = sis.read(sis.available());
       sis.close();
+      const text = new TextDecoder("utf-8").decode(Uint8Array.from(raw, c => c.charCodeAt(0)));
       return { path: connFile.path, data: JSON.parse(text) };
     }
+    // END CONNECTION INFO READER
 
     /**
      * Remove the connection info file during startup or shutdown cleanup.
@@ -3217,6 +3292,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END SEARCH RESULT HELPERS
 
             // BEGIN CONNECTION INFO WRITER
+            // Keep within the read limit of existing bridges.
+            const MAX_CONNECTION_FILE_BYTES = 4096;
+
+            function getConnectionInfoData(port, token) {
+              const data = { port, token, pid: Services.appinfo.processID };
+              const profileRoots = getThunderbirdProfileRoots();
+              if (profileRoots.length) data.profileRoots = profileRoots;
+              // Metadata is additive: old bridges ignore it, and new bridges
+              // retain static rules when old/oversized metadata is absent.
+              if (new TextEncoder().encode(JSON.stringify(data)).length > MAX_CONNECTION_FILE_BYTES) {
+                delete data.profileRoots;
+              }
+              return data;
+            }
+
             /**
              * Write connection info (port + auth token) to a well-known file
              * so the bridge can discover how to connect.
@@ -3261,7 +3351,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (connFile.exists()) {
                 connFile.remove(false);
               }
-              const data = JSON.stringify({ port, token, pid: Services.appinfo.processID });
+              const data = JSON.stringify(getConnectionInfoData(port, token));
               const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                 .createInstance(Ci.nsIFileOutputStream);
               // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x80 = O_EXCL
@@ -3280,6 +3370,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 port,
                 token,
                 expectedPid: Services.appinfo.processID,
+                expectedProfileRoots: getConnectionInfoData(port, token).profileRoots,
                 readConnectionInfo,
                 writeConnectionInfo,
                 onCheckError: (e) => {
@@ -3692,8 +3783,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // and we never want that to succeed regardless of skipReview.
                     let exportRoots;
                     let canonicalExportRoot;
+                    let profileRoots;
                     const attachmentPolicy = {
                       windows: Services.appinfo?.OS === "WINNT",
+                      // Conservatively cover case-insensitive macOS volumes.
+                      profileCaseInsensitive: ["WINNT", "Darwin"].includes(Services.appinfo?.OS),
+                      profileRoots: () => (profileRoots ||= getThunderbirdProfileRoots()),
                       // Evaluated only for an otherwise-safe export-shaped path.
                       exportRoots: () => {
                         if (!exportRoots) {

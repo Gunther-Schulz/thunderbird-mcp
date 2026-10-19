@@ -90,12 +90,61 @@ function sendToBridge(message, { timeout = 10000 } = {}) {
 /**
  * Write a test connection.json file.
  */
-function writeTestConnectionInfo(port, token) {
+function writeTestConnectionInfo(port, token, profileRoots) {
   fs.mkdirSync(CONN_DIR, { recursive: true });
-  fs.writeFileSync(CONN_FILE, JSON.stringify({ port, token, pid: process.pid }), { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(CONN_FILE, JSON.stringify({ port, token, pid: process.pid, profileRoots }), { encoding: 'utf8', mode: 0o600 });
 }
 
 describe('Auth: connection info file', () => {
+  for (const shape of ['profile metadata', 'old shape', 'malformed metadata']) {
+    it(`applies attachment policy with a verified connection using ${shape}`, async () => {
+      const requests = [];
+      const server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          const message = JSON.parse(body);
+          requests.push(message);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }));
+        });
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const profile = path.join(CONN_DIR, 'custom-profile');
+        const profiles = path.join(CONN_DIR, 'profiles');
+        const profileRoots = shape === 'old shape' ? undefined
+          : shape === 'malformed metadata' ? [profile, null] : [profile, profiles];
+        writeTestConnectionInfo(server.address().port, 'a'.repeat(64), profileRoots);
+        const denied = shape === 'profile metadata'
+          ? [path.join(profile, 'abook.sqlite'), path.join(profiles, 'other-profile', 'Mail', 'Inbox')]
+          : [path.join(CONN_DIR, 'credential.ppk')];
+        for (const file of denied) {
+          const response = await sendToBridge({
+            jsonrpc: '2.0', id: 1, method: 'tools/call',
+            params: { name: 'saveDraft', arguments: { attachments: [file], profileRoots: [] } },
+          });
+          assert.equal(response.error.code, -32602);
+          assert.match(response.error.message, /Sensitive attachment path blocked/);
+        }
+        assert.equal(requests.length, 0);
+        const document = path.join(CONN_DIR, 'report.pdf');
+        fs.writeFileSync(document, 'ordinary document');
+        const response = await sendToBridge({
+          jsonrpc: '2.0', id: 2, method: 'tools/call',
+          params: { name: 'saveDraft', arguments: { attachments: [document] } },
+        });
+        assert.ok(response.result);
+        assert.equal(requests.length, 1);
+        assert.deepEqual(requests[0].params.arguments.attachments, [{
+          name: 'report.pdf', contentType: 'application/pdf', base64: Buffer.from('ordinary document').toString('base64'),
+        }]);
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+  }
+
   it('bridge reads port and token from connection.json', async () => {
     let TEST_PORT;
     const TEST_TOKEN = 'a'.repeat(64);

@@ -45,6 +45,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
   vm.runInContext([
     getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
     getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
+    getMarkedApiSnippet('// BEGIN THUNDERBIRD PROFILE ROOTS', '// END THUNDERBIRD PROFILE ROOTS'),
     getMarkedApiSnippet('// BEGIN NATIVE ATTACHMENT CONVERSION', '// END NATIVE ATTACHMENT CONVERSION'),
     getMarkedApiSnippet('// BEGIN OUTBOUND MAIL TOOLS', '// END OUTBOUND MAIL TOOLS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
@@ -618,6 +619,7 @@ function makeMockLocalFile(attachmentPath, options = {}) {
     leafName: attachmentPath.split(/[\\/]/).pop(),
     parent: options.parent || null,
     clone() { return makeMockLocalFile(this.path, options); },
+    initWithPath(value) { this.path = value; },
     isReadable() {
       if (options.readError) throw options.readError;
       this.resolved = true;
@@ -1554,6 +1556,9 @@ describe('Attachment policy parity', () => {
     '/tmp/id_custom', '/tmp/server.pem', '/tmp/private.key', '/tmp/a.p12', '/tmp/a.pfx', '/tmp/a.kdbx',
     '/tmp/login.keychain-db', '/tmp/key4.db', '/tmp/logins.json', '/tmp/Web Data', '/tmp/Local State',
     '/tmp/Login Data', '/tmp/signons.sqlite', '/tmp/prefs.js',
+    '/documents/server.ppk', '/documents/client.ovpn', '/documents/release.jks', '/documents/release.keystore',
+    '/documents/AuthKey.p8', '/documents/passwords.kdb', '/documents/wallet.dat',
+    '/home/user/snap/chromium/common/chromium/Default/Local Storage/data',
     '\\\\server\\share\\file.txt', '//server/share/file.txt', '\\\\?\\C:\\file.txt', '\\\\.\\C:\\file.txt', '//?/C:/file.txt', '//./C:/file.txt',
     ...WINDOWS_RESERVED_NAME_PATHS, ...WINDOWS_SHORT_NAME_PATHS,
   ]) {
@@ -1600,6 +1605,59 @@ describe('Attachment policy parity', () => {
       assert.equal(bridge.isSensitiveFilePath(file), false);
     }
   });
+
+  for (const windows of [false, true]) {
+    it(`protects runtime profile roots at component boundaries in both runtimes (windows=${windows})`, () => {
+      const base = windows ? 'D:/Custom' : '/custom';
+      const policy = { windows, profileRoots: [base + '/active', base + '/profiles/'] };
+      for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+        for (const file of ['/active', '/active/abook.sqlite', '/active/Mail/Inbox', '/profiles/another/abook.sqlite']) {
+          assert.equal(check(base + file, policy), true, file);
+        }
+        assert.equal(check(base + '/active-backup/report.pdf', policy), false);
+        assert.equal(check(base + '/profiles-other/report.pdf', policy), false);
+        assert.equal(check(base + '/documents/report.pdf', policy), false);
+        assert.equal(check(base.toUpperCase() + '/ACTIVE/abook.sqlite', policy), windows);
+        if (windows) assert.equal(check('d:\\Custom\\active\\abook.sqlite', policy), true);
+      }
+    });
+  }
+
+  it('never exempts a runtime profile merely because it has an export layout', () => {
+    const exportRoot = '/custom/profile/thunderbird-mcp';
+    const policy = { exportRoots: [exportRoot], profileRoots: ['/custom/profile'] };
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check(exportRoot + '/message_1/report.pdf', policy), true);
+    }
+  });
+
+  it('protects case variants on macOS without changing Linux or POSIX path syntax', () => {
+    const profileRoots = ['/custom/Profile'];
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check('/custom/profile/abook.sqlite', { profileRoots, profileCaseInsensitive: true }), true);
+      assert.equal(check('/custom/profile/report.pdf', { profileRoots, profileCaseInsensitive: false }), false);
+      assert.equal(check('/custom/profile-notes/report.pdf', { profileRoots, profileCaseInsensitive: true }), false);
+      assert.equal(check('/documents/report:2026.pdf', { profileRoots, profileCaseInsensitive: true }), false);
+    }
+  });
+
+  for (const profileRoots of [undefined, null, 'bad', {}, [null], ['relative'], ['/valid', 7], ['/valid/../other'], ['/valid\0bad']]) {
+    it(`retains static policy with absent or malformed profile metadata: ${JSON.stringify(profileRoots)}`, () => {
+      for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+        assert.equal(check('/documents/report.pdf', { profileRoots }), false);
+        assert.equal(check('/documents/secret.ppk', { profileRoots }), true);
+      }
+    });
+  }
+
+  it('does not refuse ordinary files that resemble newly protected names', () => {
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      for (const file of ['/documents/release.jks.txt', '/documents/wallet.dat.pdf',
+        '/documents/keystore-notes.txt', '/home/user/snap/chromium/common/chromium-notes/report.pdf']) {
+        assert.equal(check(file), false, file);
+      }
+    }
+  });
 });
 
 // Uses the production conversion and mail entry points with in-memory XPCOM
@@ -1632,7 +1690,13 @@ function makeOutboundMailRuntime(options = {}) {
     },
     Services: {
       appinfo: { OS: options.os || 'Linux' },
-      dirsvc: { get() { state.dirCalls++; return tempFile(options.tmpDir || '/temporary'); } },
+      dirsvc: { get(key) {
+        state.dirCalls++;
+        if (key === 'TmpD') return tempFile(options.tmpDir || '/temporary');
+        const directory = options.profileDirectories?.[key];
+        if (!directory) throw new Error('directory unavailable');
+        return directory.clone();
+      } },
       io: { newFileURI: file => ({ spec: 'file://' + file.path }) },
     },
     Ci: {
@@ -1756,6 +1820,43 @@ describe('Outbound attachment failures are atomic', () => {
       assert.equal(state.fileCalls, 0);
       assert.equal(state.created.size, 0);
     }
+  });
+
+  for (const os of ['Linux', 'Darwin', 'WINNT']) {
+    it(`refuses lexical and canonical runtime profiles through outbound conversion on ${os}`, () => {
+      const base = os === 'WINNT' ? 'D:/Custom' : '/custom';
+      const profile = base + '/profile';
+      const profiles = base + '/profiles';
+      const canonical = base + '/canonical';
+      const canonicalProfiles = base + '/canonical-profiles';
+      const profileDirectories = {
+        ProfD: makeMockLocalFile(profile, { normalizedPath: os === 'WINNT' ? profile : canonical, target: canonical }),
+        DefProfRt: makeMockLocalFile(profiles, { normalizedPath: os === 'WINNT' ? profiles : canonicalProfiles, target: canonicalProfiles }),
+      };
+      const { runtime, state } = makeOutboundMailRuntime({ os, profileDirectories });
+      for (const root of [profile, profiles, canonical, canonicalProfiles]) {
+        assert.throws(() => runtime.filePathsToAttachDescs([root + '/abook.sqlite']), /sensitive path blocked/);
+        if (os !== 'Linux') {
+          assert.throws(() => runtime.filePathsToAttachDescs([root.toUpperCase() + '/abook.sqlite']), /sensitive path blocked/);
+        }
+      }
+      assert.equal(state.fileCalls, 0);
+      assert.equal(state.sent + state.drafts + state.windows, 0);
+      assert.equal(runtime.filePathsToAttachDescs([profile + '-documents/report.pdf']).descs.length, 1);
+      const exported = runtime.ensureAttachmentDir('message_1');
+      exported.append('report.pdf');
+      assert.equal(runtime.filePathsToAttachDescs([exported.path]).descs.length, 1);
+    });
+  }
+
+  it('refuses a path that normalizes into a runtime profile', () => {
+    const profile = '/custom/profile';
+    const alias = '/documents/report.pdf';
+    const { runtime } = makeOutboundMailRuntime({
+      profileDirectories: { ProfD: makeMockLocalFile(profile) },
+      files: new Map([[alias, makeMockLocalFile(alias, { normalizedPath: profile + '/abook.sqlite' })]]),
+    });
+    assert.throws(() => runtime.filePathsToAttachDescs([alias]), /sensitive path blocked/);
   });
 
   it('rejects Windows streams and trailing dots/spaces before touching nsIFile or TmpD', () => {
