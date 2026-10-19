@@ -214,13 +214,14 @@ Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
 
 #### Connecting HTTP-capable clients directly
 
-The extension serves MCP over HTTP itself (`POST /`: `initialize`, `tools/list`, `tools/call`, notifications), so clients that support HTTP transport can skip the bridge:
+The extension serves MCP over HTTP itself (`POST /`: `initialize`, `tools/list`, `tools/call`, notifications), so clients that support HTTP transport can skip the bridge. Read the current `port` and `token` from `connection.json`, then replace `<port>` and `<token>` below:
 
 ```bash
-claude mcp add --transport http thunderbird http://127.0.0.1:8765/ --header "Authorization: Bearer <token>"
+claude mcp add --transport http thunderbird "http://127.0.0.1:<port>/" --header "Authorization: Bearer <token>"
 ```
 
-- The port defaults to `8765` (8766-8774 if taken); the token is in `connection.json`, or set a stable token in the settings page so it survives restarts.
+- Read the port from `connection.json` after each server restart instead of pinning `8765`. The server tries ports 8765-8774; Options shows the selected port and a notice when it differs from the default.
+- A stable token can survive restarts, but does not make the port stable. On shared machines, use the stdio bridge with automatic discovery instead of a pinned port with a stable token.
 - Responses are plain JSON; there is no SSE stream and no `Mcp-Session-Id`, both optional in the Streamable HTTP spec.
 - Path attachments are then read by the extension itself, under the same attachment policy as the bridge, and inside the Snap/Flatpak sandbox where applicable (the bridge is what makes host paths work for sandboxed installs).
 - Keep this on localhost. For a client on another machine or container, prefer an SSH tunnel or a TLS proxy bound to loopback over "Listen on all interfaces": that mode is plain HTTP, so the token and mail content cross the network unencrypted.
@@ -286,6 +287,9 @@ UNC/network and device paths, dotfiles and dot-directories, application-data dir
 | Extension not loading | Check Tools > Add-ons and Themes. Errors: Tools > Developer Tools > Error Console |
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
 | Bridge can't find `connection.json` | Set `THUNDERBIRD_MCP_CONNECTION_FILE` explicitly if your environment uses a non-standard temp/runtime path |
+| Server uses a port other than 8765 | Check Options or read `port` from `connection.json`; update direct HTTP clients to that port. The stdio bridge discovers it automatically. |
+| AnkiConnect and Thunderbird MCP conflict | AnkiConnect also defaults to `127.0.0.1:8765`. Start Anki/AnkiConnect before Thunderbird so MCP can choose another port, then use the recorded MCP port or the stdio bridge. |
+| Bridge reports that a port is not answered by Thunderbird MCP | Check the server's current port in Options and `connection.json`, and whether another application is using that port. Reconnect the client after correcting its configuration. |
 | Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
 | `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
