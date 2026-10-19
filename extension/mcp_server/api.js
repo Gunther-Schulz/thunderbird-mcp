@@ -731,7 +731,13 @@ const _tempAttachFiles = new Set();
 // original message never bind two observers to the same compose window
 // (which would double-inject the body/attachments).
 // WeakSet so entries are collected automatically when the window is destroyed.
+// BEGIN COMPOSE WINDOW CLAIM STATE
 const _claimedComposeWindows = new WeakSet();
+// Native forwards create their own compose params asynchronously. Allow only
+// one unclaimed opening per type. A false result fences later opens after an
+// uncertain failure, since the original window can still appear much later.
+const _composeWindowOpenClaims = new Map();
+// END COMPOSE WINDOW CLAIM STATE
 // BEGIN INLINE ATTACHMENT BASE64 HELPERS
 // Require canonical RFC 4648 base64: complete quartets with padding only in
 // the final quartet. In particular, do not silently discard invalid bytes.
@@ -4165,9 +4171,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN COMPOSE OPEN DISPATCH
             function shouldUseDirectComposeOpen(compType) {
               return compType === Ci.nsIMsgCompType.ForwardInline;
             }
+            // END COMPOSE OPEN DISPATCH
 
             /**
              * Saves an open compose window to the identity's Drafts folder via
@@ -4278,144 +4286,194 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // END COMPOSE WINDOW DRAFT HELPER
 
-            function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs, afterInsert) {
-              return new Promise((resolve) => {
-                const OPEN_TIMEOUT_MS = shouldUseDirectComposeOpen(compType) ? 60000 : 15000;
-                let settled = false;
-                let matchedWindow = null;
-                let pendingStateListener = null;
-                let pendingStateCompose = null;
-
-                const finish = (result) => {
-                  if (settled) return;
-                  settled = true;
-                  try { Services.ww.unregisterNotification(windowObserver); } catch {}
-                  try { timeout.cancel(); } catch {}
-                  // Unregister any dangling state listener so a late
-                  // NotifyComposeBodyReady cannot mutate the compose window
-                  // after we have already resolved (e.g. after a timeout).
-                  if (pendingStateListener && pendingStateCompose) {
-                    try { pendingStateCompose.UnregisterStateListener(pendingStateListener); } catch {}
+            // BEGIN COMPOSE WINDOW OPEN HELPER
+            async function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs, afterInsert) {
+              const nativeOpen = shouldUseDirectComposeOpen(compType);
+              let releaseOpen = null;
+              let nativeOpenStarted = false;
+              try {
+                if (nativeOpen) {
+                  const previousOpen = _composeWindowOpenClaims.get(compType);
+                  let resolveOpen;
+                  const pendingOpen = new Promise(resolve => { resolveOpen = resolve; });
+                  _composeWindowOpenClaims.set(compType, pendingOpen);
+                  releaseOpen = safe => {
+                    resolveOpen(safe);
+                    if (safe && _composeWindowOpenClaims.get(compType) === pendingOpen) {
+                      _composeWindowOpenClaims.delete(compType);
+                    }
+                    releaseOpen = null;
+                  };
+                  if (previousOpen && !await previousOpen) {
+                    releaseOpen(false);
+                    return { error: "Cannot safely open another forward review after an uncertain window opening. Restart Thunderbird and retry." };
                   }
-                  pendingStateListener = null;
-                  pendingStateCompose = null;
-                  resolve(result);
-                };
+                }
+                return await new Promise((resolve) => {
+                  const OPEN_TIMEOUT_MS = nativeOpen ? 60000 : 15000;
+                  const COMPOSE_INIT_EVENT = "compose-window-init";
+                  let settled = false;
+                  let matchedWindow = null;
+                  let pendingStateListener = null;
+                  let pendingStateCompose = null;
+                  const initListeners = new Map();
 
-                const timeout = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                timeout.initWithCallback({
-                  notify() {
-                    finish({ error: "Timed out waiting for compose window" });
-                  }
-                }, OPEN_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
-
-                const maybeCustomizeWindow = (composeWin) => {
-                  try {
-                    if (!composeWin || composeWin === matchedWindow) return;
-                    if (composeWin.document?.documentElement?.getAttribute("windowtype") !== "msgcompose") return;
-                    if (!composeWin.gMsgCompose) return;
-                    if (composeWin.gMsgCompose.originalMsgURI !== originalMsgURI) return;
-                    if (composeWin.gComposeType !== compType) return;
-                    // When two callers reply to the same message concurrently,
-                    // both observers see both compose windows. Skip any window
-                    // that has already been claimed by a prior observer so each
-                    // call binds to exactly one compose window.
-                    if (_claimedComposeWindows.has(composeWin)) return;
-                    _claimedComposeWindows.add(composeWin);
-
-                    matchedWindow = composeWin;
+                  const stopObserving = () => {
                     try { Services.ww.unregisterNotification(windowObserver); } catch {}
+                    for (const [win, listener] of initListeners) {
+                      try { win.removeEventListener(COMPOSE_INIT_EVENT, listener, true); } catch {}
+                    }
+                    initListeners.clear();
+                  };
 
-                    const stateListener = {
-                      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
-                      NotifyComposeFieldsReady() {},
-                      ComposeProcessDone() {},
-                      SaveInFolderDone() {},
-                      NotifyComposeBodyReady() {
-                        // Guard against a late body-ready firing after the
-                        // caller already timed out -- don't mutate the compose
-                        // window once the promise is settled.
-                        if (settled) {
-                          try { composeWin.gMsgCompose.UnregisterStateListener(stateListener); } catch {}
-                          return;
-                        }
+                  const finish = (result) => {
+                    if (settled) return;
+                    settled = true;
+                    stopObserving();
+                    try { timeout.cancel(); } catch {}
+                    // Unregister any dangling state listener so a late
+                    // NotifyComposeBodyReady cannot mutate the compose window
+                    // after we have already resolved (e.g. after a timeout).
+                    if (pendingStateListener && pendingStateCompose) {
+                      try { pendingStateCompose.UnregisterStateListener(pendingStateListener); } catch {}
+                    }
+                    pendingStateListener = null;
+                    pendingStateCompose = null;
+                    resolve(result);
+                  };
 
-                        try {
-                          composeWin.gMsgCompose.UnregisterStateListener(stateListener);
-                        } catch {}
-                        pendingStateListener = null;
-                        pendingStateCompose = null;
+                  const timeout = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timeout.initWithCallback({
+                    notify() {
+                      finish({ error: "Timed out waiting for compose window" });
+                    }
+                  }, OPEN_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
 
-                        try {
-                          applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc);
-                          insertReplyBodyIntoComposeWindow(composeWin, body, isHtml);
-                          addAttachmentsToComposeWindow(composeWin, attachDescs);
-                          if (typeof afterInsert === "function") {
-                            // The follow-up step owns its own timeout; stop the
-                            // open timeout so it cannot fire mid-step.
-                            try { timeout.cancel(); } catch {}
-                            Promise.resolve(afterInsert(composeWin))
-                              .then(finish)
-                              .catch((e) => finish({ error: e.toString() }));
-                          } else {
-                            finish({ success: true });
+                  const maybeCustomizeWindow = (composeWin) => {
+                    try {
+                      if (settled || matchedWindow || !composeWin) return;
+                      if (composeWin.document?.documentElement?.getAttribute("windowtype") !== "msgcompose") return;
+                      if (!composeWin.gMsgCompose) return;
+                      if (composeWin.gMsgCompose.originalMsgURI !== originalMsgURI) return;
+                      if (composeWin.gComposeType !== compType) return;
+                      // Replies retain our exact fields object. URI and type alone
+                      // cannot distinguish concurrent replies to the same message.
+                      // Native forwards have no such token and are serialized above.
+                      if (!nativeOpen && composeWin.gMsgCompose.compFields !== msgComposeParams.composeFields) return;
+                      // When two callers reply to the same message concurrently,
+                      // both observers see both compose windows. Skip any window
+                      // that has already been claimed by a prior observer so each
+                      // call binds to exactly one compose window.
+                      if (_claimedComposeWindows.has(composeWin)) return;
+                      _claimedComposeWindows.add(composeWin);
+
+                      matchedWindow = composeWin;
+                      stopObserving();
+                      // Ownership is now fixed; the next native forward may open
+                      // while this window is still waiting for its body/editor.
+                      if (releaseOpen) releaseOpen(true);
+
+                      const stateListener = {
+                        QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+                        NotifyComposeFieldsReady() {},
+                        ComposeProcessDone() {},
+                        SaveInFolderDone() {},
+                        NotifyComposeBodyReady() {
+                          // Guard against a late body-ready firing after the
+                          // caller already timed out -- don't mutate the compose
+                          // window once the promise is settled.
+                          if (settled) {
+                            try { composeWin.gMsgCompose.UnregisterStateListener(stateListener); } catch {}
+                            return;
                           }
-                        } catch (e) {
-                          finish({ error: e.toString() });
-                        }
-                      },
-                    };
 
-                    pendingStateListener = stateListener;
-                    pendingStateCompose = composeWin.gMsgCompose;
-                    composeWin.gMsgCompose.RegisterStateListener(stateListener);
+                          try {
+                            composeWin.gMsgCompose.UnregisterStateListener(stateListener);
+                          } catch {}
+                          pendingStateListener = null;
+                          pendingStateCompose = null;
+
+                          try {
+                            applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc);
+                            insertReplyBodyIntoComposeWindow(composeWin, body, isHtml);
+                            addAttachmentsToComposeWindow(composeWin, attachDescs);
+                            if (typeof afterInsert === "function") {
+                              // The follow-up step owns its own timeout; stop the
+                              // open timeout so it cannot fire mid-step.
+                              try { timeout.cancel(); } catch {}
+                              Promise.resolve(afterInsert(composeWin))
+                                .then(finish)
+                                .catch((e) => finish({ error: e.toString() }));
+                            } else {
+                              finish({ success: true });
+                            }
+                          } catch (e) {
+                            finish({ error: e.toString() });
+                          }
+                        },
+                      };
+
+                      pendingStateListener = stateListener;
+                      pendingStateCompose = composeWin.gMsgCompose;
+                      composeWin.gMsgCompose.RegisterStateListener(stateListener);
+                    } catch (e) {
+                      finish({ error: e.toString() });
+                    }
+                  };
+
+                  const windowObserver = {
+                    observe(subject, topic) {
+                      if (settled || matchedWindow || topic !== "domwindowopened") return;
+                      const composeWin = subject;
+                      if (!composeWin || typeof composeWin.addEventListener !== "function") return;
+
+                      // Thunderbird dispatches a non-bubbling compose-window-init event
+                      // from MsgComposeCommands.js after gMsgCompose is initialized and
+                      // the built-in state listener is registered, but before editor
+                      // creation begins. Capturing it on the window lets us register our
+                      // own ComposeBodyReady listener for the specific reply window
+                      // without relying on getMostRecentWindow("msgcompose").
+                      const onInit = () => {
+                        initListeners.delete(composeWin);
+                        maybeCustomizeWindow(composeWin);
+                      };
+                      initListeners.set(composeWin, onInit);
+                      composeWin.addEventListener(COMPOSE_INIT_EVENT, onInit, { once: true, capture: true });
+                    },
+                  };
+
+                  try {
+                    Services.ww.registerNotification(windowObserver);
+                    const msgComposeService = MailServices.compose || Cc["@mozilla.org/messengercompose;1"]
+                      .getService(Ci.nsIMsgComposeService);
+                    if (nativeOpen) {
+                      // Native inline-forward body/attachment population only runs through OpenComposeWindow.
+                      nativeOpenStarted = true;
+                      msgComposeService.OpenComposeWindow(
+                        null,
+                        msgComposeParams.origMsgHdr,
+                        originalMsgURI,
+                        compType,
+                        msgComposeParams.format,
+                        identity,
+                        identity?.email || "",
+                        null
+                      );
+                    } else {
+                      msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+                    }
                   } catch (e) {
                     finish({ error: e.toString() });
                   }
-                };
-
-                const windowObserver = {
-                  observe(subject, topic) {
-                    if (topic !== "domwindowopened") return;
-                    const composeWin = subject;
-                    if (!composeWin || typeof composeWin.addEventListener !== "function") return;
-
-                    // Thunderbird dispatches a non-bubbling compose-window-init event
-                    // from MsgComposeCommands.js after gMsgCompose is initialized and
-                    // the built-in state listener is registered, but before editor
-                    // creation begins. Capturing it on the window lets us register our
-                    // own ComposeBodyReady listener for the specific reply window
-                    // without relying on getMostRecentWindow("msgcompose").
-                    composeWin.addEventListener("compose-window-init", () => {
-                      maybeCustomizeWindow(composeWin);
-                    }, { once: true, capture: true });
-                  },
-                };
-
-                try {
-                  Services.ww.registerNotification(windowObserver);
-                  const msgComposeService = MailServices.compose || Cc["@mozilla.org/messengercompose;1"]
-                    .getService(Ci.nsIMsgComposeService);
-                  if (shouldUseDirectComposeOpen(compType)) {
-                    // Native inline-forward body/attachment population only runs through OpenComposeWindow.
-                    msgComposeService.OpenComposeWindow(
-                      null,
-                      msgComposeParams.origMsgHdr,
-                      originalMsgURI,
-                      compType,
-                      msgComposeParams.format,
-                      identity,
-                      identity?.email || "",
-                      null
-                    );
-                  } else {
-                    msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-                  }
-                } catch (e) {
-                  finish({ error: e.toString() });
-                }
-              });
+                });
+              } finally {
+                // A failed/timed-out native opening may still create a window.
+                // Do not let a later call mistake it for its own. Only failures
+                // before invoking the native opener are safe to retry.
+                if (releaseOpen) releaseOpen(!nativeOpenStarted);
+              }
             }
+            // END COMPOSE WINDOW OPEN HELPER
 
             /**
              * Saves a message directly via nsIMsgSend without opening a compose window.
