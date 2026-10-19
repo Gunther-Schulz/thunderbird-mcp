@@ -2030,7 +2030,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         organization: { type: "string", description: "Organization or company name" },
         title: { type: "string", description: "Job title" },
         note: { type: "string", description: "Contact note; may contain multiple lines" },
-        birthday: { type: "string", description: "Birthday as YYYY-MM-DD or --MM-DD when the year is unknown" },
+        birthday: { type: "string", description: "Birthday as YYYY-MM-DD, or --MM-DD when the year is unknown. Some CardDAV servers drop a year-less birthday on sync, which leaves the contact with no birthday." },
       };
       return [
       {
