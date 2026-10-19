@@ -10076,13 +10076,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
                         }
 
-                        // An external attachment's URL (file:, http:, https:) is chosen by
-                        // the message; sending it would attach and mail a local file.
-                        // Refuse before anything is built or sent.
+                        // Original attachments must be stored in the message and pass
+                        // the same URL policy used when reading attachments.
                         if (aMimeMsg && aMimeMsg.allUserAttachments) {
                           for (const att of aMimeMsg.allUserAttachments) {
                             if (isExternalAttachment(att)) {
                               resolve({ error: "Direct forward cannot include an external attachment link, because its content is not stored in the message. Use skipReview: false to review in Thunderbird." });
+                              return;
+                            }
+                            const fetchRefusal = getSystemPrincipalFetchRefusal(att?.url);
+                            if (fetchRefusal) {
+                              resolve({ error: `Direct forward cannot include this attachment: ${fetchRefusal}. Use skipReview: false to review in Thunderbird.` });
                               return;
                             }
                           }

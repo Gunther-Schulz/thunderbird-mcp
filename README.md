@@ -183,8 +183,6 @@ The same settings page has a "Send Safety" section. **Block `skipReview`** is en
 
 The separate "Filter Send Actions" section controls **Allow automatic Forward/Reply filter actions**, which defaults to off. Only the user can change this preference in the settings page; MCP clients cannot enable it.
 
-A message can declare an "external" attachment, a link to a `file:`, `http:`, or `https:` URL instead of embedded content. These links are never fetched: `getMessage` with `saveAttachments: true` reports "External attachment link refused" on that attachment, `includeInlineImages` reports the same refusal when no stored part of the message can be read instead, and a direct forward (`forwardMessage` with `skipReview: true`) is refused if the original has one, so a crafted message cannot make the server read a local file or request a URL. Attachments stored in the message, including those from Exchange accounts, are unaffected. As a second check, attachment and inline-image fetches also refuse URLs using schemes that are never a mail store (`file`, `http`, `https`, `ftp`, `data`, `blob`, `jar`, `resource`, `chrome`, `moz-extension`, `about`, `view-source`). A forward opened for review (`skipReview: false`) is built by Thunderbird itself and shows its attachments in the compose window.
-
 ---
 
 ## Setup
@@ -266,6 +264,10 @@ That's it. Your AI can now access Thunderbird.
 For `sendMail`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attachments` as a JSON array, not a JSON-encoded string. The stdio bridge reads file-path attachments on the host and sends inline base64 to Thunderbird. The existing bridge limit is **18 MiB per path attachment**, now also applied to `saveDraft`. The extension's direct-HTTP path limit remains 50 MiB; inline base64 remains limited to 25 MiB of encoded data. Both transports enforce at most 20 attachments and 50 MiB of decoded attachments per operation.
 
 UNC/network and device paths, dotfiles and dot-directories, application-data directories (Windows `AppData` and the macOS home `Library`), and credential/key filenames are refused. Windows alternate data streams and path components ending in dots or spaces are also refused. Files exported by `getMessage(saveAttachments: true)` can still be attached again, and ordinary local document paths continue to work. If any attachment is refused, missing, invalid, or over a limit, the entire operation fails before sending, saving a draft, or opening a review window. The error identifies refused entries; temporary files created during the failed conversion are removed. Callers that previously relied on partial attachment success must handle this error explicitly.
+
+Files in hidden or application-data folders, including macOS `~/Library` and its cloud folders, must be copied to an ordinary folder before they can be attached by path.
+
+External attachment links, including attachments removed with Thunderbird's **Detach** command and RSS/Atom feed enclosures, are refused by `getMessage` with `saveAttachments: true`, which reports "External attachment link refused" for the affected attachment. `includeInlineImages` also refuses them unless it can read a stored message part. A direct forward (`forwardMessage` with `skipReview: true`) is refused if the original includes one. Attachments stored in the message, including those from Exchange accounts, continue to work. A forward opened for review (`skipReview: false`) is built by Thunderbird and shows its attachments in the compose window.
 
 ## Security
 
