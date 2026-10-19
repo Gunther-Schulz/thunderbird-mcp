@@ -21,13 +21,13 @@ function snippet(name) {
 
 function loadSignatureHelpers(options = {}) {
   const bytes = Buffer.from(options.bytes ?? "signature", "utf8").toString("latin1");
-  const calls = { opens: 0, closes: 0, reads: [], warnings: [], conversions: [] };
+  const calls = { opens: 0, closes: 0, reads: [], warnings: [], conversions: [], mimeFiles: [] };
   let cursor = 0;
   const file = {
     fileSize: Object.hasOwn(options, "fileSize") ? options.fileSize : bytes.length,
     leafName: options.leafName || "signature.txt",
-    exists: () => true,
-    isFile: () => true,
+    exists: () => options.exists !== false,
+    isFile: () => options.isFile !== false,
   };
   const stream = {
     init(openedFile) {
@@ -63,6 +63,13 @@ function loadSignatureHelpers(options = {}) {
       nsMsgFolderFlags: { Drafts: 0x400 },
     },
     Cc: {
+      "@mozilla.org/mime;1": { getService: () => ({
+        getTypeFromFile(signatureFile) {
+          calls.mimeFiles.push(signatureFile);
+          if (options.mimeError) throw options.mimeError;
+          return options.mimeType ?? "text/plain";
+        },
+      }) },
       "@mozilla.org/network/file-input-stream;1": { createInstance: () => stream },
       "@mozilla.org/parserutils;1": { getService: () => ({
         convertToPlainText(...args) {
@@ -122,6 +129,36 @@ describe("Direct compose identity signatures", () => {
     const { api } = loadSignatureHelpers();
     assert.equal(api.buildBodyWithSignature("Hello", { htmlSigText: "Jane\nSupport" }, false, false), "Hello\n\n-- \nJane\nSupport");
     assert.equal(api.buildBodyWithSignature("Hello", { htmlSigText: "-- \nJane" }, false, false), "Hello\n\n-- \nJane");
+  });
+
+  for (const htmlSigFormat of [false, true]) {
+    it(`honors suppressed separators for a ${htmlSigFormat ? "HTML" : "plain"} signature in both compose formats`, () => {
+      const { api } = loadSignatureHelpers({ plainText: "Jane\n" });
+      const identity = { htmlSigText: htmlSigFormat ? "<b>Jane</b>" : "Jane", htmlSigFormat, suppressSigSep: true };
+      assert.equal(api.buildBodyWithSignature("Hello", identity, false, false), "Hello\n\nJane");
+      assert.match(api.buildBodyWithSignature("Hello", identity, true, false),
+        htmlSigFormat ? /<div class="moz-signature"><b>Jane<\/b><\/div>/ : /<div class="moz-signature">Jane<\/div>/);
+    });
+  }
+
+  for (const signature of ["\n-- \nJane", "Jane\n-- \nTeam", "Jane\r\n\t--\t\r\nTeam", "Jane\n\u00a0--\u00a0\nTeam"]) {
+    it(`keeps an existing separator anywhere in ${JSON.stringify(signature)}`, () => {
+      const { api } = loadSignatureHelpers();
+      assert.equal(api.buildBodyWithSignature("Hello", { htmlSigText: signature }, false, false), `Hello\n\n${signature}`);
+    });
+  }
+
+  it("recognizes a separator in the rendered text of an HTML signature", () => {
+    const signature = '<div>Jane</div><div>-- </div><div>Team</div>';
+    const { api } = loadSignatureHelpers({ plainText: "\nJane\n-- \nTeam\n" });
+    const body = api.buildBodyWithSignature("Hello", { htmlSigText: signature, htmlSigFormat: true }, true, false);
+    assert.ok(body.includes(`<div class="moz-signature">${signature}</div>`));
+    assert.equal((body.match(/-- /g) || []).length, 1);
+  });
+
+  it("does not mistake inline dashes for a separator line", () => {
+    const { api } = loadSignatureHelpers();
+    assert.equal(api.buildBodyWithSignature("Hello", { htmlSigText: "Jane -- Team" }, false, false), "Hello\n\n-- \nJane -- Team");
   });
 
   it("escapes plain signatures and bodies when composing HTML", () => {
@@ -205,6 +242,40 @@ describe("Direct compose identity signatures", () => {
     }
   });
 
+  for (const tool of ["sendMail", "saveDraft"]) {
+    for (const isHtml of [false, true]) {
+      it(`${tool} honors separator suppression in ${isHtml ? "HTML" : "plain"} production dispatch`, async () => {
+        const { api, calls } = loadComposeTools({ htmlSigText: "Jane", suppressSigSep: true });
+        const result = await api.dispatchTool(tool, {
+          to: "to@example.test", subject: "Subject", body: "Hello", isHtml,
+          ...(tool === "sendMail" ? { skipReview: true } : {}),
+        });
+        assert.equal(result.success, true);
+        assert.equal(calls.sends.length, 1);
+        assert.doesNotMatch(calls.sends[0].fields.body, /-- /);
+        assert.ok(calls.sends[0].fields.body.includes("Jane"));
+      });
+
+      it(`${tool} omits image-file bytes and inline fallback in ${isHtml ? "HTML" : "plain"} production dispatch`, async () => {
+        const identity = { attachSignature: true, htmlSigText: "Inline Jane" };
+        const { api, calls, file } = loadComposeTools(identity, {
+          bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]), leafName: "signature", mimeType: "image/png",
+        });
+        identity.signature = file;
+        const result = await api.dispatchTool(tool, {
+          to: "to@example.test", subject: "Subject", body: "Hello", isHtml,
+          ...(tool === "sendMail" ? { skipReview: true } : {}),
+        });
+        assert.equal(result.success, true);
+        assert.equal(calls.sends[0].fields.body, isHtml
+          ? '<html><head><meta charset="UTF-8"></head><body>Hello</body></html>' : "Hello");
+        assert.equal(calls.opens, 0);
+        assert.equal(calls.reads.length, 0);
+        assert.equal(calls.warnings.length, 1);
+      });
+    }
+  }
+
   it("leaves signature insertion to Thunderbird on the review path", async () => {
     const { api, calls } = loadComposeTools();
     api.buildBodyWithSignature = () => assert.fail("review must not append a second signature");
@@ -233,9 +304,59 @@ describe("Bounded identity signature files", () => {
     assert.equal(calls.closes, 1);
   });
 
-  it("classifies HTML signature files by their extension", () => {
-    const { api, file } = loadSignatureHelpers({ bytes: "<b>Jane</b>", leafName: "signature.HTML" });
+  it("classifies extensionless HTML signature files using the MIME service", () => {
+    const { api, file, calls } = loadSignatureHelpers({ bytes: "<b>Jane</b>", leafName: "signature", mimeType: "text/html" });
     assert.equal(api.getIdentitySignature({ attachSignature: true, signature: file }).isHtmlSig, true);
+    assert.deepEqual(calls.mimeFiles, [file]);
+  });
+
+  it("falls back to the HTML extension when the MIME service cannot classify a file", () => {
+    const { api, file } = loadSignatureHelpers({ bytes: "<b>Jane</b>", leafName: "signature.HTML", mimeError: new Error("unknown file type") });
+    assert.equal(api.getIdentitySignature({ attachSignature: true, signature: file }).isHtmlSig, true);
+  });
+
+  it("uses the MIME service result in preference to the file extension", () => {
+    const { api, file } = loadSignatureHelpers({ bytes: "Jane", leafName: "signature.png", mimeType: "text/plain" });
+    assert.equal(api.getIdentitySignature({ attachSignature: true, signature: file }).content, "Jane");
+  });
+
+  for (const mimeType of ["image/png", "image/svg+xml"]) {
+    it(`skips an extensionless ${mimeType} signature without opening it or using inline text`, () => {
+      const { api, file, calls } = loadSignatureHelpers({ leafName: "signature", mimeType });
+      assert.equal(api.getIdentitySignature({ attachSignature: true, signature: file, htmlSigText: "Inline Jane" }), null);
+      assert.deepEqual(calls.mimeFiles, [file]);
+      assert.equal(calls.opens, 0);
+      assert.equal(calls.reads.length, 0);
+      assert.equal(calls.warnings.length, 1);
+      assert.match(calls.warnings[0][0], /image signature files are omitted/);
+    });
+  }
+
+  for (const options of [{ mimeError: new Error("unknown file type") }, { mimeType: "" }]) {
+    it(`skips image extensions when MIME detection ${options.mimeError ? "throws" : "returns no type"}`, () => {
+      const { api, file, calls } = loadSignatureHelpers({ leafName: "signature.PNG", ...options });
+      assert.equal(api.getIdentitySignature({ attachSignature: true, signature: file, htmlSigText: "Inline Jane" }), null);
+      assert.equal(calls.opens, 0);
+      assert.equal(calls.warnings.length, 1);
+    });
+  }
+
+  for (const [label, options] of [
+    ["missing", { exists: false }],
+    ["directory", { isFile: false }],
+    ["empty", { bytes: "" }],
+    ["blank", { bytes: " \n\t" }],
+    ["unreadable", { initError: new Error("read failed") }],
+  ]) {
+    it(`omits a ${label} signature file without falling back to inline text`, () => {
+      const { api, file } = loadSignatureHelpers(options);
+      assert.equal(api.getIdentitySignature({ attachSignature: true, signature: file, htmlSigText: "Inline Jane" }), null);
+    });
+  }
+
+  it("does not use inline text when the selected signature file is absent", () => {
+    const { api } = loadSignatureHelpers();
+    assert.equal(api.getIdentitySignature({ attachSignature: true, htmlSigText: "Inline Jane" }), null);
   });
 
   for (const fileSize of [MAX_SIGNATURE_BYTES + 1, -1, Infinity, NaN, 1.5, "12", undefined, Number.MAX_SAFE_INTEGER + 1]) {
