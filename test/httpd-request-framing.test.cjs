@@ -352,6 +352,54 @@ describe("httpd unexpected failures stay connection-local", () => {
 
 describe("httpd to the production MCP HTTP handler", () => {
   for (const mode of ["loopback", "listenAll"]) {
+    for (const version of ["1.0", "1.1"]) {
+      it(`validates supplied Host independently of authenticated HTTP/${version} authority (${mode})`, () => {
+        const harness = createHttpdHarness({ mode });
+        const token = "httpd-host-test-token";
+        installMcpHandler(harness, token);
+        const absoluteHost = "127.0.0.1";
+        const target = version === "1.0" ? "/" : `http://${absoluteHost}:${HTTPD_PORT}/`;
+        // Reuse the fixed URI-service stub pattern; authority checks stay real.
+        harness.sandbox.Services.io.newURI = uri => {
+          assert.equal(uri, target);
+          return { pathQueryRef: "/", scheme: "http", asciiHost: absoluteHost, port: HTTPD_PORT };
+        };
+        const body = JSON.stringify({ jsonrpc: "2.0", id: "host-check", method: "resources/list" });
+        const fields = `Authorization: Bearer ${token}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n`;
+        const reply = JSON.stringify({ jsonrpc: "2.0", id: "host-check", result: { resources: [] } });
+
+        for (const host of ["localhost:65536", `bad host:${HTTPD_PORT}`, "localhost:not-a-port"]) {
+          const rejected = harness.request(requestHead(fields, { version, target, host }) + body);
+          assertResponse(rejected, 400);
+          assert.equal(rejected.errors.length, 1);
+          assert.ok(rejected.errors[0] instanceof harness.sandbox.HttpError);
+          assert.equal(rejected.errors[0].code, 400);
+          assert.equal(harness.server._doQuit, false);
+
+          const followup = harness.request(requestHead(fields) + body);
+          assertResponse(followup, 200);
+          assert.ok(followup.wire.endsWith("\r\n\r\n" + reply), "authenticated follow-up reached MCP");
+        }
+
+        // A valid unknown Host must not override either authority. HTTP/1.0
+        // also continues to accept no Host at all.
+        const validHosts = ["unrecognized.example:65535"];
+        if (version === "1.0") validHosts.push(null);
+        for (const host of validHosts) {
+          const accepted = harness.request(requestHead(fields, { version, target, host }) + body);
+          assertResponse(accepted, 200);
+          assert.ok(accepted.wire.endsWith("\r\n\r\n" + reply));
+          assert.equal(accepted.connection.request.host,
+            version === "1.0" ? harness.server.identity.primaryHost : absoluteHost);
+          assert.equal(accepted.connection.request.port, HTTPD_PORT);
+        }
+        assert.equal(harness.server._doQuit, false);
+        assert.equal(harness.server._socket, harness.socket);
+        assert.equal(harness.socket.closed, false);
+        assert.deepEqual(harness.logs, []);
+      });
+    }
+
     it(`authenticates and dispatches a real POST after a rejected request (${mode})`, () => {
       const harness = createHttpdHarness({ mode });
       assertRejected(harness, requestHead("Transfer-Encoding: chunked\r\n"), 501);

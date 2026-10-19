@@ -1665,8 +1665,26 @@ RequestReader.prototype = {
     var metadata = this._metadata;
     var headers = metadata._headers;
 
-    // 19.6.1.1 -- servers MUST report 400 to HTTP/1.1 requests w/o Host header
     var identity = this._connection.server.identity;
+    // Local patch: validate any supplied Host, even when HTTP/1.0 or an
+    // absolute Request-URI supplies the authority. Only malformed headers are
+    // rejected here; an unrecognized valid Host matters only when resolving it.
+    var hostPort, resolvedIdentity;
+    if (headers.hasHeader("Host")) {
+      hostPort = headers.getHeader("Host");
+      resolvedIdentity = resolveIdentityFromHostHeader(identity, hostPort);
+      if (resolvedIdentity.error && resolvedIdentity.reason === "malformed") {
+        dumpn(
+          "*** malformed hostname (" +
+            hostPort +
+            ") in Host " +
+            "header, 400 time"
+        );
+        throw resolvedIdentity.error;
+      }
+    }
+
+    // 19.6.1.1 -- servers MUST report 400 to HTTP/1.1 requests w/o Host header
     if (metadata._httpVersion.atLeast(nsHttpVersion.HTTP_1_1)) {
       if (!headers.hasHeader("Host")) {
         dumpn("*** malformed HTTP/1.1 or greater request with no Host header!");
@@ -1678,17 +1696,6 @@ RequestReader.prototype = {
       // server identity data at this point, because the request just doesn't
       // contain enough data on its own to do this, sadly.
       if (!metadata._host) {
-        var hostPort = headers.getHeader("Host");
-        var resolvedIdentity = resolveIdentityFromHostHeader(identity, hostPort);
-        if (resolvedIdentity.error && resolvedIdentity.reason === "malformed") {
-          dumpn(
-            "*** malformed hostname (" +
-              hostPort +
-              ") in Host " +
-              "header, 400 time"
-          );
-          throw resolvedIdentity.error;
-        }
         if (resolvedIdentity.error) {
           dumpn(
             "*** unrecognized hostname (" +
