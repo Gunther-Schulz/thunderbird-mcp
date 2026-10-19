@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { HTTPD_PORT, createHttpdHarness } = require("./helpers/httpd.cjs");
+const REFRESH_TIMER_TYPE = 1;
 
 // The existing marker loaders cover individual helpers, not start/status.
 // Load the complete production methods; only Thunderbird services are mocked.
@@ -26,6 +28,9 @@ function loadServerLifecycle(overrides = {}) {
     attempts: 0,
     servers: [],
     timers: [],
+    channels: [],
+    nonce: 0,
+    connectionWrites: [],
     pendingStops: [],
     connection: null,
     removals: 0,
@@ -37,17 +42,31 @@ function loadServerLifecycle(overrides = {}) {
       this.listening = false;
       this.binds = [];
       this.stops = 0;
+      this.handlers = new Map();
+      this.bindModes = [];
       state.servers.push(this);
     }
-    registerPathHandler() {}
+    registerPathHandler(path, handler) {
+      if (path !== "/" && handler && state.handlerError) throw state.handlerError;
+      if (handler) this.handlers.set(path, handler);
+      else this.handlers.delete(path);
+    }
     start(port) {
       this.binds.push(port);
-      if (state.bindError) throw state.bindError;
+      this.bindModes.push("loopback");
+      const error = typeof state.bindError === "function" ? state.bindError(port, this.binds.length) : state.bindError;
+      if (error) throw error;
       assert.ok(!state.servers.some(server => server.listening), "previous listener must stop before rebinding");
       this.listening = true;
+      this.port = port;
+    }
+    startAll(port) {
+      this.start(port);
+      this.bindModes[this.bindModes.length - 1] = "listenAll";
     }
     stop(callback) {
       this.stops++;
+      if (state.stopError) throw state.stopError;
       let result;
       if (!callback) {
         result = new Promise(resolve => { callback = resolve; });
@@ -63,6 +82,93 @@ function loadServerLifecycle(overrides = {}) {
     }
   }
 
+  // Reuse the NetUtil read stub pattern from read-message-stream.test.cjs;
+  // model channel events separately so cancellation and late delivery are tested.
+  const NetUtil = {
+    newChannel(options) {
+      if (state.channelError) throw state.channelError;
+      const url = new URL(options.uri);
+      const mode = typeof state.probeResult === "function"
+        ? state.probeResult(Number(url.port), state.channels.length)
+        : state.probeResult || "ours";
+      const channel = {
+        ...options, url, mode, loadFlags: 0, headers: {}, cancelled: false,
+        bytesRead: 0, readSizes: [], responseStatusText: "OK",
+        get responseStatus() {
+          if (state.statusError) throw state.statusError;
+          return this.statusCode ?? (mode === "ours" ? 200 : 404);
+        },
+        get proxyInfo() {
+          if (state.proxyError) throw state.proxyError;
+          return state.proxyInfo ?? null;
+        },
+        getResponseVersion(major, minor) {
+          if (state.versionError) throw state.versionError;
+          [major.value, minor.value] = state.responseVersion || [1, 1];
+        },
+        QueryInterface() {
+          if (state.queryError) throw state.queryError;
+          return this;
+        },
+        setRequestHeader(name, value) { this.headers[name] = value; },
+        visitResponseHeaders(visitor) {
+          for (const [name, value] of Object.entries(this.responseHeaders || state.responseHeaders || {})) {
+            visitor.visitHeader(name, value);
+          }
+        },
+        cancel() {
+          this.cancelled = true;
+          if (state.cancelError) throw state.cancelError;
+        },
+        deliver(bytes) {
+          this.listener.onDataAvailable(this, { bytes, channel: this }, this.bytesRead, bytes.length);
+        },
+        respond() {
+          if (mode === "timeout") return;
+          let body = "foreign response";
+          if (state.httpd) {
+            const headers = Object.entries(this.headers).map(([name, value]) => `${name}: ${value}\r\n`).join("");
+            this.requestWire = `${this.requestMethod} ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\n${headers}\r\n`;
+            this.exchange = state.httpd.request(this.requestWire);
+            const [head, responseBody] = this.exchange.wire.split("\r\n\r\n");
+            this.statusCode = Number(/^HTTP\/1\.1 (\d+)/.exec(head)?.[1]);
+            this.responseHeaders = Object.fromEntries(head.split("\r\n").slice(1).map(line => {
+              const colon = line.indexOf(":");
+              return [line.slice(0, colon), line.slice(colon + 1).trim()];
+            }));
+            body = responseBody;
+          } else if (mode === "ours") {
+            const res = { setStatusLine() {}, setHeader() {}, write(value) { body = value; } };
+            this.handler({ path: url.pathname, method: this.requestMethod }, res);
+          }
+          if (mode !== "inconclusive") {
+            this.listener.onStartRequest(this);
+            for (const chunk of state.bodyChunks || [body]) {
+              if (!this.cancelled) this.deliver(chunk);
+            }
+          }
+          this.listener.onStopRequest(this, 0);
+        },
+        asyncOpen(listener) {
+          this.listener = listener;
+          if (state.asyncOpenError) throw state.asyncOpenError;
+          this.handler = state.servers.find(server => server.listening && server.port === Number(url.port))?.handlers.get(url.pathname);
+          if (!state.holdProbes) queueMicrotask(() => this.respond());
+        },
+      };
+      state.channels.push(channel);
+      return channel;
+    },
+    readInputStreamToString(stream, count) {
+      if (state.readError) throw state.readError;
+      stream.channel.readSizes.push(count);
+      stream.channel.bytesRead += count;
+      const result = stream.bytes.slice(0, count);
+      stream.bytes = stream.bytes.slice(count);
+      return result;
+    },
+  };
+
   const connectionPath = "/mock-tmp/thunderbird-mcp/connection.json";
   const sandbox = {
     MCP_DEFAULT_PORT: 8765,
@@ -74,18 +180,23 @@ function loadServerLifecycle(overrides = {}) {
       error: (...args) => state.logs.push(args),
     },
     ChromeUtils: {
+      generateQI: () => function () { return this; },
       importESModule(uri) {
         if (uri.startsWith("resource://thunderbird-mcp/httpd.sys.mjs")) {
           state.attempts++;
           if (state.importError) throw state.importError;
           return { HttpServer };
         }
+        if (uri === "resource://gre/modules/NetUtil.sys.mjs") return { NetUtil };
         return {};
       },
     },
     Services: {
       appinfo: { OS: "WINNT", processID: 4242 },
-      prefs: { clearUserPref() {} },
+      prefs: {
+        clearUserPref() { state.listenAll = false; },
+        setBoolPref(_name, value) { state.listenAll = value; },
+      },
       io: { newURI() { throw { name: "NS_ERROR_FILE_NOT_FOUND" }; } },
       dirsvc: {
         get: () => ({
@@ -101,7 +212,13 @@ function loadServerLifecycle(overrides = {}) {
         }),
       },
     },
-    Ci: { nsIFile: { DIRECTORY_TYPE: 1 }, nsITimer: { TYPE_REPEATING_SLACK: 1 } },
+    Ci: {
+      nsIFile: { DIRECTORY_TYPE: 1 }, nsITimer: { TYPE_ONE_SHOT: 0, TYPE_REPEATING_SLACK: REFRESH_TIMER_TYPE },
+      nsIRequest: { LOAD_ANONYMOUS: 1, LOAD_BYPASS_CACHE: 2, INHIBIT_CACHING: 4, LOAD_FRESH_CONNECTION: 8 },
+      nsIChannel: { LOAD_INITIAL_DOCUMENT_URI: 16 }, nsIHttpChannel: "http",
+      nsIHttpChannelInternal: "httpInternal", nsIProxiedChannel: "proxy",
+    },
+    Cr: { NS_BINDING_ABORTED: "aborted" },
     Cc: {
       "@mozilla.org/network/file-output-stream;1": {
         createInstance: () => ({
@@ -111,19 +228,32 @@ function loadServerLifecycle(overrides = {}) {
       "@mozilla.org/intl/converter-output-stream;1": {
         createInstance: () => ({
           init() {},
-          writeString(data) { state.connection = JSON.parse(data); },
+          writeString(data) {
+            state.connection = JSON.parse(data);
+            state.connectionWrites.push(state.connection);
+          },
           close() {},
         }),
       },
       "@mozilla.org/timer;1": {
         createInstance() {
+          if (state.timerCreateFailures > 0) {
+            state.timerCreateFailures--;
+            throw new Error("timer creation failed");
+          }
           const timer = {
             cancelled: false,
-            initWithCallback(callback) {
+            initWithCallback(callback, delay, type) {
               this.callback = callback;
-              if (state.timerError) throw state.timerError;
+              this.delay = delay;
+              this.type = type;
+              const error = type === 0 ? state.probeTimerError : state.timerError;
+              if (error) throw error;
             },
-            cancel() { this.cancelled = true; },
+            cancel() {
+              this.cancelled = true;
+              if (this.type === 0 && state.probeTimerCancelError) throw state.probeTimerCancelError;
+            },
           };
           state.timers.push(timer);
           return timer;
@@ -131,7 +261,11 @@ function loadServerLifecycle(overrides = {}) {
       },
     },
     getStableAuthTokenPref: () => "a".repeat(64),
-    isListenAllEnabled: () => false,
+    generateAuthToken() {
+      if (state.nonceError) throw state.nonceError;
+      return (++state.nonce).toString(16).padStart(64, "0");
+    },
+    isListenAllEnabled: () => !!state.listenAll,
     PREF_LISTEN_ALL: "extensions.thunderbird-mcp.listenAll",
     readConnectionInfo: () => ({ path: connectionPath, data: state.connection }),
     removeConnectionInfo() {
@@ -142,12 +276,19 @@ function loadServerLifecycle(overrides = {}) {
   vm.createContext(sandbox);
   vm.runInContext([
     markedSnippet("CONNECTION INFO REFRESH HELPERS"),
-    `this.api = {
-      ${markedSnippet("SERVER LIFECYCLE")}
-      ${markedSnippet("LISTEN ALL SETTER")}
-    };`,
+    markedSnippet("LISTENER OWNERSHIP HELPERS"),
+    `this.probeSettings = { maxBytes: LISTENER_PROBE_MAX_BYTES, timeoutMs: LISTENER_PROBE_TIMEOUT_MS };
+     this.shutdown = function () { ${markedSnippet("SERVER SHUTDOWN")} };`,
+    `this.getAPI = function () {
+      ${markedSnippet("SERVER INSTANCE STATE")}
+      return {
+        ${markedSnippet("SERVER LIFECYCLE")}
+        ${markedSnippet("LISTEN ALL SETTER")}
+      };
+    };
+    this.api = this.getAPI();`,
   ].join("\n"), sandbox);
-  return { api: sandbox.api, sandbox, state };
+  return { api: sandbox.api, sandbox, state, NetUtil };
 }
 
 // Reuse the production lifecycle above for the options page's browser API.
@@ -161,7 +302,7 @@ function loadServerStatus(api) {
   const saveEnd = source.indexOf("// END OPTIONS LISTEN ALL SAVE", saveStart);
   assert.ok(saveStart >= 0 && saveEnd > saveStart, "options listen-all save markers missing");
   const elements = Object.fromEntries([
-    "statusDot", "statusText", "serverPort", "connFile", "buildInfo", "retryServerBtn",
+    "statusDot", "statusText", "serverPort", "serverPortNotice", "connFile", "buildInfo", "retryServerBtn",
     "listenAllCheckbox", "saveListenAllBtn", "saveListenAllStatus",
   ].map(id => [id, {
     textContent: "", className: "", hidden: true, disabled: false,
@@ -182,7 +323,312 @@ function loadServerStatus(api) {
   return ui;
 }
 
+describe("listener ownership classification", () => {
+  const { sandbox } = loadServerLifecycle();
+  for (const [name, evidence, expected] of [
+    ["handler observation survives response failure", { observed: true }, "ours"],
+    ["handler observation wins over a proxy", { observed: true, status: 200, unproxied: false }, "ours"],
+    ...[200, 302, 403, 404, 500].map(status => [`unproxied status ${status}`, { status, unproxied: true }, "foreign"]),
+    ["proxy", { status: 200, unproxied: false }, "inconclusive"],
+    ["unknown proxy state", { status: 200 }, "inconclusive"],
+    ...[undefined, null, 0, 99, 600, "200", NaN].map(status => [`missing/invalid status ${status}`, { status, unproxied: true }, "inconclusive"]),
+  ]) {
+    it(name, () => assert.equal(sandbox.classifyListenerProbe(evidence), expected));
+  }
+});
+
+describe("post-bind listener ownership", () => {
+  for (const listenAll of [false, true]) {
+    it(`stops a foreign listener before rebinding (${listenAll ? "listenAll" : "loopback"})`, async () => {
+      const { api, state } = loadServerLifecycle({
+        listenAll, holdStops: true, probeResult: port => port === 8765 ? "foreign" : "ours",
+      });
+      const pending = api.start();
+      await new Promise(setImmediate);
+      assert.deepEqual(state.servers[0].binds, [8765]);
+      assert.equal(state.pendingStops.length, 1);
+      assert.equal(state.connection, null);
+      assert.equal((await api.getServerInfo()).running, false);
+      state.pendingStops.shift()();
+      assert.equal((await pending).port, 8766);
+      assert.deepEqual(state.servers[0].binds, [8765, 8766]);
+      assert.deepEqual(state.servers[0].bindModes, Array(2).fill(listenAll ? "listenAll" : "loopback"));
+      assert.equal(state.servers[0].stops, 1);
+      assert.deepEqual(state.connectionWrites.map(info => info.port), [8766]);
+      assert.deepEqual([...state.servers[0].handlers.keys()], ["/"]);
+      assert.notEqual(state.channels[0].url.pathname, state.channels[1].url.pathname);
+    });
+  }
+
+  it("uses anonymous, uncached, unredirected, fresh token-free requests", async () => {
+    const { api, sandbox, state } = loadServerLifecycle();
+    await api.start();
+    const channel = state.channels[0];
+    const flags = sandbox.Ci.nsIRequest;
+    assert.equal(channel.loadFlags, flags.LOAD_ANONYMOUS | flags.LOAD_BYPASS_CACHE |
+      flags.INHIBIT_CACHING | flags.LOAD_FRESH_CONNECTION | sandbox.Ci.nsIChannel.LOAD_INITIAL_DOCUMENT_URI);
+    assert.equal(channel.redirectionLimit, 0);
+    assert.equal(channel.requestMethod, "GET");
+    assert.equal(channel.loadUsingSystemPrincipal, true);
+    assert.deepEqual(channel.headers, { Connection: "close" });
+    assert.doesNotMatch(channel.uri, new RegExp(state.connection.token));
+    assert.match(channel.url.pathname, /^\/thunderbird-mcp-probe\/[0-9a-f]{64}$/);
+    assert.equal(state.timers[0].delay, sandbox.probeSettings.timeoutMs);
+    assert.equal(state.timers[0].cancelled, true);
+    assert.equal(channel.cancelled, true);
+  });
+
+  for (const overrides of [
+    { probeResult: "inconclusive" },
+    { probeResult: "foreign", proxyInfo: { type: "http" } },
+    { probeResult: "foreign", proxyInfo: { type: "socks" } },
+    { probeResult: "foreign", responseVersion: [0, 9] },
+    { probeResult: "foreign", responseVersion: [0, 0] },
+  ]) {
+    it(`keeps an inconclusive port: ${JSON.stringify(overrides)}`, async () => {
+      const { api, state } = loadServerLifecycle(overrides);
+      assert.equal((await api.start()).port, 8765);
+      assert.deepEqual(state.servers[0].binds, [8765]);
+      assert.ok(state.logs.some(args => String(args[0]).includes("inconclusive")));
+    });
+  }
+
+  for (const property of ["nonceError", "handlerError", "channelError", "queryError", "asyncOpenError",
+    "probeTimerError", "probeTimerCancelError", "versionError", "statusError", "proxyError", "readError", "cancelError"]) {
+    it(`keeps the bound port after ${property}`, async () => {
+      const { api, state } = loadServerLifecycle({ probeResult: "foreign", [property]: new Error(property) });
+      assert.equal((await api.start()).success, true);
+      assert.deepEqual(state.servers[0].binds, [8765]);
+      assert.equal(state.servers[0].stops, 0);
+      assert.equal(state.connection.port, 8765);
+      assert.deepEqual([...state.servers[0].handlers.keys()], ["/"]);
+      assert.ok(state.logs.some(args => String(args[0]).includes("inconclusive")));
+    });
+  }
+
+  it("contains timer creation and unexpected probe-helper exceptions", async () => {
+    for (const helperThrows of [false, true]) {
+      const { api, sandbox, state } = loadServerLifecycle({ timerCreateFailures: 1 });
+      if (helperThrows) {
+        state.timerCreateFailures = 0;
+        sandbox.probeListenerOwnership = () => { throw new Error("unexpected probe failure"); };
+      }
+      assert.equal((await api.start()).success, true);
+      assert.deepEqual(state.servers[0].binds, [8765]);
+      assert.equal(state.servers[0].stops, 0);
+    }
+  });
+
+  it("keeps the listening port when stopping a foreign listener throws", async () => {
+    const { api, state } = loadServerLifecycle({ probeResult: "foreign", stopError: new Error("stop failed") });
+    assert.equal((await api.start()).success, true);
+    assert.deepEqual(state.servers[0].binds, [8765]);
+    assert.equal(state.servers[0].listening, true);
+    assert.equal(state.connection.port, 8765);
+    assert.ok(state.logs.some(args => String(args[0]).includes("could not stop the listener")));
+  });
+
+  it("times out without requiring channel callbacks and ignores late delivery", async () => {
+    const { api, state } = loadServerLifecycle({ holdProbes: true });
+    const pending = api.start();
+    const channel = state.channels[0];
+    state.timers[0].callback();
+    assert.equal((await pending).port, 8765);
+    const connection = state.connection;
+    channel.respond();
+    channel.deliver("late data");
+    assert.equal(channel.bytesRead, 0);
+    assert.strictEqual(state.connection, connection);
+    assert.equal(state.servers[0].stops, 0);
+  });
+
+  it("does not let an earlier attempt's handler or events claim the next port", async () => {
+    const { api, state } = loadServerLifecycle({ holdProbes: true, probeResult: "foreign" });
+    const pending = api.start();
+    const first = state.channels[0];
+    first.respond();
+    await new Promise(setImmediate);
+    assert.equal(state.channels.length, 2);
+    first.handler({ path: first.url.pathname, method: "GET" }, { setStatusLine() {}, setHeader() {}, write() {} });
+    first.listener.onStopRequest(first, 0);
+    state.timers[0].callback();
+    assert.equal(state.connection, null);
+    // No response from the second port: it must remain inconclusive.
+    state.timers[1].callback();
+    assert.equal((await pending).port, 8766);
+    assert.ok(state.logs.some(args => String(args[0]).includes("inconclusive on port 8766")));
+  });
+
+  for (const headers of [false, true]) {
+    it(`caps ${headers ? "headers before body" : "incremental body reads"} and cancels the channel`, async () => {
+      const { api, sandbox, state } = loadServerLifecycle({
+        probeResult: port => port === 8765 ? "foreign" : "ours",
+        ...(headers ? { responseHeaders: { "X-Pad": "a".repeat(8192) } } : { bodyChunks: ["a".repeat(3000), "b".repeat(8192)] }),
+      });
+      assert.equal((await api.start()).port, 8766);
+      assert.equal(state.channels[0].cancelled, true);
+      assert.ok(state.channels[0].bytesRead <= sandbox.probeSettings.maxBytes);
+      if (headers) assert.equal(state.channels[0].bytesRead, 0);
+      else assert.equal(state.channels[0].readSizes.length, 2);
+    });
+  }
+
+  for (const initialBusy of [0, 2]) {
+    it(`falls back to the first bound port when all probes are foreign (${initialBusy} initial busy ports)`, async () => {
+      const { api, state } = loadServerLifecycle({
+        probeResult: "foreign", bindError: port => port < 8765 + initialBusy ? new Error("busy") : null,
+      });
+      const result = await api.start();
+      assert.equal(result.success, true);
+      assert.equal(result.port, 8765 + initialBusy);
+      assert.equal(state.servers[0].listening, true);
+      assert.equal(state.channels.length, 10 - initialBusy);
+      assert.deepEqual(state.connectionWrites.map(info => info.port), [result.port]);
+      assert.ok(state.logs.some(args => String(args[0]).includes("normal port fallback")));
+    });
+  }
+
+  it("uses normal bind fallback if the first port cannot be rebound", async () => {
+    const { api, state } = loadServerLifecycle({
+      probeResult: "foreign",
+      bindError: (port, attempt) => attempt > 10 && port === 8765 ? new Error("busy now") : null,
+    });
+    assert.equal((await api.start()).port, 8766);
+    assert.deepEqual(state.servers[0].binds.slice(-2), [8765, 8766]);
+    assert.equal(state.channels.length, 10);
+  });
+
+  it("recovers from a mix of foreign responses and native bind failures", async () => {
+    const { api, state } = loadServerLifecycle({
+      probeResult: "foreign", bindError: port => port === 8765 ? null : new Error("busy"),
+    });
+    assert.equal((await api.start()).port, 8765);
+    assert.equal(state.channels.length, 1);
+    assert.deepEqual(state.connectionWrites.map(info => info.port), [8765]);
+  });
+
+  it("retains the existing failure when no port can be rebound", async () => {
+    const { api, state } = loadServerLifecycle({
+      probeResult: "foreign", bindError: (_port, attempt) => attempt > 10 ? new Error("busy now") : null,
+    });
+    const result = await api.start();
+    assert.equal(result.success, false);
+    assert.match(result.error, /Could not bind to any port in range 8765-8774.*busy now/);
+    assert.equal(state.servers[0].listening, false);
+    assert.equal(state.connection, null);
+  });
+
+  it("cancels startup during a probe without publishing after shutdown", async () => {
+    const { api, sandbox, state } = loadServerLifecycle({ holdProbes: true });
+    const pending = api.start();
+    sandbox.shutdown();
+    const result = await pending;
+    assert.equal(result.success, false);
+    assert.match(result.error, /cancelled/);
+    assert.equal(state.channels[0].cancelled, true);
+    assert.equal(state.servers[0].listening, false);
+    assert.equal(state.connectionWrites.length, 0);
+    assert.equal((await api.getServerInfo()).running, false);
+    state.channels[0].respond();
+    assert.equal((await api.getServerInfo()).running, false);
+    assert.deepEqual([...state.servers[0].handlers.keys()], ["/"]);
+  });
+
+  it("does not rebind after shutdown while a foreign listener is stopping", async () => {
+    const { api, sandbox, state } = loadServerLifecycle({ probeResult: "foreign", holdStops: true });
+    const pending = api.start();
+    await new Promise(setImmediate);
+    sandbox.shutdown();
+    state.pendingStops.shift()();
+    assert.equal((await pending).success, false);
+    assert.deepEqual(state.servers[0].binds, [8765]);
+    assert.equal(state.servers[0].stops, 1);
+    assert.equal(state.connection, null);
+  });
+
+  it("cancels queued settings restarts when shutdown interrupts a probe", async () => {
+    const { api, sandbox, state } = loadServerLifecycle({ holdProbes: true });
+    const optionsApi = sandbox.getAPI();
+    const pending = api.start();
+    const firstSetter = api.setListenAll(false);
+    await new Promise(setImmediate);
+    const secondSetter = optionsApi.setListenAll(true);
+    sandbox.shutdown();
+    for (const result of await Promise.all([pending, firstSetter, secondSetter, api.start(), optionsApi.start()])) {
+      assert.equal(result.success, false);
+      assert.match(result.error, /cancelled/);
+    }
+    assert.equal(state.attempts, 1);
+    assert.equal(state.servers[0].listening, false);
+    assert.equal(state.connectionWrites.length, 0);
+    assert.equal(sandbox.__tbMcpRestartPromise, null);
+  });
+
+  it("cancels queued settings restarts during listener teardown", async () => {
+    const { api, sandbox, state } = loadServerLifecycle({ holdStops: true });
+    assert.equal((await api.start()).success, true);
+    const firstSetter = api.setListenAll(false);
+    await new Promise(setImmediate);
+    const secondSetter = api.setListenAll(true);
+    sandbox.shutdown();
+    state.pendingStops.shift()();
+    for (const result of await Promise.all([firstSetter, secondSetter])) {
+      assert.equal(result.success, false);
+      assert.match(result.error, /cancelled/);
+    }
+    assert.equal(state.attempts, 1);
+    assert.equal(state.servers[0].listening, false);
+    assert.equal(state.connectionWrites.length, 1, "shutdown must not republish connection info");
+    assert.equal(state.connection, null);
+  });
+});
+
+describe("probe through S1's real httpd parser", () => {
+  for (const mode of ["loopback", "listenAll"]) {
+    it(`reaches the production probe handler without authentication (${mode})`, async () => {
+      const httpd = createHttpdHarness({ mode });
+      const { sandbox, state, NetUtil } = loadServerLifecycle({ httpd });
+      const result = await sandbox.probeListenerOwnership({
+        server: httpd.server, port: HTTPD_PORT, NetUtil,
+        generateNonce: sandbox.generateAuthToken, startup: {},
+      });
+      assert.equal(result, "ours");
+      assert.match(state.channels[0].exchange.wire, /^HTTP\/1\.1 200 OK\r\n/);
+      assert.match(state.channels[0].exchange.wire, /\r\n\r\n[0-9a-f]{64}$/);
+      assert.doesNotMatch(state.channels[0].requestWire, /Authorization|Bearer|Transfer-Encoding/i);
+      assert.equal(httpd.socket.closed, false);
+      assert.equal(httpd.server._doQuit, false);
+      assert.match(httpd.request(`GET ${state.channels[0].url.pathname} HTTP/1.1\r\nHost: 127.0.0.1:${HTTPD_PORT}\r\n\r\n`).wire, /^HTTP\/1\.1 404 /);
+    });
+  }
+});
+
 describe("options server status", () => {
+  it("shows the non-default port notice and clears it as status changes", async () => {
+    let info = { running: true, port: 8766 };
+    const ui = loadServerStatus({ getServerInfo: async () => {
+      if (info instanceof Error) throw info;
+      return info;
+    } });
+    for (const next of [
+      { running: true, port: 8765 },
+      { running: false, port: 8766 },
+      { running: false, lastError: "Failed to start" },
+      { running: true, port: null },
+      new Error("API unavailable"),
+    ]) {
+      info = { running: true, port: 8766 };
+      await ui.loadServerInfo();
+      assert.equal(ui.serverPortNotice.hidden, false);
+      assert.match(ui.serverPortNotice.textContent, /8766.*8765/);
+      assert.match(ui.serverPortNotice.textContent, /connection\.json.*stdio bridge/);
+      info = next;
+      await ui.loadServerInfo();
+      assert.equal(ui.serverPortNotice.hidden, true);
+      assert.equal(ui.serverPortNotice.textContent, "");
+    }
+  });
+
   it("shows stopped without a startup error before any attempt", async () => {
     const { api } = loadServerLifecycle();
     const ui = loadServerStatus(api);
@@ -301,7 +747,7 @@ describe("server startup lifecycle", () => {
     assert.strictEqual(sandbox.__tbMcpStartPromise, cached);
     assert.equal(state.attempts, 1);
     assert.equal(state.servers.length, 1);
-    assert.equal(state.timers.length, 1);
+    assert.equal(state.timers.filter(timer => timer.type === REFRESH_TIMER_TYPE).length, 1);
   });
 
   it("reports stopped and shares a failed attempt until listener teardown finishes", async () => {
@@ -345,8 +791,9 @@ describe("server startup lifecycle", () => {
       timerError: new Error("timer init failed"), holdStops: true,
     });
     const start = api.start();
+    await new Promise(setImmediate);
     assert.equal((await api.getServerInfo()).running, false);
-    assert.equal(state.timers[0].cancelled, true);
+    assert.equal(state.timers.find(timer => timer.type === REFRESH_TIMER_TYPE).cancelled, true);
     assert.equal(sandbox.__tbMcpConnectionInfoRefreshTimer, null);
 
     state.pendingStops.shift()();
@@ -356,8 +803,9 @@ describe("server startup lifecycle", () => {
 
     state.timerError = null;
     assert.equal((await api.start()).success, true);
-    assert.equal(state.timers.length, 2);
-    assert.equal(state.timers[1].cancelled, false);
+    const refreshTimers = state.timers.filter(timer => timer.type === REFRESH_TIMER_TYPE);
+    assert.equal(refreshTimers.length, 2);
+    assert.equal(refreshTimers[1].cancelled, false);
   });
 
   it("allows retry after exhausting the port range", async () => {
@@ -450,6 +898,7 @@ describe("server startup lifecycle", () => {
       const start = api.start();
       const checkedStart = rejects ? assert.rejects(start, error => error === rejection) : start;
       const cached = sandbox.__tbMcpStartPromise;
+      await new Promise(setImmediate);
       state.writeError = null;
       const restart = api.setListenAll(false);
 
@@ -473,6 +922,7 @@ describe("server startup lifecycle", () => {
         holdStops: true,
       });
       const oldStart = api.start();
+      await new Promise(setImmediate);
       const newer = Promise.resolve({ success: true, port: 8770 });
       const newerConnection = { port: 8770, token: "new", pid: 4242 };
       sandbox.__tbMcpStartPromise = newer;
@@ -562,7 +1012,7 @@ describe("server startup lifecycle", () => {
     await api.start();
     const connection = state.connection;
     state.connection = null;
-    state.timers[0].callback();
+    state.timers.find(timer => timer.type === REFRESH_TIMER_TYPE).callback();
     assert.deepEqual(state.connection, connection);
     assert.equal(state.attempts, 1);
     assert.equal((await api.getServerInfo()).running, true);

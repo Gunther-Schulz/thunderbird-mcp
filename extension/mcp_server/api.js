@@ -94,6 +94,121 @@ function ensureFreshConnectionInfo({
 }
 // END CONNECTION INFO REFRESH HELPERS
 
+// BEGIN LISTENER OWNERSHIP HELPERS
+const LISTENER_PROBE_TIMEOUT_MS = 3000;
+const LISTENER_PROBE_MAX_BYTES = 4096;
+
+function classifyListenerProbe({ observed, status, unproxied }) {
+  if (observed) return "ours";
+  if (unproxied === true && Number.isInteger(status) && status >= 100 && status <= 599) {
+    return "foreign";
+  }
+  return "inconclusive";
+}
+
+// A successful bind need not mean that a new connection reaches this listener.
+// This request has its own nonce and never receives the MCP authentication token.
+function probeListenerOwnership({ server, port, NetUtil, generateNonce, startup }) {
+  return new Promise((resolve) => {
+    let channel = null;
+    let timer = null;
+    let probePath = null;
+    let observed = false;
+    let status = null;
+    let unproxied = false;
+    let receivedBytes = 0;
+    let settled = false;
+    const finish = (failed = false) => {
+      if (settled) return;
+      settled = true;
+      startup.cancelProbe = null;
+      try { timer?.cancel(); } catch { failed = true; }
+      try { channel?.cancel(Cr.NS_BINDING_ABORTED); } catch { failed = true; }
+      try {
+        if (probePath) server.registerPathHandler(probePath, null);
+      } catch { failed = true; }
+      resolve(classifyListenerProbe({ observed, status: failed ? null : status, unproxied }));
+    };
+    startup.cancelProbe = () => finish(true);
+    try {
+      if (startup.cancelled) {
+        finish(true);
+        return;
+      }
+      probePath = `/thunderbird-mcp-probe/${generateNonce()}`;
+      const body = generateNonce();
+      server.registerPathHandler(probePath, (req, res) => {
+        if (!settled && req.method === "GET" && req.path === probePath) observed = true;
+        res.setStatusLine("1.1", 200, "OK");
+        res.setHeader("Content-Type", "text/plain", false);
+        res.setHeader("Cache-Control", "no-store", false);
+        res.write(body);
+      });
+      channel = NetUtil.newChannel({
+        uri: `http://127.0.0.1:${port}${probePath}`,
+        loadUsingSystemPrincipal: true,
+      });
+      // LOAD_FRESH_CONNECTION requires LOAD_INITIAL_DOCUMENT_URI in Necko.
+      channel.loadFlags |= Ci.nsIRequest.LOAD_ANONYMOUS |
+        Ci.nsIRequest.LOAD_BYPASS_CACHE | Ci.nsIRequest.INHIBIT_CACHING |
+        Ci.nsIRequest.LOAD_FRESH_CONNECTION | Ci.nsIChannel.LOAD_INITIAL_DOCUMENT_URI;
+      const httpChannel = channel.QueryInterface(Ci.nsIHttpChannel);
+      httpChannel.requestMethod = "GET";
+      httpChannel.redirectionLimit = 0;
+      httpChannel.setRequestHeader("Connection", "close", false);
+      timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+      timer.initWithCallback(() => finish(), LISTENER_PROBE_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+      channel.asyncOpen({
+        QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+        onStartRequest(request) {
+          if (settled) return;
+          try {
+            const http = request.QueryInterface(Ci.nsIHttpChannel);
+            const major = {}, minor = {};
+            request.QueryInterface(Ci.nsIHttpChannelInternal).getResponseVersion(major, minor);
+            // HTTP/0.9 can have a synthetic 200 without any status line.
+            if (major.value !== 1 || (minor.value !== 0 && minor.value !== 1)) {
+              finish(true);
+              return;
+            }
+            status = http.responseStatus;
+            unproxied = request.QueryInterface(Ci.nsIProxiedChannel).proxyInfo === null;
+            // Necko parses headers before this callback. Charge them to our
+            // budget before consuming any body; never buffer the whole reply.
+            receivedBytes = `HTTP/${major.value}.${minor.value} ${status} ${http.responseStatusText}\r\n\r\n`.length;
+            http.visitResponseHeaders({
+              QueryInterface: ChromeUtils.generateQI(["nsIHttpHeaderVisitor"]),
+              visitHeader(name, value) {
+                receivedBytes += name.length + value.length + 4;
+                if (receivedBytes >= LISTENER_PROBE_MAX_BYTES) throw Cr.NS_BINDING_ABORTED;
+              },
+            });
+            if (receivedBytes >= LISTENER_PROBE_MAX_BYTES) finish();
+          } catch {
+            finish(receivedBytes < LISTENER_PROBE_MAX_BYTES);
+          }
+        },
+        onDataAvailable(_request, stream, _offset, count) {
+          if (settled) return;
+          try {
+            const readCount = Math.min(count, LISTENER_PROBE_MAX_BYTES - receivedBytes);
+            const bytes = NetUtil.readInputStreamToString(stream, readCount);
+            receivedBytes += bytes.length;
+            if (bytes.length !== readCount) finish(true);
+            else if (receivedBytes >= LISTENER_PROBE_MAX_BYTES || readCount < count) finish();
+          } catch {
+            finish(true);
+          }
+        },
+        onStopRequest() { finish(); },
+      });
+    } catch {
+      finish(true);
+    }
+  });
+}
+// END LISTENER OWNERSHIP HELPERS
+
 // BEGIN CONTACT FIELD HELPERS
 // BEGIN CONTACT FIELD CONSTANTS
 const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
@@ -1926,6 +2041,10 @@ function sanitizeToolResultText(value, key = "") {
 
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
+    // BEGIN SERVER INSTANCE STATE
+    const serverLifecycle = this._serverLifecycle ??= { shutdown: false };
+    const SERVER_START_CANCELLED = "Server startup cancelled";
+    // END SERVER INSTANCE STATE
     const extensionRoot = context.extension.rootURI;
     const resourceName = "thunderbird-mcp";
 
@@ -2953,10 +3072,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       mcpServer: {
         // BEGIN SERVER LIFECYCLE
         start: async function() {
+          if (serverLifecycle.shutdown) return { success: false, error: SERVER_START_CANCELLED };
           // Guard against double-start on extension reload (port conflict)
           if (globalThis.__tbMcpStartPromise) {
             return await globalThis.__tbMcpStartPromise;
           }
+          const startup = { cancelled: false, cancelProbe: null };
+          globalThis.__tbMcpStartup = startup;
           const startPromise = (async () => {
           let startedServer = null;
           try {
@@ -11625,28 +11747,59 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // END MCP HTTP HANDLER
 
-            // Try the default port first, then fall back to nearby ports
+            // Probe each successful bind before publishing it. If every probe
+            // rejects its port, repeat normal binding without the probe, starting
+            // at the first port that bound. Only actual bind failures can exhaust
+            // this fallback; uncertain ownership must not prevent startup.
             let boundPort = null;
+            let firstBoundPort = null;
+            let lastBindError = null;
+            const lastPort = MCP_DEFAULT_PORT + MCP_MAX_PORT_ATTEMPTS - 1;
             const listenAll = isListenAllEnabled();
-            for (let attempt = 0; attempt < MCP_MAX_PORT_ATTEMPTS; attempt++) {
-              const tryPort = MCP_DEFAULT_PORT + attempt;
-              try {
-                if (listenAll) {
-                  server.startAll(tryPort);
-                } else {
-                  server.start(tryPort);
+            for (let pass = 0; pass < 2 && boundPort === null; pass++) {
+              if (pass === 1) {
+                if (firstBoundPort === null) break;
+                console.warn("thunderbird-mcp: could not confirm a listener; starting with normal port fallback");
+              }
+              for (let tryPort = pass === 0 ? MCP_DEFAULT_PORT : firstBoundPort; tryPort <= lastPort; tryPort++) {
+                if (startup.cancelled) throw new Error(SERVER_START_CANCELLED);
+                try {
+                  if (listenAll) server.startAll(tryPort);
+                  else server.start(tryPort);
+                } catch (portErr) {
+                  lastBindError = portErr;
+                  if (tryPort < lastPort) console.warn(`Port ${tryPort} in use, trying ${tryPort + 1}...`);
+                  continue;
                 }
+                startedServer = server;
                 boundPort = tryPort;
-                break;
-              } catch (portErr) {
-                if (attempt === MCP_MAX_PORT_ATTEMPTS - 1) {
-                  throw new Error(`Could not bind to any port in range ${MCP_DEFAULT_PORT}-${tryPort}: ${portErr}`, { cause: portErr });
+                firstBoundPort ??= tryPort;
+                if (pass === 1) break;
+                let ownership = "inconclusive";
+                try {
+                  ownership = await probeListenerOwnership({ server, port: tryPort, NetUtil, generateNonce: generateAuthToken, startup });
+                } catch { /* A probe failure is never a bind failure. */ }
+                if (startup.cancelled) throw new Error(SERVER_START_CANCELLED);
+                if (ownership !== "foreign") {
+                  if (ownership === "inconclusive") console.warn(`thunderbird-mcp: listener check inconclusive on port ${tryPort}; keeping the port`);
+                  break;
                 }
-                console.warn(`Port ${tryPort} in use, trying ${tryPort + 1}...`);
+                console.warn(`thunderbird-mcp: port ${tryPort} is answered by another listener; trying another port`);
+                try {
+                  await server.stop();
+                } catch {
+                  console.warn(`thunderbird-mcp: could not stop the listener on port ${tryPort}; keeping the port`);
+                  break;
+                }
+                startedServer = null;
+                boundPort = null;
               }
             }
+            if (startup.cancelled) throw new Error(SERVER_START_CANCELLED);
+            if (boundPort === null) {
+              throw new Error(`Could not bind to any port in range ${MCP_DEFAULT_PORT}-${lastPort}: ${lastBindError}`, { cause: lastBindError });
+            }
 
-            startedServer = server;
             // Write the connection file fresh on initial start so the secure
             // create path (0600 perms, directory checks) always runs. The
             // refresh timer self-heals it afterward via ensureConnectionInfo
@@ -11663,10 +11816,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
-            stopConnectionInfoRefreshTimer();
             // Clean up before yielding: a reload may install a new connection
             // file while this listener is still draining.
-            removeConnectionInfo();
+            if (globalThis.__tbMcpStartup === startup) {
+              stopConnectionInfoRefreshTimer();
+              removeConnectionInfo();
+            }
             // Keep this attempt cached until the listener has finished stopping,
             // so concurrent starts cannot rebind during failure cleanup.
             if (startedServer) {
@@ -11690,6 +11845,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             throw e;
           } finally {
+            if (globalThis.__tbMcpStartup === startup) globalThis.__tbMcpStartup = null;
             // The IIFE can fail synchronously before the assignment above.
             // Evict failures/rejections after settlement without clearing a
             // newer attempt installed by a restart or extension reload.
@@ -12005,6 +12161,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           const previousRestart = globalThis.__tbMcpRestartPromise;
           const restartPromise = (async () => {
             try { await previousRestart; } catch { /* previous restart failed */ }
+            if (serverLifecycle.shutdown) return { success: false, error: SERVER_START_CANCELLED };
             console.log(`[MCP] setListenAll called with: ${listenAll}`);
             // A failed start may still be stopping its listener. Follow any
             // newer attempt another caller installs while we are waiting.
@@ -12014,6 +12171,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (startPromise) {
                 try { await startPromise; } catch { /* startup failed */ }
               }
+              if (serverLifecycle.shutdown) return { success: false, error: SERVER_START_CANCELLED };
             } while (globalThis.__tbMcpStartPromise &&
                      globalThis.__tbMcpStartPromise !== startPromise);
             if (listenAll) {
@@ -12036,6 +12194,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 });
               } catch { /* ignore */ }
             }
+            if (serverLifecycle.shutdown) return { success: false, error: SERVER_START_CANCELLED };
             // Only release the startup attempt this operation waited for.
             if (globalThis.__tbMcpStartPromise === startPromise) {
               globalThis.__tbMcpStartPromise = null;
@@ -12066,6 +12225,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       this._addonManager = null;
     }
     // END UNINSTALL LISTENER REMOVAL
+    // BEGIN SERVER SHUTDOWN
+    if (this._serverLifecycle) this._serverLifecycle.shutdown = true;
+    // A startup probe yields before publishing the running server. Cancel it
+    // so its continuation stops its listener instead of publishing after unload.
+    if (globalThis.__tbMcpStartup) {
+      globalThis.__tbMcpStartup.cancelled = true;
+      globalThis.__tbMcpStartup.cancelProbe?.();
+      globalThis.__tbMcpStartup = null;
+    }
     // Stop the HTTP server so the port is released
     if (globalThis.__tbMcpServer) {
       try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
@@ -12074,6 +12242,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     stopConnectionInfoRefreshTimer();
     // Clear the start promise so a fresh start can occur on reload
     globalThis.__tbMcpStartPromise = null;
+    // END SERVER SHUTDOWN
 
     // Always clean up the connection info file so stale tokens don't linger
     // (Inlined because getAPI() helpers are not in scope in onShutdown().)

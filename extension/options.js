@@ -65,8 +65,12 @@ function validateGetMessagesLimitInput() {
 
 // BEGIN OPTIONS SERVER STATUS
 const retryServerBtn = document.getElementById("retryServerBtn");
+const serverPortNotice = document.getElementById("serverPortNotice");
+const DEFAULT_SERVER_PORT = 8765;
 
 async function loadServerInfo() {
+  serverPortNotice.hidden = true;
+  serverPortNotice.textContent = "";
   try {
     const info = await browser.mcpServer.getServerInfo();
     retryServerBtn.hidden = info.running || !info.lastError;
@@ -75,6 +79,10 @@ async function loadServerInfo() {
       statusText.textContent = "Running";
       serverPort.textContent = info.port || "--";
       connFile.textContent = info.connectionFile || "--";
+      if (Number.isInteger(info.port) && info.port > 0 && info.port !== DEFAULT_SERVER_PORT) {
+        serverPortNotice.textContent = `The server is using port ${info.port} instead of ${DEFAULT_SERVER_PORT}. Direct HTTP clients must use the current port from connection.json. The stdio bridge discovers it automatically.`;
+        serverPortNotice.hidden = false;
+      }
     } else {
       statusDot.className = "status-dot stopped";
       statusText.textContent = info.lastError ? "Failed to start: " + info.lastError : "Not running";
