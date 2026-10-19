@@ -734,8 +734,8 @@ const _tempAttachFiles = new Set();
 // BEGIN COMPOSE WINDOW CLAIM STATE
 const _claimedComposeWindows = new WeakSet();
 // Native forwards create their own compose params asynchronously. Allow only
-// one unclaimed opening per type. A false result fences later opens after an
-// uncertain failure, since the original window can still appear much later.
+// one unclaimed opening per type, including a bounded recovery period for an
+// abandoned opening. Exact header tokens keep late windows ineligible afterward.
 const _composeWindowOpenClaims = new Map();
 // END COMPOSE WINDOW CLAIM STATE
 // BEGIN INLINE ATTACHMENT BASE64 HELPERS
@@ -4287,36 +4287,62 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END COMPOSE WINDOW DRAFT HELPER
 
             // BEGIN COMPOSE WINDOW OPEN HELPER
+            function createComposeWindowHeader(originalHeader) {
+              // libmime preserves origMsgHdr in the new window's compose params.
+              // A distinct JS implementation supplies a per-opening token without
+              // changing the message URI, identity, or any header data. Keep our
+              // own QI: returning the native header would discard that identity.
+              const header = new Proxy({ QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]) }, {
+                get(target, property) {
+                  if (property === "QueryInterface") return target.QueryInterface;
+                  if (property === "wrappedJSObject") return header;
+                  const value = originalHeader[property];
+                  return typeof value === "function" ? value.bind(originalHeader) : value;
+                },
+                set(_target, property, value) {
+                  originalHeader[property] = value;
+                  return true;
+                },
+              });
+              return header;
+            }
+
             async function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs, afterInsert) {
               const nativeOpen = shouldUseDirectComposeOpen(compType);
               let releaseOpen = null;
               let nativeOpenStarted = false;
+              let recovering = false;
               try {
                 if (nativeOpen) {
                   const previousOpen = _composeWindowOpenClaims.get(compType);
                   let resolveOpen;
                   const pendingOpen = new Promise(resolve => { resolveOpen = resolve; });
                   _composeWindowOpenClaims.set(compType, pendingOpen);
-                  releaseOpen = safe => {
-                    resolveOpen(safe);
-                    if (safe && _composeWindowOpenClaims.get(compType) === pendingOpen) {
+                  releaseOpen = () => {
+                    resolveOpen();
+                    if (_composeWindowOpenClaims.get(compType) === pendingOpen) {
                       _composeWindowOpenClaims.delete(compType);
                     }
                     releaseOpen = null;
                   };
-                  if (previousOpen && !await previousOpen) {
-                    releaseOpen(false);
-                    return { error: "Cannot safely open another forward review after an uncertain window opening. Restart Thunderbird and retry." };
-                  }
+                  if (previousOpen) await previousOpen;
                 }
                 return await new Promise((resolve) => {
                   const OPEN_TIMEOUT_MS = nativeOpen ? 60000 : 15000;
+                  const RECOVERY_TIMEOUT_MS = 15000;
                   const COMPOSE_INIT_EVENT = "compose-window-init";
                   let settled = false;
                   let matchedWindow = null;
                   let pendingStateListener = null;
                   let pendingStateCompose = null;
+                  let recoveryTimer = null;
+                  const openingHeader = nativeOpen ? createComposeWindowHeader(msgComposeParams.origMsgHdr) : null;
                   const initListeners = new Map();
+
+                  const ownsNativeWindow = win => {
+                    const header = win?.arguments?.[0]?.origMsgHdr;
+                    return (header?.wrappedJSObject || header) === openingHeader;
+                  };
 
                   const stopObserving = () => {
                     try { Services.ww.unregisterNotification(windowObserver); } catch {}
@@ -4326,10 +4352,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     initListeners.clear();
                   };
 
+                  const completeOpening = () => {
+                    stopObserving();
+                    try { recoveryTimer?.cancel(); } catch {}
+                    recoveryTimer = null;
+                    recovering = false;
+                    if (releaseOpen) releaseOpen();
+                  };
+
                   const finish = (result) => {
                     if (settled) return;
                     settled = true;
-                    stopObserving();
                     try { timeout.cancel(); } catch {}
                     // Unregister any dangling state listener so a late
                     // NotifyComposeBodyReady cannot mutate the compose window
@@ -4339,6 +4372,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                     pendingStateListener = null;
                     pendingStateCompose = null;
+                    if (nativeOpenStarted && !matchedWindow) {
+                      // The opener may still produce a window. Drain its init or
+                      // close notification before opening the next review, but
+                      // never block the queue indefinitely. Its unique header
+                      // keeps it ineligible even after this recovery period.
+                      recovering = true;
+                      try {
+                        recoveryTimer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                        recoveryTimer.initWithCallback({ notify: completeOpening }, RECOVERY_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+                      } catch {
+                        completeOpening();
+                      }
+                    } else {
+                      completeOpening();
+                    }
                     resolve(result);
                   };
 
@@ -4351,15 +4399,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                   const maybeCustomizeWindow = (composeWin) => {
                     try {
-                      if (settled || matchedWindow || !composeWin) return;
+                      if ((settled && !recovering) || matchedWindow || !composeWin) return;
                       if (composeWin.document?.documentElement?.getAttribute("windowtype") !== "msgcompose") return;
                       if (!composeWin.gMsgCompose) return;
                       if (composeWin.gMsgCompose.originalMsgURI !== originalMsgURI) return;
                       if (composeWin.gComposeType !== compType) return;
                       // Replies retain our exact fields object. URI and type alone
                       // cannot distinguish concurrent replies to the same message.
-                      // Native forwards have no such token and are serialized above.
+                      // Native forwards preserve our per-opening header wrapper.
                       if (!nativeOpen && composeWin.gMsgCompose.compFields !== msgComposeParams.composeFields) return;
+                      if (nativeOpen && !ownsNativeWindow(composeWin)) return;
                       // When two callers reply to the same message concurrently,
                       // both observers see both compose windows. Skip any window
                       // that has already been claimed by a prior observer so each
@@ -4368,10 +4417,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       _claimedComposeWindows.add(composeWin);
 
                       matchedWindow = composeWin;
-                      stopObserving();
                       // Ownership is now fixed; the next native forward may open
                       // while this window is still waiting for its body/editor.
-                      if (releaseOpen) releaseOpen(true);
+                      completeOpening();
+                      // A late abandoned window is left untouched for the user.
+                      // It is claimed permanently, but receives no customization.
+                      if (settled) return;
 
                       const stateListener = {
                         QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
@@ -4423,8 +4474,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                   const windowObserver = {
                     observe(subject, topic) {
-                      if (settled || matchedWindow || topic !== "domwindowopened") return;
+                      if ((settled && !recovering) || matchedWindow) return;
                       const composeWin = subject;
+                      if (nativeOpen && topic === "domwindowclosed") {
+                        try {
+                          if (ownsNativeWindow(composeWin)) {
+                            _claimedComposeWindows.add(composeWin);
+                            matchedWindow = composeWin;
+                            completeOpening();
+                            finish({ error: "Compose window closed before initialization" });
+                          }
+                        } catch {}
+                        return;
+                      }
+                      if (topic !== "domwindowopened") return;
                       if (!composeWin || typeof composeWin.addEventListener !== "function") return;
 
                       // Thunderbird dispatches a non-bubbling compose-window-init event
@@ -4451,7 +4514,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       nativeOpenStarted = true;
                       msgComposeService.OpenComposeWindow(
                         null,
-                        msgComposeParams.origMsgHdr,
+                        openingHeader,
                         originalMsgURI,
                         compType,
                         msgComposeParams.format,
@@ -4467,10 +4530,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 });
               } finally {
-                // A failed/timed-out native opening may still create a window.
-                // Do not let a later call mistake it for its own. Only failures
-                // before invoking the native opener are safe to retry.
-                if (releaseOpen) releaseOpen(!nativeOpenStarted);
+                // Abandoned native openings release their queue slot when the
+                // late window resolves or the bounded recovery timer expires.
+                if (releaseOpen && !recovering) releaseOpen();
               }
             }
             // END COMPOSE WINDOW OPEN HELPER

@@ -28,8 +28,17 @@ function makeHarness(options = {}) {
   const openings = [];
   const windows = [];
   let registrationFailures = options.registrationFailures || 0;
+  let nativeFailures = options.nativeThrows || options.nativeThrowsBeforeWindow ? 1 : 0;
+  const originalHeader = {
+    subject: "Original subject",
+    QueryInterface() { return this; },
+    getStringProperty(name) {
+      assert.equal(this, originalHeader, "header methods keep their native receiver");
+      return `property:${name}`;
+    },
+  };
 
-  function makeWindow(label, type, fields = {}) {
+  function makeWindow(label, type, fields = {}, header = originalHeader) {
     const initListeners = new Set();
     const stateListeners = new Set();
     const win = {
@@ -41,6 +50,7 @@ function makeHarness(options = {}) {
       bodies: [],
       recipients: [],
       attachments: [],
+      arguments: [{ origMsgHdr: header }],
       document: { documentElement: { getAttribute: () => "msgcompose" } },
       gComposeType: type,
       gMsgCompose: {
@@ -74,6 +84,10 @@ function makeHarness(options = {}) {
       bodyReady() {
         for (const listener of [...stateListeners]) listener.NotifyComposeBodyReady();
       },
+      close() {
+        this.closed = true;
+        for (const observer of [...observers]) observer.observe(this, "domwindowclosed");
+      },
     };
     windows.push(win);
     return win;
@@ -85,7 +99,7 @@ function makeHarness(options = {}) {
 
   function createOpenedWindow(opening) {
     assert.equal(opening.win, undefined, "each native opening creates only one window");
-    opening.win = makeWindow(opening.label, opening.type, opening.fields);
+    opening.win = makeWindow(opening.label, opening.type, opening.fields, opening.header);
     announce(opening.win);
     return opening.win;
   }
@@ -104,7 +118,7 @@ function makeHarness(options = {}) {
     Cc: { "@mozilla.org/timer;1": { createInstance() {
       const timer = {
         cancelled: false,
-        initWithCallback(callback) { this.callback = callback; },
+        initWithCallback(callback, delay) { this.callback = callback; this.delay = delay; },
         cancel() { this.cancelled = true; },
       };
       timers.push(timer);
@@ -114,20 +128,28 @@ function makeHarness(options = {}) {
       nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgCompType: { Reply: REPLY, ForwardInline: FORWARD },
     },
-    ChromeUtils: { generateQI: () => () => {} },
+    ChromeUtils: { generateQI: () => function() { return this; } },
     MailServices: { compose: {
       OpenComposeWindowWithParams(_parent, params) {
         const opening = { label: params.label, type: params.type, fields: params.composeFields };
         openings.push(opening);
         createOpenedWindow(opening);
       },
-      OpenComposeWindow(_parent, header, _uri, type) {
+      OpenComposeWindow(_parent, header, uri, type, _format, identity) {
         // Native forwarding creates its own compose fields, so it cannot use
         // the exact object passed to openComposeWindowWithCustomizations.
-        const opening = { label: header.label, type, fields: {} };
+        assert.equal(uri, ORIGINAL_URI, "native forwarding keeps the original URI");
+        const opening = { label: identity.email.split("@")[0], type, fields: {}, header };
         openings.push(opening);
+        if (nativeFailures > 0 && options.nativeThrowsBeforeWindow) {
+          nativeFailures--;
+          throw new Error("native forward opening failed");
+        }
         if (!options.deferNativeWindow) createOpenedWindow(opening);
-        if (options.nativeThrows) throw new Error("native forward opening failed");
+        if (nativeFailures > 0) {
+          nativeFailures--;
+          throw new Error("native forward opening failed");
+        }
       },
     } },
     applyComposeRecipientOverrides(win, identity, to, cc, bcc) {
@@ -145,7 +167,7 @@ function makeHarness(options = {}) {
 
   function start(label, type = REPLY) {
     const identity = { email: `${label}@example.test` };
-    const params = { label, type, composeFields: {}, origMsgHdr: { label } };
+    const params = { label, type, composeFields: {}, origMsgHdr: originalHeader };
     const call = {
       params,
       identity,
@@ -163,7 +185,7 @@ function makeHarness(options = {}) {
     return call;
   }
 
-  return { start, observers, timers, openings, windows, makeWindow, announce, createOpenedWindow };
+  return { start, observers, timers, openings, windows, makeWindow, announce, createOpenedWindow, originalHeader };
 }
 
 // No shared test assertion covers ownership of every customization. Keep this
@@ -252,24 +274,26 @@ describe("compose window ownership", () => {
     assertClean(h);
   });
 
-  it("fences queued and later native forwards after an unclaimed timeout, including a late window", async () => {
+  it("recovers when an abandoned forward initializes late and closes", async () => {
     const h = makeHarness({ deferNativeWindow: true });
     const first = h.start("A", FORWARD);
     const second = h.start("B", FORWARD);
-    const third = h.start("C", FORWARD);
     assert.equal(h.openings.length, 1);
     h.timers[0].callback.notify();
     assert.match((await first.promise).error, /Timed out waiting/);
-    for (const call of [second, third]) {
-      assert.match((await call.promise).error, /Cannot safely open another forward/);
-    }
-    for (const label of ["D", "E"]) {
-      assert.match((await h.start(label, FORWARD).promise).error, /Cannot safely open another forward/);
-    }
-    assert.equal(h.openings.length, 1, "a timeout must not permit any later native opening");
+    assert.equal(h.openings.length, 1, "the next opening waits for bounded recovery");
+    assert.equal(h.timers[1].delay, 15000);
     const late = h.createOpenedWindow(h.openings[0]);
     late.fireInit();
     late.bodyReady();
+    late.close();
+    await tick();
+    assert.equal(h.openings.length, 2);
+    const next = h.createOpenedWindow(h.openings[1]);
+    next.fireInit();
+    next.bodyReady();
+    assert.equal((await second.promise).success, true);
+    assertCustomized(next, second);
     assert.deepEqual(late.bodies, []);
     assert.deepEqual(late.recipients, []);
     assert.deepEqual(late.attachments, []);
@@ -292,19 +316,133 @@ describe("compose window ownership", () => {
     assertClean(h);
   });
 
-  it("fences later native forwards when the native opener throws", async () => {
+  it("recovers after a synchronous native opener failure with no window", async () => {
+    const h = makeHarness({ nativeThrowsBeforeWindow: true });
+    const first = h.start("A", FORWARD);
+    assert.match((await first.promise).error, /native forward opening failed/);
+    const second = h.start("B", FORWARD);
+    assert.equal(h.openings.length, 1);
+    h.timers[1].callback.notify();
+    await tick();
+    assert.equal(h.openings.length, 2);
+    const next = h.openings[1].win;
+    next.fireInit();
+    next.bodyReady();
+    assert.equal((await second.promise).success, true);
+    assertCustomized(next, second);
+    assertClean(h);
+  });
+
+  it("recovers when a window from a failed native opener closes before initialization", async () => {
     const h = makeHarness({ nativeThrows: true });
     const first = h.start("A", FORWARD);
     const late = h.openings[0].win;
     const staleInit = late.initHistory[0];
     assert.match((await first.promise).error, /native forward opening failed/);
-    for (const label of ["B", "C", "D"]) {
-      assert.match((await h.start(label, FORWARD).promise).error, /Cannot safely open another forward/);
-    }
+    const second = h.start("B", FORWARD);
     assert.equal(h.openings.length, 1);
+    late.close();
+    await tick();
+    assert.equal(h.openings.length, 2);
     staleInit();
     late.bodyReady();
     assert.deepEqual(late.bodies, []);
+    const next = h.openings[1].win;
+    next.fireInit();
+    next.bodyReady();
+    assert.equal((await second.promise).success, true);
+    assertCustomized(next, second);
+    assertClean(h);
+  });
+
+  it("recovers after a timeout when no window ever arrives", async () => {
+    const h = makeHarness({ deferNativeWindow: true });
+    const first = h.start("A", FORWARD);
+    h.timers[0].callback.notify();
+    assert.match((await first.promise).error, /Timed out waiting/);
+    const second = h.start("B", FORWARD);
+    assert.equal(h.openings.length, 1);
+    h.timers[1].callback.notify();
+    await tick();
+    assert.equal(h.openings.length, 2);
+    const next = h.createOpenedWindow(h.openings[1]);
+    next.fireInit();
+    next.bodyReady();
+    assert.equal((await second.promise).success, true);
+    assertCustomized(next, second);
+    assertClean(h);
+  });
+
+  for (const initOrder of ["AB", "BA"]) {
+    it(`never claims a late window after recovery expires: init ${initOrder}`, async () => {
+      const h = makeHarness({ deferNativeWindow: true });
+      const first = h.start("A", FORWARD);
+      const second = h.start("B", FORWARD);
+      h.timers[0].callback.notify();
+      assert.match((await first.promise).error, /Timed out waiting/);
+      h.timers[1].callback.notify();
+      await tick();
+      const wins = {
+        A: h.createOpenedWindow(h.openings[0]),
+        B: h.createOpenedWindow(h.openings[1]),
+      };
+      for (const label of initOrder) wins[label].fireInit();
+      for (const label of [...initOrder].reverse()) wins[label].bodyReady();
+      assert.equal((await second.promise).success, true);
+      assertCustomized(wins.B, second);
+      assert.deepEqual(wins.A.bodies, []);
+      assert.deepEqual(wins.A.recipients, []);
+      assert.deepEqual(wins.A.attachments, []);
+      wins.A.close();
+      assertClean(h);
+    });
+  }
+
+  it("releases the native queue when a pending window is closed before initialization", async () => {
+    const h = makeHarness();
+    const first = h.start("A", FORWARD);
+    const second = h.start("B", FORWARD);
+    h.openings[0].win.close();
+    assert.match((await first.promise).error, /closed before initialization/);
+    await tick();
+    const next = h.openings[1].win;
+    next.fireInit();
+    next.bodyReady();
+    assert.equal((await second.promise).success, true);
+    assertCustomized(next, second);
+    assertClean(h);
+  });
+
+  it("uses distinct header tokens while delegating header data and ignoring unrelated forwards", async () => {
+    const h = makeHarness();
+    const first = h.start("A", FORWARD);
+    const header = h.openings[0].header;
+    assert.notEqual(header, h.originalHeader);
+    assert.equal(header.QueryInterface(), header);
+    assert.equal(header.wrappedJSObject, header);
+    assert.equal(header.subject, h.originalHeader.subject);
+    assert.equal(header.getStringProperty("name"), "property:name");
+    header.subject = "Changed subject";
+    assert.equal(h.originalHeader.subject, "Changed subject");
+
+    const unrelated = h.makeWindow("unrelated", FORWARD);
+    h.announce(unrelated);
+    unrelated.fireInit();
+    unrelated.bodyReady();
+    assert.deepEqual(unrelated.bodies, []);
+    h.openings[0].win.fireInit();
+    h.openings[0].win.bodyReady();
+    assert.equal((await first.promise).success, true);
+    assertCustomized(h.openings[0].win, first);
+
+    const second = h.start("B", FORWARD);
+    assert.notEqual(h.openings[1].header, header);
+    // Also exercise an XPConnect wrapper exposing the JS implementation.
+    h.openings[1].win.arguments[0].origMsgHdr = { wrappedJSObject: h.openings[1].header };
+    h.openings[1].win.fireInit();
+    h.openings[1].win.bodyReady();
+    assert.equal((await second.promise).success, true);
+    assertCustomized(h.openings[1].win, second);
     assertClean(h);
   });
 
