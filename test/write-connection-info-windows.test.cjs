@@ -12,7 +12,7 @@ function loadWriteConnectionInfo(sandbox) {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
   const snippets = [];
-  for (const name of ["THUNDERBIRD PROFILE ROOTS", "CONNECTION INFO WRITER", "CONNECTION INFO REFRESH HELPERS"]) {
+  for (const name of ["SENSITIVE ATTACHMENT PATH HELPERS", "THUNDERBIRD PROFILE ROOTS", "CONNECTION INFO WRITER", "CONNECTION INFO REFRESH HELPERS"]) {
     const start = source.indexOf(`// BEGIN ${name}`);
     const end = source.indexOf(`// END ${name}`, start);
     assert.ok(start >= 0 && end > start, `Missing production marker: ${name}`);
@@ -430,6 +430,52 @@ describe("writeConnectionInfo profile metadata", () => {
 
       assert.ok(Buffer.byteLength(written[0]) <= CONNECTION_READ_LIMIT);
       assert.deepEqual(JSON.parse(written[0]).profileRoots, extraBytes ? undefined : [root]);
+    });
+  }
+
+  for (const oversizedFirst of [false, true]) {
+    it(`keeps usable roots around an oversized entry (oversizedFirst=${oversizedFirst})`, () => {
+      const oversized = PROFILE_PREFIX + "é".repeat(2100);
+      const current = POSIX_PROFILE_DIRS.ProfD.path;
+      const profiles = POSIX_PROFILE_DIRS.DefProfRt.path;
+      const profileDirs = {
+        ProfD: { path: oversizedFirst ? oversized : current, normalizedPath: oversizedFirst ? current : oversized },
+        DefProfRt: { path: profiles },
+      };
+      const { sandbox, written } = makeSandbox({ os: "Linux", tmpDir: makeTmpDir({ permissions: 0o700 }), profileDirs });
+      const connectionPath = loadWriteConnectionInfo(sandbox)(8770, "token");
+      const data = JSON.parse(written[0]);
+      assert.deepEqual(data.profileRoots, [current, profiles]);
+      assert.ok(Buffer.byteLength(written[0]) <= CONNECTION_READ_LIMIT);
+      assert.equal(sandbox.ensureFreshConnectionInfo({
+        port: data.port, token: data.token, expectedPid: data.pid,
+        expectedProfileRoots: sandbox.getConnectionInfoData(data.port, data.token).profileRoots,
+        readConnectionInfo: () => ({ path: connectionPath, data }),
+        writeConnectionInfo() { assert.fail("Retained metadata must not cause repeated writes"); },
+      }), connectionPath);
+    });
+  }
+
+  it("retains the roots that fit when the combined metadata exceeds the limit", () => {
+    const empty = { port: 8770, token: "token", pid: 4242, profileRoots: [PROFILE_PREFIX] };
+    const current = PROFILE_PREFIX + "p".repeat(CONNECTION_READ_LIMIT - Buffer.byteLength(JSON.stringify(empty)));
+    const { sandbox, written } = makeSandbox({ os: "Linux", tmpDir: makeTmpDir({ permissions: 0o700 }),
+      profileDirs: { ProfD: { path: current }, DefProfRt: { path: POSIX_PROFILE_DIRS.DefProfRt.path } } });
+    loadWriteConnectionInfo(sandbox)(8770, "token");
+    assert.equal(Buffer.byteLength(written[0]), CONNECTION_READ_LIMIT);
+    assert.deepEqual(JSON.parse(written[0]).profileRoots, [current]);
+  });
+
+  for (const os of ["Linux", "WINNT"]) {
+    it(`does not let unsupported roots consume the metadata budget on ${os}`, () => {
+      const current = os === "WINNT" ? WINDOWS_PROFILE_DIRS.ProfD.path : POSIX_PROFILE_DIRS.ProfD.path;
+      const empty = { port: 8770, token: "token", pid: 4242, profileRoots: ["//server/share/"] };
+      const unsupported = empty.profileRoots[0] + "p".repeat(CONNECTION_READ_LIMIT - Buffer.byteLength(JSON.stringify(empty)));
+      const { sandbox, written } = makeSandbox({ os, tmpDir: makeTmpDir({ permissions: 0o700 }),
+        profileDirs: { ProfD: { path: unsupported }, DefProfRt: { path: current } } });
+      loadWriteConnectionInfo(sandbox)(8770, "token");
+      assert.deepEqual(JSON.parse(written[0]).profileRoots, [current]);
+      assert.ok(Buffer.byteLength(written[0]) <= CONNECTION_READ_LIMIT);
     });
   }
 

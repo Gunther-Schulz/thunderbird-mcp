@@ -248,6 +248,25 @@ describe('Bridge attachment path policy', () => {
     }
   });
 
+  for (const platform of ['linux', 'win32']) {
+    it(`preserves local profile refusals beside rejected metadata entries on ${platform}`, async () => {
+      const base = platform === 'win32' ? 'D:/Mail' : '/mail';
+      const first = base + '/active';
+      const last = base + '/profiles';
+      const fsImpl = new Proxy({}, { get() { assert.fail('profile attachments must not reach filesystem access'); } });
+      for (const rejected of ['\\\\server\\share\\profiles', '//server/share/profiles', null, 7, {}, '',
+        'relative/profile', base + '/bad\0root', base + '/other/../profile', base + '/./profile']) {
+        const options = { platform, pathImpl: platform === 'win32' ? path.win32 : path.posix,
+          profileRoots: [first, rejected, last], fsImpl };
+        for (const file of [first + '/abook.sqlite', last + '/other/Mail/Inbox',
+          '\\\\server\\share\\file.txt', '//server/share/file.txt', base + '/credential.ppk']) {
+          await assert.rejects(inlineAttachmentPaths({ attachments: [file] }, options),
+            /Sensitive attachment path blocked/, `${file}, rejected=${JSON.stringify(rejected)}`);
+        }
+      }
+    });
+  }
+
   it('refuses macOS profile case variants before filesystem access', async () => {
     const fsImpl = new Proxy({}, { get() { assert.fail('profile paths must be refused before filesystem access'); } });
     await assert.rejects(inlineAttachmentPaths({ attachments: ['/custom/profile/abook.sqlite'] }, {

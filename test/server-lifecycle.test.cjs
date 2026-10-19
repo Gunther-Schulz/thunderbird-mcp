@@ -146,6 +146,7 @@ function loadServerLifecycle(overrides = {}) {
   vm.createContext(sandbox);
   vm.runInContext([
     markedSnippet("CONNECTION INFO REFRESH HELPERS"),
+    markedSnippet("SENSITIVE ATTACHMENT PATH HELPERS"),
     markedSnippet("THUNDERBIRD PROFILE ROOTS"),
     `this.api = {
       ${markedSnippet("SERVER LIFECYCLE")}

@@ -124,7 +124,7 @@ describe('bridge request outcomes', () => {
     const conversions = [];
     const { runtime, requests } = loadRequests({
       candidates: 2,
-      profileRoots: [[profile], [otherProfile]],
+      profileRoots: [[profile, '//server/share/profiles'], [null, otherProfile]],
       inlineAttachmentPaths: async (args, options) => {
         conversions.push({ attachments: [...args.attachments], roots: [...options.profileRoots] });
         args.attachments = [{ name: 'report.pdf', base64: 'QQ==' }];

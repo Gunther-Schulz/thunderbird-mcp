@@ -1044,17 +1044,18 @@ function getWindowsTempPrefixLength(parts, exportRoots) {
   return prefixLength;
 }
 
-// Optional connection metadata is ignored as a whole if malformed. Older peers
-// still use the static policy; runtime profile protection needs both upgraded.
+// Keep every usable root independently; an unsupported entry cannot remove
+// another root's protection. Older peers retain the static policy; runtime
+// profile protection needs both upgraded.
 function normalizeAttachmentProfileRoots(profileRoots, windows = false) {
   const roots = typeof profileRoots === 'function' ? profileRoots() : profileRoots;
   if (!Array.isArray(roots)) return [];
   const normalized = [];
   for (const root of roots) {
-    if (typeof root !== 'string' || root.includes('\0')) return [];
+    if (typeof root !== 'string' || root.includes('\0')) continue;
     const nativeRoot = windows ? root.replace(/\\/g, '/').toLowerCase() : root;
     if ((windows ? !/^[a-z]:\//.test(nativeRoot) : !nativeRoot.startsWith('/')) ||
-        nativeRoot.startsWith('//') || nativeRoot.split('/').some(part => part === '.' || part === '..')) return [];
+        nativeRoot.startsWith('//') || nativeRoot.split('/').some(part => part === '.' || part === '..')) continue;
     normalized.push(nativeRoot.replace(/\/+/g, '/').replace(/\/$/, '') + '/');
   }
   return [...new Set(normalized)];
@@ -3297,13 +3298,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function getConnectionInfoData(port, token) {
               const data = { port, token, pid: Services.appinfo.processID };
-              const profileRoots = getThunderbirdProfileRoots();
-              if (profileRoots.length) data.profileRoots = profileRoots;
-              // Metadata is additive: old bridges ignore it, and new bridges
-              // retain static rules when old/oversized metadata is absent.
-              if (new TextEncoder().encode(JSON.stringify(data)).length > MAX_CONNECTION_FILE_BYTES) {
-                delete data.profileRoots;
+              const profileRoots = [];
+              for (const root of getThunderbirdProfileRoots()) {
+                if (!normalizeAttachmentProfileRoots([root], Services.appinfo.OS === "WINNT").length) continue;
+                profileRoots.push(root);
+                data.profileRoots = profileRoots;
+                // Keep the roots that fit and continue after an oversized entry.
+                if (new TextEncoder().encode(JSON.stringify(data)).length > MAX_CONNECTION_FILE_BYTES) {
+                  profileRoots.pop();
+                }
               }
+              // Metadata is additive: old bridges ignore it, and new bridges
+              // retain static rules when no usable metadata is available.
+              if (!profileRoots.length) delete data.profileRoots;
               return data;
             }
 

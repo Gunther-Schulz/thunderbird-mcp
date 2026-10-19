@@ -96,7 +96,7 @@ function writeTestConnectionInfo(port, token, profileRoots) {
 }
 
 describe('Auth: connection info file', () => {
-  for (const shape of ['profile metadata', 'old shape', 'malformed metadata']) {
+  for (const shape of ['profile metadata', 'old shape', 'malformed metadata', 'mixed local/UNC metadata']) {
     it(`applies attachment policy with a verified connection using ${shape}`, async () => {
       const requests = [];
       const server = http.createServer((req, res) => {
@@ -114,11 +114,14 @@ describe('Auth: connection info file', () => {
         const profile = path.join(CONN_DIR, 'custom-profile');
         const profiles = path.join(CONN_DIR, 'profiles');
         const profileRoots = shape === 'old shape' ? undefined
-          : shape === 'malformed metadata' ? [profile, null] : [profile, profiles];
+          : shape === 'malformed metadata' ? [profile, null]
+          : shape === 'mixed local/UNC metadata' ? [profile, '//server/share/profiles', profiles] : [profile, profiles];
         writeTestConnectionInfo(server.address().port, 'a'.repeat(64), profileRoots);
-        const denied = shape === 'profile metadata'
-          ? [path.join(profile, 'abook.sqlite'), path.join(profiles, 'other-profile', 'Mail', 'Inbox')]
-          : [path.join(CONN_DIR, 'credential.ppk')];
+        const denied = [path.join(CONN_DIR, 'credential.ppk')];
+        if (shape !== 'old shape') denied.push(path.join(profile, 'abook.sqlite'));
+        if (shape === 'profile metadata' || shape === 'mixed local/UNC metadata') {
+          denied.push(path.join(profiles, 'other-profile', 'Mail', 'Inbox'));
+        }
         for (const file of denied) {
           const response = await sendToBridge({
             jsonrpc: '2.0', id: 1, method: 'tools/call',

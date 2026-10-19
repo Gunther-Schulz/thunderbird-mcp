@@ -1650,6 +1650,23 @@ describe('Attachment policy parity', () => {
     });
   }
 
+  it('keeps valid roots on either side of an unsupported entry in both runtimes', () => {
+    for (const windows of [false, true]) {
+      const base = windows ? 'D:/Mail' : '/mail';
+      for (const rejected of [null, 7, {}, '', 'relative', base + '/bad\0root', base + '/./bad',
+        base + '/other/../bad', '\\\\server\\share', '//server/share']) {
+        const policy = { windows, profileRoots: [base + '/first', rejected, base + '/last'] };
+        for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+          assert.equal(check(base + '/first/abook.sqlite', policy), true);
+          assert.equal(check(base + '/last/Mail/Inbox', policy), true);
+          assert.equal(check(base + '/documents/report.pdf', policy), false);
+          assert.equal(check(base + '/credential.ppk', policy), true);
+          assert.equal(check('//server/share/file.txt', policy), true);
+        }
+      }
+    }
+  });
+
   it('does not refuse ordinary files that resemble newly protected names', () => {
     for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
       for (const file of ['/documents/release.jks.txt', '/documents/wallet.dat.pdf',
@@ -1823,6 +1840,35 @@ describe('Outbound attachment failures are atomic', () => {
   });
 
   for (const os of ['Linux', 'Darwin', 'WINNT']) {
+    it(`keeps a local profile protected alongside a UNC profiles root on ${os}`, () => {
+      const profile = os === 'WINNT' ? 'D:/Mail/active' : '/mail/active';
+      for (const uncRoot of ['\\\\server\\share\\profiles', '//server/share/profiles']) {
+        const { runtime, state } = makeOutboundMailRuntime({ os, profileDirectories: {
+          ProfD: makeMockLocalFile(profile), DefProfRt: makeMockLocalFile(uncRoot),
+        } });
+        assert.throws(() => runtime.filePathsToAttachDescs([profile + '/abook.sqlite']), /sensitive path blocked/);
+        assert.throws(() => runtime.filePathsToAttachDescs([uncRoot + '/other/abook.sqlite']), /sensitive path blocked/);
+        assert.equal(state.fileCalls, 0);
+        assert.equal(state.sent + state.drafts + state.windows, 0);
+        assert.equal(runtime.filePathsToAttachDescs([profile + '-documents/report.pdf']).descs.length, 1);
+      }
+    });
+
+    it(`preserves valid profile entries around malformed ones during conversion on ${os}`, () => {
+      const base = os === 'WINNT' ? 'D:/Mail' : '/mail';
+      for (const rejected of [null, 7, {}, '', 'relative/profile', base + '/bad\0root',
+        base + '/other/../profile', base + '/./profile']) {
+        const { runtime, state } = makeOutboundMailRuntime({ os });
+        runtime.getThunderbirdProfileRoots = () => [base + '/first', rejected, base + '/last'];
+        for (const file of [base + '/first/abook.sqlite', base + '/last/Mail/Inbox', base + '/credential.ppk']) {
+          assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/,
+            `${file}, rejected=${JSON.stringify(rejected)}`);
+        }
+        assert.equal(state.fileCalls, 0);
+        assert.equal(runtime.filePathsToAttachDescs([base + '/documents/report.pdf']).descs.length, 1);
+      }
+    });
+
     it(`refuses lexical and canonical runtime profiles through outbound conversion on ${os}`, () => {
       const base = os === 'WINNT' ? 'D:/Custom' : '/custom';
       const profile = base + '/profile';

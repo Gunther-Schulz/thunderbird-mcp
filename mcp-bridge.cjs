@@ -801,17 +801,18 @@ function getWindowsTempPrefixLength(parts, exportRoots) {
   return prefixLength;
 }
 
-// Optional connection metadata is ignored as a whole if malformed. Older peers
-// still use the static policy; runtime profile protection needs both upgraded.
+// Keep every usable root independently; an unsupported entry cannot remove
+// another root's protection. Older peers retain the static policy; runtime
+// profile protection needs both upgraded.
 function normalizeAttachmentProfileRoots(profileRoots, windows = false) {
   const roots = typeof profileRoots === 'function' ? profileRoots() : profileRoots;
   if (!Array.isArray(roots)) return [];
   const normalized = [];
   for (const root of roots) {
-    if (typeof root !== 'string' || root.includes('\0')) return [];
+    if (typeof root !== 'string' || root.includes('\0')) continue;
     const nativeRoot = windows ? root.replace(/\\/g, '/').toLowerCase() : root;
     if ((windows ? !/^[a-z]:\//.test(nativeRoot) : !nativeRoot.startsWith('/')) ||
-        nativeRoot.startsWith('//') || nativeRoot.split('/').some(part => part === '.' || part === '..')) return [];
+        nativeRoot.startsWith('//') || nativeRoot.split('/').some(part => part === '.' || part === '..')) continue;
     normalized.push(nativeRoot.replace(/\/+/g, '/').replace(/\/$/, '') + '/');
   }
   return [...new Set(normalized)];
