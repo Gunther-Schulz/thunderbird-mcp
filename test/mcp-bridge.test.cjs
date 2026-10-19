@@ -17,6 +17,7 @@ const {
   readConnectionInfo,
 } = require('./helpers/bridge.cjs');
 const { makeAllowedTempDir } = require('./helpers/fixture-dir.cjs');
+const WINDOWS_TEMP_SUBDIR = path.join('AppData', 'Local', 'Temp');
 
 function makeTempRoot() {
   return makeAllowedTempDir('tb-mcp-bridge-');
@@ -480,7 +481,7 @@ describe('Bridge attachment path policy', () => {
     // treat as separators, so only the Windows layout is meaningful there.
     const skip = process.platform === 'win32' && layout !== 'windows-temp';
     it(`reattaches exports from ${layout} without allowing other temp files`, { skip }, async () => {
-      const tmpDir = path.join(root, 'AppData', 'Local', 'Temp');
+      const tmpDir = path.join(root, WINDOWS_TEMP_SUBDIR);
       const options = makeTestOptions(root, {
         platform: layout === 'windows-temp' ? 'win32' : 'linux',
         osImpl: { tmpdir: () => tmpDir },
@@ -523,7 +524,7 @@ describe('Bridge attachment path policy', () => {
     // Use the host's own export layout: junctions below %TEMP% on Windows, the
     // Flatpak cache below the home directory elsewhere.
     const windowsHost = process.platform === 'win32';
-    const tmpDir = path.join(root, 'AppData', 'Local', 'Temp');
+    const tmpDir = path.join(root, WINDOWS_TEMP_SUBDIR);
     const options = windowsHost
       ? makeTestOptions(root, { platform: 'win32', osImpl: { tmpdir: () => tmpDir } })
       : makeTestOptions(root);
@@ -538,7 +539,7 @@ describe('Bridge attachment path policy', () => {
     fs.writeFileSync(path.join(exported, 'report.pdf'), 'exported attachment');
     fs.writeFileSync(path.join(documents, 'report.pdf'), 'outside export directory');
     try {
-      const type = process.platform === 'win32' ? 'junction' : 'dir';
+      const type = windowsHost ? 'junction' : 'dir';
       fs.symlinkSync(documents, path.join(exportRoot, 'message_2'), type);
       fs.symlinkSync(exported, alias, type);
     } catch (error) {
