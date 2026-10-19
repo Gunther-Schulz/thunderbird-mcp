@@ -65,6 +65,7 @@ function loadServerLifecycle(overrides = {}) {
 
   const connectionPath = "/mock-tmp/thunderbird-mcp/connection.json";
   const sandbox = {
+    TextEncoder,
     MCP_DEFAULT_PORT: 8765,
     MCP_MAX_PORT_ATTEMPTS: 10,
     CONNECTION_FILE_REFRESH_MS: 30000,
@@ -88,17 +89,20 @@ function loadServerLifecycle(overrides = {}) {
       prefs: { clearUserPref() {} },
       io: { newURI() { throw { name: "NS_ERROR_FILE_NOT_FOUND" }; } },
       dirsvc: {
-        get: () => ({
-          append() {},
-          exists: () => true,
-          isSymlink: () => false,
-          clone: () => ({
-            path: connectionPath,
+        get: (key) => {
+          if (key !== "TmpD") throw new Error("Directory unavailable");
+          return {
             append() {},
-            exists: () => state.connection !== null,
-            remove() { state.connection = null; },
-          }),
-        }),
+            exists: () => true,
+            isSymlink: () => false,
+            clone: () => ({
+              path: connectionPath,
+              append() {},
+              exists: () => state.connection !== null,
+              remove() { state.connection = null; },
+            }),
+          };
+        },
       },
     },
     Ci: { nsIFile: { DIRECTORY_TYPE: 1 }, nsITimer: { TYPE_REPEATING_SLACK: 1 } },
@@ -142,6 +146,8 @@ function loadServerLifecycle(overrides = {}) {
   vm.createContext(sandbox);
   vm.runInContext([
     markedSnippet("CONNECTION INFO REFRESH HELPERS"),
+    markedSnippet("SENSITIVE ATTACHMENT PATH HELPERS"),
+    markedSnippet("THUNDERBIRD PROFILE ROOTS"),
     `this.api = {
       ${markedSnippet("SERVER LIFECYCLE")}
       ${markedSnippet("LISTEN ALL SETTER")}

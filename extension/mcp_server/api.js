@@ -7,7 +7,7 @@
 // addon_parent is a sandbox, not a window or a system ES module. These names
 // are supported by xpc::GlobalProperties in js/xpconnect/src/Sandbox.cpp.
 try {
-  Cu.importGlobalProperties(["DOMParser", "atob", "btoa", "TextDecoder"]);
+  Cu.importGlobalProperties(["DOMParser", "atob", "btoa", "TextDecoder", "TextEncoder"]);
 } catch (e) {
   console.warn("thunderbird-mcp: failed to import Experiment globals:", e);
 }
@@ -70,6 +70,7 @@ function ensureFreshConnectionInfo({
   port,
   token,
   expectedPid,
+  expectedProfileRoots,
   readConnectionInfo,
   writeConnectionInfo,
   onCheckError,
@@ -81,7 +82,8 @@ function ensureFreshConnectionInfo({
       data &&
       data.port === port &&
       data.token === token &&
-      data.pid === expectedPid
+      data.pid === expectedPid &&
+      JSON.stringify(data.profileRoots) === JSON.stringify(expectedProfileRoots)
     ) {
       return current.path;
     }
@@ -974,6 +976,9 @@ const SENSITIVE_ATTACHMENT_PATTERNS = [
   /\.key$/,
   /\.asc$/,
   /\.gpg$/,
+  /\.(ppk|ovpn|jks|keystore|p8|kdb)$/,
+  /(^|\/)wallet\.dat$/,
+  /\/snap\/chromium\/common\/chromium(\/|$)/,
   // Linux / macOS system directories
   /^\/etc\//,
   /^\/proc\//,
@@ -1039,7 +1044,24 @@ function getWindowsTempPrefixLength(parts, exportRoots) {
   return prefixLength;
 }
 
-function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
+// Keep every usable root independently; an unsupported entry cannot remove
+// another root's protection. Older peers retain the static policy; runtime
+// profile protection needs both upgraded.
+function normalizeAttachmentProfileRoots(profileRoots, windows = false) {
+  const roots = typeof profileRoots === 'function' ? profileRoots() : profileRoots;
+  if (!Array.isArray(roots)) return [];
+  const normalized = [];
+  for (const root of roots) {
+    if (typeof root !== 'string' || root.includes('\0')) continue;
+    const nativeRoot = windows ? root.replace(/\\/g, '/').toLowerCase() : root;
+    if ((windows ? !/^[a-z]:\//.test(nativeRoot) : !nativeRoot.startsWith('/')) ||
+        nativeRoot.startsWith('//') || nativeRoot.split('/').some(part => part === '.' || part === '..')) continue;
+    normalized.push(nativeRoot.replace(/\/+/g, '/').replace(/\/$/, '') + '/');
+  }
+  return [...new Set(normalized)];
+}
+
+function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [], profileRoots = [], profileCaseInsensitive = windows } = {}) {
   if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
   const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
   const parts = normalized.split('/');
@@ -1048,6 +1070,12 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
   // Traversal must never gain the export-directory exemption.
   if (parts.some(part => part === '.' || part === '..')) return true;
   if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  const nativePath = windows ? normalized : attachmentPath;
+  const profilePath = profileCaseInsensitive ? nativePath.toLowerCase() : nativePath;
+  if (normalizeAttachmentProfileRoots(profileRoots, windows).some(root => {
+    const prefix = profileCaseInsensitive ? root.toLowerCase() : root;
+    return profilePath === prefix.slice(0, -1) || profilePath.startsWith(prefix);
+  })) return true;
   // Refuse short names outside the trusted temp prefix. Roots are resolved only
   // after the network-namespace patterns above have passed.
   if (windows && parts.some(part => WINDOWS_SHORT_NAME.test(part))) {
@@ -1061,6 +1089,51 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
   return false;
 }
 // END SENSITIVE ATTACHMENT PATH HELPERS
+
+// BEGIN THUNDERBIRD PROFILE ROOTS
+function getThunderbirdProfileRoots() {
+  const roots = new Set();
+  for (const key of ["ProfD", "DefProfRt"]) {
+    try {
+      const file = Services.dirsvc.get(key, Ci.nsIFile);
+      roots.add(file.path);
+      const canonical = file.clone();
+      canonical.normalize();
+      // Windows normalize() only normalizes syntax. As in attachment
+      // validation, resolve each ancestor before inspecting its target.
+      if (Services.appinfo?.OS === "WINNT") {
+        const seen = new Set();
+        for (;;) {
+          const current = canonical.path.replace(/\\/g, "/").toLowerCase();
+          if (seen.has(current)) throw new Error("Profile path resolution cycle");
+          seen.add(current);
+          const suffix = [];
+          let redirected = false;
+          for (let component = canonical.clone(); component; component = component.parent) {
+            if (!component.isReadable()) throw new Error("Profile path resolution failed");
+            const target = component.target;
+            if (!target) throw new Error("Profile path target unavailable");
+            if (target.replace(/\\/g, "/").toLowerCase() !== component.path.replace(/\\/g, "/").toLowerCase()) {
+              canonical.initWithPath(target);
+              for (const part of suffix.reverse()) canonical.append(part);
+              redirected = true;
+              break;
+            }
+            suffix.push(component.leafName);
+          }
+          // A target can itself have redirected ancestors; resolve it again.
+          if (!redirected) break;
+        }
+      }
+      roots.add(canonical.path);
+    } catch {
+      // Some directory providers cannot resolve a root. Keep any lexical
+      // location already obtained, and retain the static policy regardless.
+    }
+  }
+  return [...roots].filter(root => typeof root === "string" && root.length > 0);
+}
+// END THUNDERBIRD PROFILE ROOTS
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
@@ -2913,6 +2986,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       }
     }
 
+    // BEGIN CONNECTION INFO READER
     function readConnectionInfo() {
       const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
       tmpDir.append("thunderbird-mcp");
@@ -2927,10 +3001,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       const sis = Cc["@mozilla.org/scriptableinputstream;1"]
         .createInstance(Ci.nsIScriptableInputStream);
       sis.init(fis);
-      const text = sis.read(sis.available());
+      const raw = sis.read(sis.available());
       sis.close();
+      const text = new TextDecoder("utf-8").decode(Uint8Array.from(raw, c => c.charCodeAt(0)));
       return { path: connFile.path, data: JSON.parse(text) };
     }
+    // END CONNECTION INFO READER
 
     /**
      * Remove the connection info file during startup or shutdown cleanup.
@@ -3217,6 +3293,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END SEARCH RESULT HELPERS
 
             // BEGIN CONNECTION INFO WRITER
+            // Keep within the read limit of existing bridges.
+            const MAX_CONNECTION_FILE_BYTES = 4096;
+
+            function getConnectionInfoData(port, token) {
+              const data = { port, token, pid: Services.appinfo.processID };
+              const profileRoots = [];
+              for (const root of getThunderbirdProfileRoots()) {
+                if (!normalizeAttachmentProfileRoots([root], Services.appinfo.OS === "WINNT").length) continue;
+                profileRoots.push(root);
+                data.profileRoots = profileRoots;
+                // Keep the roots that fit and continue after an oversized entry.
+                if (new TextEncoder().encode(JSON.stringify(data)).length > MAX_CONNECTION_FILE_BYTES) {
+                  profileRoots.pop();
+                }
+              }
+              // Metadata is additive: old bridges ignore it, and new bridges
+              // retain static rules when no usable metadata is available.
+              if (!profileRoots.length) delete data.profileRoots;
+              return data;
+            }
+
             /**
              * Write connection info (port + auth token) to a well-known file
              * so the bridge can discover how to connect.
@@ -3261,7 +3358,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (connFile.exists()) {
                 connFile.remove(false);
               }
-              const data = JSON.stringify({ port, token, pid: Services.appinfo.processID });
+              const data = JSON.stringify(getConnectionInfoData(port, token));
               const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                 .createInstance(Ci.nsIFileOutputStream);
               // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x80 = O_EXCL
@@ -3280,6 +3377,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 port,
                 token,
                 expectedPid: Services.appinfo.processID,
+                expectedProfileRoots: getConnectionInfoData(port, token).profileRoots,
                 readConnectionInfo,
                 writeConnectionInfo,
                 onCheckError: (e) => {
@@ -3692,8 +3790,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // and we never want that to succeed regardless of skipReview.
                     let exportRoots;
                     let canonicalExportRoot;
+                    let profileRoots;
                     const attachmentPolicy = {
                       windows: Services.appinfo?.OS === "WINNT",
+                      // Conservatively cover case-insensitive macOS volumes.
+                      profileCaseInsensitive: ["WINNT", "Darwin"].includes(Services.appinfo?.OS),
+                      profileRoots: () => (profileRoots ||= getThunderbirdProfileRoots()),
                       // Evaluated only for an otherwise-safe export-shaped path.
                       exportRoots: () => {
                         if (!exportRoots) {
@@ -7931,6 +8033,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               walkPart(top, false);
               return results;
             }
+            // BEGIN SYSTEM PRINCIPAL FETCH GUARD
+            // Attachment and inline-image bytes are fetched with the system principal.
+            // Message-part URLs come from Thunderbird's message services and use
+            // whatever scheme the account type registers (mailbox, imap, news,
+            // x-moz-ews, x-moz-graph, add-on stores), so they cannot be allow-listed.
+            // The one URL a message can control is an external attachment: libmime
+            // honours X-Mozilla-External-Attachment-URL for http, https and file, and
+            // the parsed attachment reports isExternal. Those are refused at the
+            // source (see isExternalAttachment) and never reach a channel. The
+            // deny-list below is defense in depth for schemes that are never a mail store.
+            const EXTERNAL_ATTACHMENT_ERROR = "External attachment link refused: its content is not stored in the message";
+            const SYSTEM_PRINCIPAL_DENIED_SCHEMES = new Set([
+              "file", "http", "https", "ftp", "data", "blob", "jar",
+              "resource", "chrome", "moz-extension", "about", "view-source",
+            ]);
+
+            // Fails closed: an attachment whose flag cannot be read counts as external.
+            function isExternalAttachment(att) {
+              try {
+                return !!att?.isExternal;
+              } catch {
+                return true;
+              }
+            }
+
+            // Mirrors URL parsing, which ignores tabs/newlines and strips leading
+            // C0 controls and spaces before reading the scheme.
+            function getFetchUrlScheme(url) {
+              if (typeof url !== "string") return null;
+              const normalized = url.replace(/[\t\n\r]/g, "").replace(/^[\x00-\x20]+/, "");
+              const match = /^([a-z][a-z0-9+.-]*):/i.exec(normalized);
+              return match ? match[1].toLowerCase() : null;
+            }
+
+            function isSystemPrincipalFetchDenied(url) {
+              if (typeof url !== "string") return true;
+              return SYSTEM_PRINCIPAL_DENIED_SCHEMES.has(getFetchUrlScheme(url));
+            }
+
+            function getSystemPrincipalFetchRefusal(url) {
+              if (!isSystemPrincipalFetchDenied(url)) return null;
+              const scheme = getFetchUrlScheme(url);
+              return scheme
+                ? `Refusing to fetch a ${scheme}: URL; it is not a mail-store URL`
+                : "Refusing to fetch an invalid URL";
+            }
+            // END SYSTEM PRINCIPAL FETCH GUARD
             // END RAW MIME ATTACHMENT HELPERS
 
             // BEGIN ENCRYPTED MESSAGE GUARD
@@ -8716,10 +8865,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           size: typeof att?.size === "number" ? att.size : null,
                           isInline: false,
                         };
+                        // An external attachment's URL is controlled by the message
+                        // (http, https or file), so drop it here; saving and inline
+                        // reads report EXTERNAL_ATTACHMENT_ERROR instead.
+                        const external = isExternalAttachment(att);
                         const source = {
                           info,
-                          url: att?.url || "",
-                          size: typeof att?.size === "number" ? att.size : null
+                          url: external ? "" : (att?.url || ""),
+                          size: typeof att?.size === "number" ? att.size : null,
+                          external
                         };
                         attachments.push(info);
                         attachmentSources.push(source);
@@ -8822,6 +8976,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             : null;
                           let info;
                           let fallbackUrl = "";
+                          let fallbackExternal = false;
                           if (includeInlineImages && correlation.matchedKnownAttachment) {
                             const knownRecord = correlation.metadataRecord;
                             info = knownRecord.info;
@@ -8834,6 +8989,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             info.isInline = true;
                             info.contentId = contentId || knownRecord.contentId || null;
                             fallbackUrl = knownRecord.source?.url || "";
+                            fallbackExternal = knownRecord.source?.external === true;
                           } else {
                             info = {
                               name,
@@ -8848,11 +9004,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                               attachmentSources.push({ info, url: partUrl, size: info.size });
                             }
                           }
+                          // partUrl comes from the message service, not from message
+                          // content, so it needs no guard; only the fallback taken from
+                          // an attachment record can carry a message-controlled URL.
                           inlineImageSources.push({
                             info,
                             url: partUrl || fallbackUrl,
                             size: info.size,
                             partName: part.partName,
+                            external: !partUrl && fallbackExternal,
                           });
                         }
                       }
@@ -8917,8 +9077,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             : { data: encodeByteStringToBase64(rawMimeToByteString(source.bytes)) });
                           return;
                         }
+                        if (source.external) {
+                          resolve({ error: EXTERNAL_ATTACHMENT_ERROR });
+                          return;
+                        }
                         if (!source.url) {
                           resolve({ error: "Inline image has no fetchable message-part URL" });
+                          return;
+                        }
+                        const fetchRefusal = getSystemPrincipalFetchRefusal(source.url);
+                        if (fetchRefusal) {
+                          resolve({ error: fetchRefusal });
                           return;
                         }
                         try {
@@ -9217,11 +9386,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return { size: recoveredSize };
                     }
 
-                                        const saveOne = ({ info, url, size, bytes }, index) =>
+                                        const saveOne = ({ info, url, size, bytes, external }, index) =>
                                           new Promise((done) => {
                         try {
+                          if (external) {
+                            info.error = EXTERNAL_ATTACHMENT_ERROR;
+                            done();
+                            return;
+                          }
                           if (!url && !bytes) {
                             info.error = "Missing attachment URL";
+                            done();
+                            return;
+                          }
+
+                          // Defense in depth: refuse schemes that are never a mail store
+                          // before any file is created.
+                          const fetchRefusal = bytes ? null : getSystemPrincipalFetchRefusal(url);
+                          if (fetchRefusal) {
+                            info.error = fetchRefusal;
                             done();
                             return;
                           }
@@ -9993,6 +10176,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             `From: ${fwdAuthor}\n` +
                             `To: ${fwdRecipients}\n\n`;
                           composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
+                        }
+
+                        // Original attachments must be stored in the message and pass
+                        // the same URL policy used when reading attachments.
+                        if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                          for (const att of aMimeMsg.allUserAttachments) {
+                            if (isExternalAttachment(att)) {
+                              resolve({ error: "Direct forward cannot include an external attachment link, because its content is not stored in the message. Use skipReview: false to review in Thunderbird." });
+                              return;
+                            }
+                            const fetchRefusal = getSystemPrincipalFetchRefusal(att?.url);
+                            if (fetchRefusal) {
+                              resolve({ error: `Direct forward cannot include this attachment: ${fetchRefusal}. Use skipReview: false to review in Thunderbird.` });
+                              return;
+                            }
+                          }
                         }
 
                         const origDescs = [];

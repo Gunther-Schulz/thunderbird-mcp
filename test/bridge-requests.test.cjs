@@ -20,17 +20,22 @@ function snippet(name) {
 
 // Searches found production request/retry helpers in the bridge, but no HTTP
 // request test harness. Exercise those helpers through their production markers.
-function loadRequests({ candidates = 1 } = {}) {
+function loadRequests({ candidates = 1, profileRoots = [], inlineAttachmentPaths = async () => {} } = {}) {
   const requests = [];
   let candidateIndex = 0;
   const runtime = {
     Buffer,
     setTimeout,
+    process: { platform: process.platform },
+    inlineAttachmentPaths,
+    cachedCandidateList: Array.from({ length: candidates }, (_, index) => ({
+      data: { port: 21000 + index, token: 'a'.repeat(64), profileRoots: profileRoots[index] },
+    })),
     THUNDERBIRD_HOSTS: ['127.0.0.1'],
     CONNECTION_MAX_RETRIES: 0,
     CONNECTION_RETRY_DELAY_MS: 1000,
     readConnectionInfo: () => candidateIndex < candidates
-      ? { port: 8765 + candidateIndex, token: 'a'.repeat(64) }
+      ? runtime.cachedCandidateList[candidateIndex].data
       : null,
     advanceToNextCandidate() {
       candidateIndex++;
@@ -62,6 +67,7 @@ function loadRequests({ candidates = 1 } = {}) {
   };
   vm.createContext(runtime);
   vm.runInContext([
+    snippet('BRIDGE ATTACHMENT POLICY'),
     snippet('BRIDGE HTTP REQUEST HELPERS'),
     snippet('BRIDGE FORWARDING'),
   ].join('\n'), runtime);
@@ -112,6 +118,43 @@ const mailOperations = [
 ];
 
 describe('bridge request outcomes', () => {
+  it('preflights against verified profile metadata and preserves paths across candidate retries', async () => {
+    const profile = process.platform === 'win32' ? 'D:/profile' : '/profile';
+    const otherProfile = process.platform === 'win32' ? 'D:/other-profile' : '/other-profile';
+    const conversions = [];
+    const { runtime, requests } = loadRequests({
+      candidates: 2,
+      profileRoots: [[profile, '//server/share/profiles'], [null, otherProfile]],
+      inlineAttachmentPaths: async (args, options) => {
+        conversions.push({ attachments: [...args.attachments], roots: [...options.profileRoots] });
+        args.attachments = [{ name: 'report.pdf', base64: 'QQ==' }];
+      },
+    });
+    const message = toolCall('sendMail', { attachments: ['/documents/report.pdf'], profileRoots: ['/untrusted'] });
+    const pending = runtime.forwardToThunderbird(message);
+    await new Promise(setImmediate);
+    assert.deepEqual(conversions[0].attachments, ['/documents/report.pdf']);
+    assert.deepEqual(new Set(conversions[0].roots), new Set([profile + '/', otherProfile + '/']));
+    connect(requests[0], { pending: true });
+    requests[0].emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
+    await new Promise(setImmediate);
+    assert.equal(conversions.length, 2);
+    assert.deepEqual(conversions[1].attachments, ['/documents/report.pdf']);
+    assert.deepEqual(message.params.arguments.attachments, ['/documents/report.pdf']);
+    assert.equal(JSON.parse(requests[1].data).params.arguments.attachments[0].base64, 'QQ==');
+    finishResponse(requests[1]);
+    await pending;
+  });
+
+  it('returns attachment refusals without sending an HTTP request', async () => {
+    const { runtime, requests } = loadRequests({
+      inlineAttachmentPaths: async () => { throw new Error('Sensitive attachment path blocked'); },
+    });
+    const result = await runtime.forwardToThunderbird(toolCall('saveDraft', { attachments: ['/profile/report.pdf'] }));
+    assert.equal(result.error.code, -32602);
+    assert.equal(requests.length, 0);
+  });
+
   for (const [name, args, folderAdvice] of mailOperations) {
     it(`${name} ${JSON.stringify(args)} waits 150 seconds and reports an uncertain timeout`, async () => {
       const { runtime, requests } = loadRequests();

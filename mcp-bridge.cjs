@@ -697,6 +697,7 @@ const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE = 20;
 
+// BEGIN BRIDGE ATTACHMENT POLICY
 // File paths that an MCP caller must never be allowed to attach to outbound
 // mail. Keep the pattern list and helper behavior identical to the extension so
 // neither transport can bypass the LLM-confused-deputy defense.
@@ -732,6 +733,9 @@ const SENSITIVE_ATTACHMENT_PATTERNS = [
   /\.key$/,
   /\.asc$/,
   /\.gpg$/,
+  /\.(ppk|ovpn|jks|keystore|p8|kdb)$/,
+  /(^|\/)wallet\.dat$/,
+  /\/snap\/chromium\/common\/chromium(\/|$)/,
   // Linux / macOS system directories
   /^\/etc\//,
   /^\/proc\//,
@@ -797,7 +801,24 @@ function getWindowsTempPrefixLength(parts, exportRoots) {
   return prefixLength;
 }
 
-function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
+// Keep every usable root independently; an unsupported entry cannot remove
+// another root's protection. Older peers retain the static policy; runtime
+// profile protection needs both upgraded.
+function normalizeAttachmentProfileRoots(profileRoots, windows = false) {
+  const roots = typeof profileRoots === 'function' ? profileRoots() : profileRoots;
+  if (!Array.isArray(roots)) return [];
+  const normalized = [];
+  for (const root of roots) {
+    if (typeof root !== 'string' || root.includes('\0')) continue;
+    const nativeRoot = windows ? root.replace(/\\/g, '/').toLowerCase() : root;
+    if ((windows ? !/^[a-z]:\//.test(nativeRoot) : !nativeRoot.startsWith('/')) ||
+        nativeRoot.startsWith('//') || nativeRoot.split('/').some(part => part === '.' || part === '..')) continue;
+    normalized.push(nativeRoot.replace(/\/+/g, '/').replace(/\/$/, '') + '/');
+  }
+  return [...new Set(normalized)];
+}
+
+function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [], profileRoots = [], profileCaseInsensitive = windows } = {}) {
   if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
   const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
   const parts = normalized.split('/');
@@ -806,6 +827,12 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
   // Traversal must never gain the export-directory exemption.
   if (parts.some(part => part === '.' || part === '..')) return true;
   if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  const nativePath = windows ? normalized : attachmentPath;
+  const profilePath = profileCaseInsensitive ? nativePath.toLowerCase() : nativePath;
+  if (normalizeAttachmentProfileRoots(profileRoots, windows).some(root => {
+    const prefix = profileCaseInsensitive ? root.toLowerCase() : root;
+    return profilePath === prefix.slice(0, -1) || profilePath.startsWith(prefix);
+  })) return true;
   // Refuse short names outside the trusted temp prefix. Roots are resolved only
   // after the network-namespace patterns above have passed.
   if (windows && parts.some(part => WINDOWS_SHORT_NAME.test(part))) {
@@ -826,6 +853,7 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
 // extension fails when file.exists() returns false inside the sandbox. Reading
 // on the bridge side and shipping inline base64 sidesteps the sandbox entirely.
 const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']);
+// END BRIDGE ATTACHMENT POLICY
 
 // Minimal MIME map covering common attachment types (documents, images,
 // archives, A/V). Falls back to application/octet-stream which Thunderbird
@@ -1080,6 +1108,9 @@ async function inlineAttachmentPaths(args, options = {}) {
   let exportRoots;
   context.attachmentPolicy = {
     windows: context.platform === 'win32',
+    // Conservatively cover case-insensitive macOS volumes.
+    profileCaseInsensitive: ['win32', 'darwin'].includes(context.platform),
+    profileRoots: options.profileRoots,
     // Resolve trusted roots only after lexical network/credential checks pass.
     exportRoots: () => (exportRoots ||= getAttachmentExportRoots(context)),
   };
@@ -1262,25 +1293,6 @@ async function handleMessage(line) {
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
   }
 
-  // For mail tools (including drafts), inline attachments passed as file paths.
-  // The Thunderbird extension may run inside a sandboxed snap that cannot
-  // see /data/..., the host /tmp, or any path outside its confined view —
-  // passing such paths through would fail attachment validation.
-  // Reading on the bridge side and shipping base64 sidesteps the sandbox.
-  if (message.method === 'tools/call'
-      && message.params
-      && ATTACHMENT_TOOLS.has(message.params.name)) {
-    try {
-      await inlineAttachmentPaths(message.params.arguments);
-    } catch (e) {
-      return {
-        jsonrpc: '2.0',
-        id: message.id,
-        error: { code: -32602, message: e.message }
-      };
-    }
-  }
-
   return forwardToThunderbird(message);
 }
 
@@ -1445,7 +1457,6 @@ function compactToolResultJsonText(response) {
 
 // BEGIN BRIDGE FORWARDING
 async function forwardToThunderbird(message) {
-  const postData = JSON.stringify(message);
   const policy = getThunderbirdRequestPolicy(message);
 
   // Read connection info (port + auth token) from the file written by the extension.
@@ -1472,6 +1483,24 @@ async function forwardToThunderbird(message) {
   let rediscoveryAttempted = false;
 
   while (connInfo) {
+    let requestMessage = message;
+    if (message.method === 'tools/call' && ATTACHMENT_TOOLS.has(message.params?.name) &&
+        message.params.arguments?.attachments != null) {
+      try {
+        // Only discovery-verified metadata supplies roots, never tool arguments.
+        // Include all verified candidates so failover does not read another
+        // running profile before trying its connection.
+        const profileRoots = [connInfo, ...cachedCandidateList.map(candidate => candidate.data)]
+          .flatMap(candidate => normalizeAttachmentProfileRoots(candidate.profileRoots, process.platform === 'win32'));
+        const args = { ...message.params.arguments };
+        // Keep the original paths for revalidation if discovery changes on retry.
+        await inlineAttachmentPaths(args, { profileRoots });
+        requestMessage = { ...message, params: { ...message.params, arguments: args } };
+      } catch (e) {
+        return { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: e.message } };
+      }
+    }
+    const postData = JSON.stringify(requestMessage);
     try {
       return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token, policy);
     } catch (err) {

@@ -265,6 +265,10 @@ For `sendMail`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attac
 
 UNC/network and device paths, dotfiles and dot-directories, application-data directories (Windows `AppData` and the macOS home `Library`), and credential/key filenames are refused. Windows alternate data streams and path components ending in dots or spaces are also refused. Files exported by `getMessage(saveAttachments: true)` can still be attached again, and ordinary local document paths continue to work. If any attachment is refused, missing, invalid, or over a limit, the entire operation fails before sending, saving a draft, or opening a review window. The error identifies refused entries; temporary files created during the failed conversion are removed. Callers that previously relied on partial attachment success must handle this error explicitly.
 
+Files in hidden or application-data folders, including macOS `~/Library` and its cloud folders, must be copied to an ordinary folder before they can be attached by path.
+
+External attachment links, including attachments removed with Thunderbird's **Detach** command and RSS/Atom feed enclosures, are refused by `getMessage` with `saveAttachments: true`, which reports "External attachment link refused" for the affected attachment. `includeInlineImages` also refuses them unless it can read a stored message part. A direct forward (`forwardMessage` with `skipReview: true`) is refused if the original includes one. Attachments stored in the message, including those from Exchange accounts, continue to work. A forward opened for review (`skipReview: false`) is built by Thunderbird and shows its attachments in the compose window.
+
 ## Security
 
 - **Auth tokens**: The HTTP server requires a session-scoped bearer token. Generated on startup, written to `<TmpD>/thunderbird-mcp/connection.json` with 0600 permissions. The bridge re-discovers that file automatically across native installs, Snap, Flatpak, Betterbird Flatpak, and macOS temp directories.

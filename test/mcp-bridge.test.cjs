@@ -27,10 +27,10 @@ function cleanupTempRoot(root) {
   fs.rmSync(root, { recursive: true, force: true });
 }
 
-function writeConnectionFile(filePath, { port, token, pid = process.pid }) {
+function writeConnectionFile(filePath, { port, token, pid = process.pid, profileRoots }) {
   // Thunderbird creates the connection directory owner-only.
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(filePath, JSON.stringify({ port, token, pid }), { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(filePath, JSON.stringify({ port, token, pid, profileRoots }), { encoding: 'utf8', mode: 0o600 });
 }
 
 function makeTestOptions(root, overrides = {}) {
@@ -235,6 +235,58 @@ describe('Bridge attachment path policy', () => {
   it('uses the same normalized deny-list rules for Windows paths', () => {
     assert.equal(isSensitiveFilePath('C:\\Users\\alice\\.ssh\\id_ed25519'), true);
     assert.equal(isSensitiveFilePath('C:\\Users\\alice\\Downloads\\report.pdf'), false);
+  });
+
+  it('refuses trusted profile roots before filesystem access', async () => {
+    const profileRoots = [path.join(root, 'custom-profile'), path.join(root, 'profiles')];
+    const fsImpl = new Proxy({}, { get() { assert.fail('profile paths must be refused before filesystem access'); } });
+    for (const file of [
+      path.join(profileRoots[0], 'Mail', 'Local Folders', 'Inbox'),
+      path.join(profileRoots[1], 'another-profile', 'abook.sqlite'),
+    ]) {
+      await assert.rejects(inlineAttachmentPaths({ attachments: [file] }, { profileRoots, fsImpl }), /Sensitive attachment path blocked/);
+    }
+  });
+
+  for (const platform of ['linux', 'win32']) {
+    it(`preserves local profile refusals beside rejected metadata entries on ${platform}`, async () => {
+      const base = platform === 'win32' ? 'D:/Mail' : '/mail';
+      const first = base + '/active';
+      const last = base + '/profiles';
+      const fsImpl = new Proxy({}, { get() { assert.fail('profile attachments must not reach filesystem access'); } });
+      for (const rejected of ['\\\\server\\share\\profiles', '//server/share/profiles', null, 7, {}, '',
+        'relative/profile', base + '/bad\0root', base + '/other/../profile', base + '/./profile']) {
+        const options = { platform, pathImpl: platform === 'win32' ? path.win32 : path.posix,
+          profileRoots: [first, rejected, last], fsImpl };
+        for (const file of [first + '/abook.sqlite', last + '/other/Mail/Inbox',
+          '\\\\server\\share\\file.txt', '//server/share/file.txt', base + '/credential.ppk']) {
+          await assert.rejects(inlineAttachmentPaths({ attachments: [file] }, options),
+            /Sensitive attachment path blocked/, `${file}, rejected=${JSON.stringify(rejected)}`);
+        }
+      }
+    });
+  }
+
+  it('refuses macOS profile case variants before filesystem access', async () => {
+    const fsImpl = new Proxy({}, { get() { assert.fail('profile paths must be refused before filesystem access'); } });
+    await assert.rejects(inlineAttachmentPaths({ attachments: ['/custom/profile/abook.sqlite'] }, {
+      platform: 'darwin', pathImpl: path.posix, profileRoots: ['/custom/Profile'], fsImpl,
+    }), /Sensitive attachment path blocked/);
+  });
+
+  it('keeps ordinary documents and message exports attachable with profile metadata', async () => {
+    const options = makeTestOptions(root);
+    delete options.procRoot; // File reads use the host's descriptor lookup, not discovery's mock /proc tree.
+    options.profileRoots = [path.join(root, 'profile'), path.join(root, 'profiles')];
+    const document = path.join(root, 'profile-documents', 'report.pdf');
+    const exported = path.join(options.osImpl.tmpdir(), 'thunderbird-mcp', 'message_1', 'report.pdf');
+    for (const file of [document, exported]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'ordinary attachment');
+      const args = { attachments: [file] };
+      await inlineAttachmentPaths(args, { ...options, platform: process.platform });
+      assert.equal(args.attachments[0].base64, Buffer.from('ordinary attachment').toString('base64'));
+    }
   });
 
   it('rejects attachment counts above the extension limit before filesystem access', async () => {
@@ -565,6 +617,23 @@ describe('Bridge attachment path policy', () => {
     await assert.rejects(inlineAttachmentPaths({ attachments: [path.join(alias, 'report.pdf')] }), /Sensitive attachment path blocked/);
   });
 
+  it('refuses a parent alias into a runtime profile before opening the attachment', async (t) => {
+    const profile = path.join(root, 'custom-profile');
+    const alias = path.join(root, 'documents');
+    fs.mkdirSync(profile);
+    fs.writeFileSync(path.join(profile, 'report.pdf'), 'profile fixture');
+    try {
+      fs.symlinkSync(profile, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (error) {
+      if (error.code === 'EPERM' || error.code === 'EACCES') return t.skip('symlinks unavailable');
+      throw error;
+    }
+    t.mock.method(fs.promises, 'open', async () => assert.fail('a profile attachment must not be opened'));
+    await assert.rejects(inlineAttachmentPaths({ attachments: [path.join(alias, 'report.pdf')] }, {
+      profileRoots: [profile, fs.realpathSync(profile)],
+    }), /Sensitive attachment path blocked/);
+  });
+
   it('lists every refused path and leaves a mixed request unchanged', async () => {
     const valid = path.join(root, 'report.pdf');
     const missing = path.join(root, 'missing.pdf');
@@ -747,6 +816,20 @@ describe('Bridge discovery', () => {
       pid: process.pid,
     });
   });
+
+  for (const profileRoots of [undefined, ['/custom-profile', '/profiles'], 'malformed', [null]]) {
+    it(`discovers a valid connection with optional metadata ${JSON.stringify(profileRoots)}`, () => {
+      const options = makeTestOptions(root, {
+        env: { THUNDERBIRD_MCP_CONNECTION_FILE: path.join(root, 'connection.json') },
+      });
+      writeConnectionFile(options.env.THUNDERBIRD_MCP_CONNECTION_FILE, {
+        port: 21000, token: 'a'.repeat(64), profileRoots,
+      });
+      const info = readConnectionInfo(options);
+      assert.equal(info.port, 21000);
+      assert.deepEqual(info.profileRoots, profileRoots);
+    });
+  }
 
   it('snap detection works from a mocked /proc tree', () => {
     const options = makeTestOptions(root, {
