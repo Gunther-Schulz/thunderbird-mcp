@@ -24,7 +24,11 @@ function loadSend(options = {}) {
   const identity = { key: "sender", email: "sender@example.test" };
   const timer = {
     cancelled: false,
-    initWithCallback(callback, delay) { this.callback = callback; this.delay = delay; },
+    initWithCallback(callback, delay) {
+      this.callback = callback;
+      this.delay = delay;
+      if (options.timerInitError) throw options.timerInitError;
+    },
     cancel() { this.cancelled = true; },
   };
   const creation = new Promise((resolve, reject) => {
@@ -38,13 +42,27 @@ function loadSend(options = {}) {
   const makeCompose = () => {
     const compose = {
       stateListener: null, unregistered: 0,
+      sendListeners: new Set(), stateListeners: new Set(),
       initialize(params, win, editor) {
         compose.init = { params, win, editor };
         if (options.initError) throw options.initError;
       },
-      addMsgSendListener(listener) { state.listener = listener; },
-      RegisterStateListener(listener) { compose.stateListener = listener; },
-      UnregisterStateListener(listener) { if (listener === compose.stateListener) compose.unregistered++; },
+      addMsgSendListener(listener) {
+        // Keep callback handles for late-notification tests, independently of
+        // the native object's strong listener registrations.
+        state.listener = listener;
+        compose.sendListeners.add(listener);
+        if (options.sendListenerError) throw options.sendListenerError;
+      },
+      removeMsgSendListener(listener) { compose.sendListeners.delete(listener); },
+      RegisterStateListener(listener) {
+        compose.stateListener = listener;
+        compose.stateListeners.add(listener);
+        if (options.stateListenerError) throw options.stateListenerError;
+      },
+      UnregisterStateListener(listener) {
+        if (compose.stateListeners.delete(listener)) compose.unregistered++;
+      },
       sendMsg(...args) {
         compose.sendArgs = args;
         if (options.createError) throw options.createError;
@@ -62,7 +80,11 @@ function loadSend(options = {}) {
       nsIMsgFolder: { nsMsgDispositionState_Replied: 10, nsMsgDispositionState_Forwarded: 11 },
     },
     Cc: {
-      "@mozilla.org/timer;1": { createInstance: () => timer },
+      "@mozilla.org/timer;1": { createInstance() {
+        if (options.timerCreateError) throw options.timerCreateError;
+        state.timerCreated = true;
+        return timer;
+      } },
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
       "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({
         headers: {}, setHeader(name, value) { this.headers[name] = value; }, addAttachment(att) { state.attached.push(att); },
@@ -142,6 +164,20 @@ async function assertPending(harness) {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(harness.state.result, undefined, "SMTP outcome must still be pending");
   assert.equal(harness.timer.cancelled, false, "delivery timer must stay active");
+  for (const compose of harness.state.composes) {
+    assert.equal(compose.sendListeners.size, 1, "send listener must stay registered until settlement");
+    assert.equal(compose.stateListeners.size, 1, "state listener must stay registered until settlement");
+  }
+}
+
+// Searched for listener-cleanup assertions: compose-window-claim has a local
+// window-specific assertClean, but no shared send-lifecycle assertion exists.
+function assertComposeReleased(harness) {
+  for (const compose of harness.state.composes) {
+    assert.equal(compose.sendListeners.size, 0, "send listener is released");
+    assert.equal(compose.stateListeners.size, 0, "state listener is released");
+  }
+  assert.equal(harness.timer.cancelled, !!harness.state.timerCreated, "created timer is cancelled");
 }
 
 const errors = [
@@ -263,6 +299,7 @@ describe("windowless nsIMsgCompose send", () => {
     assert.equal((await result).success, true);
     assert.equal(h.timer.cancelled, true);
     assert.equal(compose.unregistered, 1, "state listener is released");
+    assertComposeReleased(h);
   });
 
   it("succeeds on ComposeProcessDone when the send listener stays silent", async () => {
@@ -270,6 +307,7 @@ describe("windowless nsIMsgCompose send", () => {
     const result = h.start("compose");
     h.compose.stateListener.ComposeProcessDone(0);
     assert.equal((await result).success, true);
+    assertComposeReleased(h);
   });
 
   it("reports a failed ComposeProcessDone", async () => {
@@ -277,6 +315,7 @@ describe("windowless nsIMsgCompose send", () => {
     const result = h.start("compose");
     h.compose.stateListener.ComposeProcessDone(failure);
     assert.match((await result).error, /Send failed.*80004005/);
+    assertComposeReleased(h);
   });
 
   it("retains confirmed delivery when ComposeProcessDone or the promise fails afterward", async () => {
@@ -290,6 +329,8 @@ describe("windowless nsIMsgCompose send", () => {
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(h.state.result.error, undefined);
     assert.equal(h.compose.unregistered, 1);
+    h.timer.callback.notify();
+    assertComposeReleased(h);
   });
 
   for (const [label, options, pattern] of [
@@ -305,6 +346,7 @@ describe("windowless nsIMsgCompose send", () => {
       assert.equal(result.success, undefined);
       assert.equal(h.state.composes.length, 0);
       assert.equal(h.state.calls.length, 0);
+      assertComposeReleased(h);
     });
   }
 
@@ -316,18 +358,25 @@ describe("windowless nsIMsgCompose send", () => {
       await assertPending(h);
       trigger(h);
       assert.match((await result).error, pattern);
+      assertComposeReleased(h);
       const original = h.state.result;
       h.state.listener.onStopSending("id", 0);
       h.compose.stateListener.ComposeProcessDone(0);
+      h.timer.callback.notify();
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(h.state.result, original);
       assert.equal(h.compose.unregistered, 1);
+      assertComposeReleased(h);
     });
   }
 
   for (const [label, options, pattern] of [
     ["missing identity", { noIdentity: true }, /No identity/],
+    ["timer creation failure", { timerCreateError: new Error("timer creation threw") }, /timer creation threw/],
+    ["timer initialization failure", { timerInitError: new Error("timer init threw") }, /timer init threw/],
     ["initialize failure", { initError: new Error("init threw") }, /init threw/],
+    ["send listener registration failure", { sendListenerError: new Error("send listener threw") }, /send listener threw/],
+    ["state listener registration failure", { stateListenerError: new Error("state listener threw") }, /state listener threw/],
     ["sendMsg failure", { createError: new Error("sendMsg threw") }, /sendMsg threw/],
     ["attachment failure", { attachmentError: new Error("attachments invalid") }, /attachments invalid/],
   ]) {
@@ -337,6 +386,14 @@ describe("windowless nsIMsgCompose send", () => {
       assert.match(result.error, pattern);
       assert.equal(result.success, undefined);
       assert.equal(h.state.calls.length, 0);
+      assertComposeReleased(h);
+      // Even a callback retained before a partially successful registration
+      // must not change the failure or re-register either listener.
+      h.state.listener?.onStopSending("late", 0);
+      h.compose?.stateListener?.ComposeProcessDone(0);
+      h.timer.callback?.notify();
+      assert.equal(h.state.result, result);
+      assertComposeReleased(h);
     });
   }
 
@@ -345,6 +402,7 @@ describe("windowless nsIMsgCompose send", () => {
     const result = h.start("compose");
     h.state.listener.onStopSending("id", 0);
     assert.equal((await result).success, true);
+    assertComposeReleased(h);
   });
 });
 

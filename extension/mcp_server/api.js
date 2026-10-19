@@ -4700,29 +4700,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               return new Promise((resolve) => {
                 let msgCompose = null;
+                let sendListener = null;
                 let stateListener = null;
                 let settled = false;
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                let timer = null;
                 const settle = (result) => {
                   if (settled) return;
                   settled = true;
-                  timer.cancel();
+                  try { timer?.cancel(); } catch {}
                   if (msgCompose && stateListener) {
                     try { msgCompose.UnregisterStateListener(stateListener); } catch {}
                   }
+                  if (msgCompose && sendListener) {
+                    try { msgCompose.removeMsgSendListener(sendListener); } catch {}
+                  }
+                  // nsIMsgCompose retains send listeners strongly and is not
+                  // cycle-collected. Break both registrations and the closure's
+                  // ownership, including when a late callback is still queued.
+                  stateListener = null;
+                  sendListener = null;
+                  msgCompose = null;
+                  timer = null;
                   resolve(result);
                 };
 
-                // Before Thunderbird 153, this armed timer's closure (through
-                // settle) is the only strong owner of msgCompose after delivery
-                // starts. Keep it alive until the send outcome settles.
-                timer.initWithCallback({
-                  notify() {
-                    settle({ error: "Send timed out after 120s. The outcome is unknown; check Sent and the Outbox before retrying." });
-                  }
-                }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
-
                 try {
+                  // Before Thunderbird 153, this armed timer's closure (through
+                  // settle) is the only strong owner of msgCompose after delivery
+                  // starts. Keep it alive until the send outcome settles.
+                  timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timer.initWithCallback({
+                    notify() {
+                      settle({ error: "Send timed out after 120s. The outcome is unknown; check Sent and the Outbox before retrying." });
+                    }
+                  }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+
                   for (const att of descsToMsgAttachments(attachDescs)) {
                     msgComposeParams.composeFields.addAttachment(att);
                   }
@@ -4746,7 +4758,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // runs afterwards and can stall on a recovery prompt or fail, and
                   // reporting that as a failed send would invite a retry that
                   // delivers the message twice.
-                  msgCompose.addMsgSendListener({
+                  sendListener = {
                     QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
                     onStartSending() {},
                     onSendProgress() {},
@@ -4765,7 +4777,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     onTransportSecurityError(msgID, status, secInfo, location) {
                       settle({ error: `Transport security error${location ? ": " + location : ""}` });
                     },
-                  });
+                  };
+                  msgCompose.addMsgSendListener(sendListener);
 
                   // ComposeProcessDone is the final notification for every outcome.
                   // It reports failures the send listener did not see; a success

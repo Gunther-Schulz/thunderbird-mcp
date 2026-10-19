@@ -60,6 +60,7 @@ function loadComposeFormat(composeHtml) {
             this.sent = { body: params.composeFields.body, mimeType: useHtml ? "text/html" : "text/plain", format: params.format };
           },
           addMsgSendListener(listener) { this.listener = listener; },
+          removeMsgSendListener(listener) { if (this.listener === listener) this.listener = null; },
           RegisterStateListener() {},
           UnregisterStateListener() {},
           sendMsg(mode, sender, accountKey) {
