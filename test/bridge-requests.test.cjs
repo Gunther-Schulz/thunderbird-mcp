@@ -296,6 +296,127 @@ describe('bridge request outcomes', () => {
   });
 });
 
+describe('bridge response envelopes', () => {
+  for (const id of [1, 0, '1', '0', 'request-id', null]) {
+    it(`accepts a matching ${JSON.stringify(id)} response id`, async () => {
+      const { runtime, requests } = loadRequests();
+      const pending = runtime.forwardToThunderbird({ ...toolCall('listFolders'), id });
+      const expected = { jsonrpc: '2.0', id, result: {} };
+      finishResponse(requests[0], expected);
+      assert.deepEqual(JSON.parse(JSON.stringify(await pending)), expected);
+    });
+  }
+
+  for (const result of [null, false, 0, '', []]) {
+    it(`accepts a present result ${JSON.stringify(result)}`, async () => {
+      const { runtime, requests } = loadRequests();
+      const pending = runtime.forwardToThunderbird(toolCall('listFolders'));
+      const expected = { jsonrpc: '2.0', id: 1, result };
+      finishResponse(requests[0], expected);
+      assert.deepEqual(JSON.parse(JSON.stringify(await pending)), expected);
+    });
+  }
+
+  it('passes through a valid JSON-RPC error', async () => {
+    const { runtime, requests } = loadRequests();
+    const pending = runtime.forwardToThunderbird(toolCall('listFolders'));
+    const expected = { jsonrpc: '2.0', id: 1, error: { code: -32602, message: 'Invalid params', data: {} } };
+    finishResponse(requests[0], expected);
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)), expected);
+  });
+
+  for (const [name, reply] of [
+    ['null', null],
+    ['array', [{ jsonrpc: '2.0', id: 1, result: {} }]],
+    ['string', 'not a response'],
+    ['number', 1],
+    ['boolean', true],
+    ['missing version', { id: 1, result: {} }],
+    ['wrong version', { jsonrpc: '1.0', id: 1, result: {} }],
+    ['missing id', { jsonrpc: '2.0', result: {} }],
+    ['wrong id', { jsonrpc: '2.0', id: 2, result: {} }],
+    ['string id for numeric request', { jsonrpc: '2.0', id: '1', result: {} }],
+    ['null id for numeric request', { jsonrpc: '2.0', id: null, result: {} }],
+    ['missing result and error', { jsonrpc: '2.0', id: 1 }],
+    ['both result and error', { jsonrpc: '2.0', id: 1, result: {}, error: { code: -32603, message: 'Error' } }],
+    ['null error', { jsonrpc: '2.0', id: 1, error: null }],
+    ['array error', { jsonrpc: '2.0', id: 1, error: [] }],
+    ['string error', { jsonrpc: '2.0', id: 1, error: 'Error' }],
+    ['missing error code', { jsonrpc: '2.0', id: 1, error: { message: 'Error' } }],
+    ['string error code', { jsonrpc: '2.0', id: 1, error: { code: '-32603', message: 'Error' } }],
+    ['fractional error code', { jsonrpc: '2.0', id: 1, error: { code: 0.5, message: 'Error' } }],
+    ['missing error message', { jsonrpc: '2.0', id: 1, error: { code: -32603 } }],
+    ['numeric error message', { jsonrpc: '2.0', id: 1, error: { code: -32603, message: 1 } }],
+  ]) {
+    it(`rejects ${name} without replaying the request`, async () => {
+      const { runtime, requests } = loadRequests({ candidates: 2 });
+      const pending = runtime.forwardToThunderbird(toolCall('saveDraft'));
+      finishResponse(requests[0], reply);
+      await assert.rejects(pending, /port 8765.*something that is not Thunderbird MCP/);
+      assert.equal(requests.length, 1);
+    });
+  }
+
+  it('does not coerce a numeric response id to a string request id', async () => {
+    const { runtime, requests } = loadRequests({ candidates: 2 });
+    const pending = runtime.forwardToThunderbird({ ...toolCall('listFolders'), id: '0' });
+    finishResponse(requests[0], { jsonrpc: '2.0', id: 0, result: {} });
+    await assert.rejects(pending, /port 8765.*something that is not Thunderbird MCP/);
+    assert.equal(requests.length, 1);
+  });
+
+  it('reports invalid JSON without logging the reply or trying another candidate', async () => {
+    const { runtime, requests } = loadRequests({ candidates: 2 });
+    const pending = runtime.forwardToThunderbird(toolCall('listFolders'));
+    const res = response(requests[0], { complete: true });
+    res.emit('data', Buffer.from('<html>private reply contents</html>'));
+    res.emit('end');
+    await assert.rejects(pending, (error) => {
+      assert.match(error.message, /port 8765.*something that is not Thunderbird MCP.*invalid JSON/);
+      assert.doesNotMatch(error.message, /private reply contents/);
+      return true;
+    });
+    assert.equal(requests.length, 1);
+  });
+
+  it('validates the envelope after the JSON sanitization fallback', async () => {
+    const { runtime, requests } = loadRequests();
+    const expected = { jsonrpc: '2.0', id: 1, result: {} };
+    runtime.sanitizeJson = (data) => {
+      assert.equal(data, 'needs sanitizing');
+      return JSON.stringify(expected);
+    };
+    const pending = runtime.forwardToThunderbird(toolCall('listFolders'));
+    const res = response(requests[0], { complete: true });
+    res.emit('data', Buffer.from('needs sanitizing'));
+    res.emit('end');
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)), expected);
+  });
+
+  it('rejects a malformed envelope from the JSON sanitization fallback', async () => {
+    const { runtime, requests } = loadRequests({ candidates: 2 });
+    runtime.sanitizeJson = () => JSON.stringify({ jsonrpc: '2.0', id: '1', result: {} });
+    const pending = runtime.forwardToThunderbird(toolCall('listFolders'));
+    const res = response(requests[0], { complete: true });
+    res.emit('data', Buffer.from('needs sanitizing'));
+    res.emit('end');
+    await assert.rejects(pending, /port 8765.*something that is not Thunderbird MCP/);
+    assert.equal(requests.length, 1);
+  });
+
+  it('names the selected port after a 403 advances to another candidate', async () => {
+    const { runtime, requests } = loadRequests({ candidates: 3 });
+    const pending = runtime.forwardToThunderbird(toolCall('listFolders'));
+    const rejected = response(requests[0], { statusCode: 403, complete: true });
+    rejected.emit('end');
+    await new Promise(setImmediate);
+    assert.equal(requests.length, 2);
+    finishResponse(requests[1], { error: 'not a JSON-RPC response' });
+    await assert.rejects(pending, /port 8766.*something that is not Thunderbird MCP/);
+    assert.equal(requests.length, 2);
+  });
+});
+
 describe('bridge loader startup', () => {
   for (const disabled of [false, true]) {
     it(`production startup ${disabled ? 'honors an explicit opt-out' : 'runs when require.main differs'}`, () => {
