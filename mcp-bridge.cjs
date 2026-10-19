@@ -1367,8 +1367,8 @@ function tryRequest(hostname, postData, port, token, policy) {
         } catch {
           try {
             settle(null, JSON.parse(sanitizeJson(data)));
-          } catch (e) {
-            settle(new Error(`Invalid JSON from Thunderbird: ${e.message}`));
+          } catch {
+            settle(new Error(`The reply on port ${port} came from something that is not Thunderbird MCP (invalid JSON).`));
           }
         }
       });
@@ -1398,6 +1398,26 @@ function isRetryableConnectionError(err) {
       || err.code === 'ECONNREFUSED'
       || err.code === 'EADDRNOTAVAIL'
       || err.code === 'EAFNOSUPPORT');
+}
+
+function isJsonRpcResponse(response, requestId) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)
+    || response.jsonrpc !== '2.0'
+    || !Object.prototype.hasOwnProperty.call(response, 'id')
+    || response.id !== requestId
+    || !(response.id === null || typeof response.id === 'string' || Number.isFinite(response.id))) {
+    return false;
+  }
+  const hasResult = Object.prototype.hasOwnProperty.call(response, 'result');
+  const hasError = Object.prototype.hasOwnProperty.call(response, 'error');
+  if (hasResult === hasError) return false;
+  if (hasError) {
+    return response.error !== null && typeof response.error === 'object'
+      && !Array.isArray(response.error)
+      && Number.isInteger(response.error.code)
+      && typeof response.error.message === 'string';
+  }
+  return true;
 }
 
 function tryAllHosts(hosts, postData, port, token, policy) {
@@ -1473,7 +1493,11 @@ async function forwardToThunderbird(message) {
 
   while (connInfo) {
     try {
-      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token, policy);
+      const response = await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token, policy);
+      if (!isJsonRpcResponse(response, message.id)) {
+        throw new Error(`The reply on port ${connInfo.port} came from something that is not Thunderbird MCP (invalid JSON-RPC response).`);
+      }
+      return response;
     } catch (err) {
       if (!isRetryableConnectionError(err)) {
         throw err;
