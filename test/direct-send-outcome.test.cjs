@@ -58,6 +58,7 @@ function loadSend(options = {}) {
     Ci: {
       nsIMsgCompDeliverMode: modes, nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
+      nsIMsgCompFormat: { Default: 0, HTML: 1, PlainText: 2, OppositeOfDefault: 3 },
       nsIMsgFolder: { nsMsgDispositionState_Replied: 10, nsMsgDispositionState_Forwarded: 11 },
     },
     Cc: {
@@ -84,10 +85,15 @@ function loadSend(options = {}) {
       importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, {}) }),
     },
     Components: { isSuccessCode: status => status === 0 },
-    MailServices: { accounts: { accounts: [
-      { key: "other", identities: [{ key: "someone-else" }] },
-      { key: "account", identities: [identity] },
-    ] } },
+    MailServices: { accounts: { get accounts() {
+      if (options.accountError) throw options.accountError;
+      return [
+        { key: "other", identities: [{ key: "someone-else" }] },
+        ...(options.noAccount ? [] : [{
+          key: Object.hasOwn(options, "accountKey") ? options.accountKey : "account", identities: [identity],
+        }]),
+      ];
+    } } },
     descsToMsgAttachments(descs) {
       if (options.attachmentError) throw options.attachmentError;
       return descs;
@@ -115,7 +121,7 @@ function loadSend(options = {}) {
         const composeFields = sandbox.Cc["@mozilla.org/messengercompose/composefields;1"].createInstance();
         result = sandbox.sendThroughCompose(
           { identity: options.noIdentity ? null : identity, composeFields, type: 0 },
-          options.attachments || []);
+          options.attachments || [], options.useHtml ?? false);
       } else if (tool === "reply") {
         result = sandbox.replyToMessage("original", "folder", "Reply", false, false,
           undefined, undefined, undefined, undefined, undefined, true);
@@ -272,6 +278,35 @@ describe("windowless nsIMsgCompose send", () => {
     h.compose.stateListener.ComposeProcessDone(failure);
     assert.match((await result).error, /Send failed.*80004005/);
   });
+
+  it("retains confirmed delivery when ComposeProcessDone or the promise fails afterward", async () => {
+    const h = loadSend();
+    const result = h.start("compose");
+    h.state.listener.onStopSending("id", 0);
+    h.compose.stateListener.ComposeProcessDone(failure);
+    h.state.creationFailed(new Error("late rejection"));
+    h.state.listener.onSendNotPerformed("id", failure);
+    assert.equal((await result).success, true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.state.result.error, undefined);
+    assert.equal(h.compose.unregistered, 1);
+  });
+
+  for (const [label, options, pattern] of [
+    ["missing owning account", { noAccount: true }, /account/i],
+    ["empty account key", { accountKey: "" }, /account/i],
+    ["missing account key", { accountKey: undefined }, /account/i],
+    ["account lookup exception", { accountError: new Error("account lookup failed") }, /account lookup failed/],
+  ]) {
+    it(`refuses a ${label} before constructing or sending a compose`, async () => {
+      const h = loadSend(options);
+      const result = await h.start("compose");
+      assert.match(result.error, pattern);
+      assert.equal(result.success, undefined);
+      assert.equal(h.state.composes.length, 0);
+      assert.equal(h.state.calls.length, 0);
+    });
+  }
 
   for (const [label, trigger, pattern] of errors) {
     it(`reports ${label} and ignores later completion`, async () => {

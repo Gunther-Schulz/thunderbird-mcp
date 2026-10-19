@@ -4632,7 +4632,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Based on #229 by Kieran Hannigan.
              */
             // BEGIN COMPOSE SEND HELPER
-            function sendThroughCompose(msgComposeParams, attachDescs) {
+            function sendThroughCompose(msgComposeParams, attachDescs, useHtml) {
               const identity = msgComposeParams.identity;
               if (!identity) {
                 return Promise.resolve({ error: "No identity available for direct send" });
@@ -4655,7 +4655,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   resolve(result);
                 };
 
-                // Safety timeout -- if neither listener nor an error fires
+                // Before Thunderbird 153, this armed timer's closure (through
+                // settle) is the only strong owner of msgCompose after delivery
+                // starts. Keep it alive until the send outcome settles.
                 timer.initWithCallback({
                   notify() {
                     settle({ error: "Send timed out after 120s. The outcome is unknown; check Sent and the Outbox before retrying." });
@@ -4669,8 +4671,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                   const accountKey = MailServices.accounts.accounts.find(account =>
                     account.identities.some(id => id.key === identity.key)
-                  )?.key || "";
+                  )?.key;
+                  if (typeof accountKey !== "string" || !accountKey.trim()) {
+                    throw new Error("Cannot send: the identity's owning account key could not be resolved");
+                  }
 
+                  // Initialize accepts explicit formats even for ForwardInline.
+                  // Use the same decision that shaped the body, rather than
+                  // re-reading identity defaults when choosing the MIME type.
+                  msgComposeParams.format = useHtml ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.PlainText;
                   msgCompose = Cc["@mozilla.org/messengercompose/compose;1"]
                     .createInstance(Ci.nsIMsgCompose);
                   msgCompose.initialize(msgComposeParams, null, null);
@@ -5179,9 +5188,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *
              * Thunderbird inserts signatures from its compose window only
              * (gMsgCompose reads htmlSigText/sig_file and honours sig_bottom).
-             * The createAndSendMessage path behind saveDraft and skipReview
-             * sends never opens that window, so without this the message ships
-             * with no signature at all. New messages carry no quote, so
+             * Neither saveDraft's nsIMsgSend nor skipReview's windowless
+             * nsIMsgCompose has an editor to insert a signature, so new mail
+             * and drafts append it here. New messages carry no quote, so
              * sig_bottom does not apply: the signature always goes last.
              *
              * Returns "" when the identity has no signature.
@@ -5236,7 +5245,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * mode, and returns the matching msgComposeParams.format value.
              *
              * The caller's explicit isHtml wins (true/false). When isHtml is
-             * omitted, the identity's compose-format preference is consulted.
+             * omitted or null, the identity's compose-format preference is consulted.
              *
              * ForwardInline is a special case: Thunderbird's compose service
              * only passes format through when it's Default or OppositeOfDefault
@@ -5246,6 +5255,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *
              * Identity must be resolved (setComposeIdentity) before calling this.
              */
+            // BEGIN COMPOSE FORMAT HELPER
             function resolveComposeFormat(identity, isHtml, compType) {
               const identityUsesHtml = identity?.composeHtml !== false;
               const useHtml = isHtml === true || (isHtml !== false && identityUsesHtml);
@@ -5253,7 +5263,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                              || compType === Ci.nsIMsgCompType.ForwardAsAttachment;
 
               let format;
-              if (isHtml === undefined) {
+              if (isHtml === undefined || isHtml === null) {
                 format = Ci.nsIMsgCompFormat.Default;
               } else if (isForward) {
                 const explicitMatchesPref = (isHtml === true) === identityUsesHtml;
@@ -5265,6 +5275,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               return { useHtml, format };
             }
+            // END COMPOSE FORMAT HELPER
 
             /**
              * Sets compose identity from `from` param or falls back to default.
@@ -9587,7 +9598,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // must NOT get it -- Thunderbird adds it when the window
                   // opens, and doing both would duplicate it.
                   composeFields.body = buildBodyWithSignature(body, msgComposeParams.identity, useHtml, isHtml, includeSignature);
-                  return sendThroughCompose(msgComposeParams, fileDescs).then(result => {
+                  return sendThroughCompose(msgComposeParams, fileDescs, useHtml).then(result => {
                     if (result.success) {
                       let msg = "Message sent";
                       result.message = msg;
@@ -9910,7 +9921,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                        }
 
 	                        // On success Thunderbird marks the original replied.
-	                        sendThroughCompose(msgComposeParams, fileDescs).then(result => {
+	                        sendThroughCompose(msgComposeParams, fileDescs, replyUseHtml).then(result => {
 	                          if (result.success) {
 	                            let msg = "Reply sent";
 	                            result.message = msg;
@@ -10108,7 +10119,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const allDescs = [...origDescs, ...fileDescs];
 
                         // On success Thunderbird marks the original forwarded.
-                        sendThroughCompose(msgComposeParams, allDescs).then(result => {
+                        sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml).then(result => {
                           if (result.success) {
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                             result.message = msg;

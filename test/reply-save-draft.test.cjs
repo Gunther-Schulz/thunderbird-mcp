@@ -61,7 +61,7 @@ function loadReply(options = {}) {
     isAccountAllowed: key => key === "allowed",
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
-      "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({}) },
+      "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ setHeader() {} }) },
       "@mozilla.org/timer;1": { createInstance() {
         const timer = {
           cancelled: false,
@@ -127,6 +127,8 @@ function loadReply(options = {}) {
       return afterInsert(win);
     },
   };
+  // Share the existing no-send counter with the new windowless compose path.
+  sandbox.sendThroughCompose = sandbox.sendMessageDirectly;
   // Exercise the real access gate too, so a restricted account with a Drafts
   // flag cannot pass merely because a stub forgot to enforce account access.
   const accessStart = source.indexOf("function isFolderAccessible(folder) {");
@@ -150,6 +152,15 @@ function loadReply(options = {}) {
 }
 
 describe("replyToMessage saveAsDraft", () => {
+  it("observes a direct reply send with the same counter used by draft no-send assertions", async () => {
+    const { reply, calls } = loadReply({ blocked: false });
+    const result = await reply({ saveAsDraft: false, skipReview: true });
+    assert.equal(result.success, true);
+    assert.equal(calls.sends, 1);
+    assert.equal(calls.saves, 0);
+    assert.equal(calls.opens.length, 0);
+  });
+
   it("uses native reply composition and saves without sending even while skipReview is blocked", async () => {
     const { reply, calls, identity } = loadReply();
     const attachment = { name: "note.txt", base64: "bm90ZQ==" };
