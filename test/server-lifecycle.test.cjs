@@ -739,6 +739,64 @@ describe("post-bind listener ownership", () => {
 });
 
 describe("probe through S1's real httpd parser", () => {
+  it("moves to 8766 when another add-on server answers the probe with its default 404", async () => {
+    // The second server has only the harness's own "/" handler. Our probe
+    // handler belongs to the lifecycle server and is never registered here.
+    const other = createHttpdHarness();
+    other.server.identity.add("http", "127.0.0.1", 8765);
+    const { api, state } = loadServerLifecycle({ httpd: other, holdProbes: true, holdStops: true });
+    const pending = api.start();
+    const server = state.servers[0];
+    const firstProbe = state.channels[0];
+    assert.deepEqual(server.binds, [8765]);
+    assert.equal(server.listening, true);
+    assert.equal(server.handlers.has(firstProbe.url.pathname), true);
+    assert.match(firstProbe.url.pathname, /^\/thunderbird-mcp-probe\/[0-9a-f]{64}$/);
+
+    firstProbe.respond();
+    await new Promise(setImmediate);
+    assert.match(firstProbe.exchange.wire, /^HTTP\/1\.1 404 Not Found\r\n/);
+    assert.ok(firstProbe.exchange.wire.includes("\r\n\r\n"), "the default 404 has a complete response head");
+    assert.deepEqual(firstProbe.exchange.errors, [], "the probe passes S1's request parser");
+    assert.equal(other.requests.length, 0, "the random probe path does not reach the other server's root handler");
+    assert.ok(state.logs.some(args => String(args[0]).includes("port 8765 is answered by another listener")));
+    assert.equal(server.stops, 1);
+    assert.equal(state.pendingStops.length, 1);
+    assert.deepEqual(server.binds, [8765], "rebind must wait for stop completion");
+    assert.equal(state.channels.length, 1);
+    assert.equal(state.connection, null);
+    assert.deepEqual(state.connectionWrites, []);
+    assert.equal((await api.getServerInfo()).running, false);
+
+    // After the first listener finishes stopping, the next port reaches our
+    // production probe handler through the existing lifecycle channel stub.
+    state.httpd = null;
+    state.pendingStops.shift()();
+    await new Promise(setImmediate);
+    assert.deepEqual(server.binds, [8765, 8766]);
+    assert.equal(state.channels.length, 2);
+    assert.equal(state.channels[1].url.port, "8766");
+    assert.equal(state.connection, null, "do not publish before the final probe completes");
+    state.channels[1].respond();
+    const result = await pending;
+    assert.equal(result.success, true);
+    assert.equal(result.port, 8766);
+    assert.equal(server.listening, true);
+    assert.equal(server.port, 8766);
+    assert.equal(server.stops, 1);
+    assert.deepEqual(state.connectionWrites.map(info => info.port), [8766]);
+    assert.equal(state.connection.port, 8766);
+    assert.ok(!state.logs.some(args => String(args[0]).includes("inconclusive")));
+    for (const channel of state.channels) {
+      assert.deepEqual(channel.headers, { Connection: "close" });
+      assert.equal(channel.uri.includes(state.connection.token), false);
+    }
+    assert.doesNotMatch(firstProbe.requestWire, /Authorization|Bearer/i);
+    assert.equal(firstProbe.requestWire.includes(state.connection.token), false);
+    assert.equal(other.socket.closed, false, "only our listener is stopped");
+    assert.match(other.request("GET / HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n").wire, /^HTTP\/1\.1 200 OK\r\n/);
+  });
+
   for (const mode of ["loopback", "listenAll"]) {
     it(`reaches the production probe handler without authentication (${mode})`, async () => {
       const httpd = createHttpdHarness({ mode });
