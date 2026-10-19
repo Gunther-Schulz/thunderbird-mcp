@@ -4991,11 +4991,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (identity.attachSignature) {
                   const file = identity.signature;
                   if (file && file.exists() && file.isFile()) {
+                    let contentType = "";
+                    try {
+                      contentType = Cc["@mozilla.org/mime;1"].getService(Ci.nsIMIMEService).getTypeFromFile(file);
+                    } catch { /* Unknown types fall back to the filename. */ }
+                    const isImage = contentType
+                      ? contentType.startsWith("image/")
+                      : /\.(?:avif|bmp|gif|ico|jpe?g|png|svg|tiff?|webp)$/i.test(file.leafName);
+                    if (isImage) {
+                      console.warn("thunderbird-mcp: image signature files are omitted from direct sends and saved drafts");
+                      return null;
+                    }
                     const content = readSignatureFileText(file);
                     if (content && content.trim()) {
-                      return { content, isHtmlSig: /\.html?$/i.test(file.leafName) };
+                      return { content, isHtmlSig: contentType ? contentType === "text/html" : /\.html?$/i.test(file.leafName) };
                     }
                   }
+                  // Thunderbird ignores inline signature text when a file is selected.
+                  return null;
                 }
                 const inline = identity.htmlSigText;
                 if (inline && inline.trim()) {
@@ -5071,19 +5084,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!sig) return "";
 
               const asText = sig.isHtmlSig ? htmlSignatureToPlainText(sig.content) : sig.content;
-              // Thunderbird prepends the "-- " separator unless the signature
-              // already opens with one (mail.compose.dont_add_signature_separator).
-              const hasSeparator = /^\s*--\s*$/m.test(asText.split("\n")[0] || "");
+              // Honor the identity's suppress_signature_separator preference.
+              // Check every rendered-text line with our existing whitespace
+              // leniency; Thunderbird checks raw source for HTML signatures.
+              const omitSeparator = identity.suppressSigSep === true || /^\s*--\s*$/m.test(asText);
 
               if (useHtml) {
                 const sigHtml = sig.isHtmlSig
                   ? formatBodyHtml(unwrapHtmlDocument(sig.content), true)
                   : formatBodyHtml(sig.content, false);
-                const separator = hasSeparator ? "" : "-- <br>";
+                const separator = omitSeparator ? "" : "-- <br>";
                 return `<br><div class="moz-signature">${separator}${sigHtml}</div>`;
               }
 
-              const separator = hasSeparator ? "" : "-- \n";
+              const separator = omitSeparator ? "" : "-- \n";
               return `\n\n${separator}${asText}`;
             }
 
