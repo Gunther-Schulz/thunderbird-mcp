@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const formats = { Default: 0, HTML: 1, PlainText: 2, OppositeOfDefault: 3 };
@@ -32,15 +33,18 @@ function loadComposeFormat(composeHtml) {
     subject: "Original subject", recipients: "sender@example.test", date: 0,
   };
   const sandbox = {
+    ...clearOriginalRawFixture,
     Ci: {
+      nsIPrefBranch: prefTypes,
       nsIMsgCompType: types, nsIMsgCompFormat: formats,
       nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 4 }, nsITimer: { TYPE_ONE_SHOT: 0 },
     },
     ChromeUtils: {
       generateQI: () => () => {},
-      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, {}) }),
+      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, { contentType: "text/plain", body: "Original <text>\nSecond line" }) }),
     },
     Components: { isSuccessCode: status => status === 0 },
+    Services: { prefs: makeDirectSendPrefs() },
     MailServices: { accounts: { accounts: [{ key: "account", identities: [identity] }] } },
     Cc: {
       "@mozilla.org/timer;1": { createInstance: () => ({ initWithCallback() {}, cancel() {} }) },
@@ -114,6 +118,7 @@ function loadComposeFormat(composeHtml) {
     source.slice(escapeStart, escapeEnd),
     snippet("MESSAGE TEXT CONVERSION"), snippet("COMPOSE HTML FRAGMENT"),
     snippet("COMPOSE SIGNATURE HELPERS"), snippet("COMPOSE FORMAT HELPER"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("DIRECT SEND HELPER"), snippet("COMPOSE SEND HELPER"),
     snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL DISPATCH"),
   ].join("\n"), sandbox);

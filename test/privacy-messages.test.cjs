@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
+const { makeDirectSendAttachments, assertNoAttachmentEffects } = require("./helpers/direct-send-attachments.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 // Same marker assertions and VM loading pattern as validation.test.cjs.
@@ -15,13 +17,19 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "raw MIME", DOMParser: Parser = null, streamError, mimeError } = {}) {
-  const calls = { options: [], streams: 0, sends: [], reviews: 0, logs: [] };
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError } = {}) {
+  const attachments = makeDirectSendAttachments();
+  const calls = {
+    options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [], timers: [],
+    created: { params: 0, fields: 0, compose: 0, sender: 0 },
+    attachments: attachments.calls,
+  };
   const folder = {
     server: {},
     getUriForMsg: () => "message-uri",
     getMsgInputStream() {
       calls.streams++;
+      calls.order.push("raw");
       if (streamError) throw streamError;
       return { close() {} };
     },
@@ -37,27 +45,58 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     Uint8Array,
     atob,
     btoa,
-    Services: { prefs: { getBoolPref() { if (unreadable) throw Error("unreadable"); return allowed; } } },
-    ChromeUtils: { importESModule: () => ({
+    Services: { prefs: {
+      ...makeDirectSendPrefs(),
+      getBoolPref() { if (unreadable) throw Error("unreadable"); return allowed; },
+    } },
+    ChromeUtils: { importESModule: () => {
+      calls.imports++;
+      calls.order.push("import");
+      return {
       MsgHdrToMimeMessage(msgHdr, _listener, callback, _download, options) {
         calls.options.push(options);
+        calls.order.push("mime");
         if (mimeError) throw mimeError;
         callback(msgHdr, mime);
       },
-    }) },
+      };
+    } },
     findMessage: () => ({ msgHdr: hdr, folder }),
     getUserTags: () => [],
     getConfiguredGetMessagesLimit: () => 10,
     readMessageStreamFully: () => raw,
     isSkipReviewBlocked: () => false,
     isToolEnabled: () => true,
-    filePathsToAttachDescs: () => ({ descs: [], failed: [] }),
+    filePathsToAttachDescs: attachments.convert,
+    descsToMsgAttachments: attachments.toNative,
     Cc: {
-      "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
-      "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ setHeader() {} }) },
+      "@mozilla.org/timer;1": { createInstance() {
+        const timer = {
+          initWithCallback(callback, delay) { this.callback = callback; this.delay = delay; },
+          cancel() { this.cancelled = true; },
+        };
+        calls.timers.push(timer);
+        return timer;
+      } },
+      "@mozilla.org/messengercompose/composeparams;1": { createInstance() {
+        calls.created.params++;
+        return {};
+      } },
+      "@mozilla.org/messengercompose/composefields;1": { createInstance() {
+        calls.created.fields++;
+        return { setHeader() {} };
+      } },
+      "@mozilla.org/messengercompose/compose;1": { createInstance() {
+        calls.created.compose++;
+        return {};
+      } },
+      "@mozilla.org/messengercompose/send;1": { createInstance() {
+        calls.created.sender++;
+        return {};
+      } },
     },
-    Ci: { nsIMsgCompType: { Reply: 1, ReplyAll: 2, ForwardInline: 3 }, nsIMsgCompDeliverMode: { Now: 0 }, nsIMsgFolder: {} },
-    setComposeIdentity(params) { params.identity = {}; },
+    Ci: { nsIPrefBranch: prefTypes, nsITimer: { TYPE_ONE_SHOT: 0 }, nsIMsgCompType: { Reply: 1, ReplyAll: 2, ForwardInline: 3 }, nsIMsgCompDeliverMode: { Now: 0 }, nsIMsgFolder: {} },
+    setComposeIdentity(params) { params.identity = { key: "sender" }; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     async sendThroughCompose(params, attachments) {
       calls.sends.push({ ...params.composeFields, attachments });
@@ -72,11 +111,41 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     snippet("MESSAGE TEXT CONVERSION"), snippet("RAW MIME PARSING HELPERS"),
     snippet("RAW MIME ATTACHMENT HELPERS"), snippet("INLINE IMAGE CONTENT HELPERS"),
     snippet("INLINE ATTACHMENT BASE64 HELPERS"), snippet("ENCRYPTED MESSAGE GUARD"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("MESSAGE READ TOOLS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   // The production stream reader is loaded with its helper block; serve the fixture instead.
   sandbox.readMessageStreamFully = () => raw;
+  // Searched for test call-through defaults -> found the invoke lambdas below.
+  // Give every direct call real path and inline inputs without changing reads,
+  // review windows, or automatic drafts that omit their caller attachments.
+  for (const [name, attachmentIndex, skipReviewIndex] of [
+    ["replyToMessage", 9, 10],
+    ["forwardMessage", 8, 9],
+  ]) {
+    const invoke = sandbox[name];
+    sandbox[name] = (...args) => {
+      if (args[skipReviewIndex] && args[attachmentIndex] === undefined) args[attachmentIndex] = attachments.entries;
+      return invoke(...args);
+    };
+  }
   return { api: sandbox, calls };
+}
+
+// Searched for original-message refusal assertions -> found identity-only
+// assertRefused in direct-send-encryption, whose no-MIME check does not fit.
+// Reuse its constructor-counter and review-instruction assertions here.
+function assertOriginalRefused(calls, result) {
+  assert.equal(result.success, undefined);
+  assert.match(result.error, /encrypted messages is blocked/);
+  assert.match(result.error, /skipReview: false/);
+  assert.match(result.error, /review window/);
+  assert.match(result.error, /Thunderbird.*encryption/);
+  assert.doesNotMatch(result.error, /enable.*read encrypted/i);
+  assert.deepEqual(calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
+  assert.equal(calls.sends.length, 0);
+  assert.equal(calls.reviews, 0);
+  assertNoAttachmentEffects(calls.attachments);
 }
 
 const encryptedTrees = [
@@ -89,6 +158,21 @@ const encryptedTrees = [
   { label: "ambiguous PKCS7", contentType: "application/pkcs7-mime; smime-type=enveloped-data; smime-type=signed-data" },
   { label: "empty encrypted MIME tree", contentType: "message/rfc822", headers: { "content-type": ["application/pkcs7-mime; smime-type=enveloped-data"] }, parts: [] },
   { label: "inline OpenPGP", contentType: "text/plain", body: "-----BEGIN PGP MESSAGE-----\nciphertext" },
+];
+
+const protectedRawOriginals = [
+  ["OpenPGP MIME", [
+    'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="enc"', "",
+    "--enc", "Content-Type: application/pgp-encrypted", "", "Version: 1",
+    "--enc", "Content-Type: application/octet-stream", "", "ciphertext", "--enc--", "",
+  ].join("\r\n")],
+  ["S/MIME encrypted", "Content-Type: application/pkcs7-mime; smime-type=enveloped-data\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["S/MIME opaque signed", "Content-Type: application/pkcs7-mime; smime-type=signed-data\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["legacy S/MIME", "Content-Type: application/x-pkcs7-mime\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["inline armor", "Content-Type: text/plain\r\n\r\n-----BEGIN PGP MESSAGE-----\r\nciphertext"],
+  ["CMS filename without a reliable MIME type", "Content-Type: application/octet-stream; name=smime.p7m\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["unknown malformed MIME", "Content-Type: multipart/mixed\r\n\r\nno boundary"],
+  ["incomplete raw MIME", "Content-Type: text/plain"],
 ];
 
 describe("Encrypted message privacy", () => {
@@ -172,10 +256,9 @@ describe("Encrypted message privacy", () => {
             await api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true),
           ];
           for (const reply of replies) {
-            if (allowed) assert.equal(reply.success, true);
-            else assert.match(reply.error, /encrypted messages is blocked/);
+            assertOriginalRefused(calls, reply);
           }
-          assert.equal(calls.sends.length, allowed ? 2 : 0);
+          assert.equal(calls.sends.length, 0);
         });
       }
     }
@@ -200,38 +283,106 @@ describe("Encrypted message privacy", () => {
     const invoke = (api, skipReview) => tool === "replyToMessage"
       ? api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, skipReview)
       : api.forwardMessage("message-1", "folder", "recipient@example.test", "intro", false, undefined, undefined, undefined, undefined, skipReview);
+    for (const [label, raw] of protectedRawOriginals) {
+      for (const allowed of [false, true]) {
+        it(`${tool} refuses ${label} raw content before Gloda can run, opt-in=${allowed}`, async () => {
+          const { api, calls } = loadMessageTools({
+            allowed, raw,
+            mime: { contentType: "text/plain", body: "decrypted plaintext that Gloda must never produce" },
+          });
+          assertOriginalRefused(calls, await invoke(api, true));
+          assert.equal(calls.streams, 1);
+          assert.equal(calls.imports, 0, "The MIME module is not imported for protected or unknown raw content");
+          assert.equal(calls.options.length, 0, "Gloda/libmime must never receive a protected original");
+          assert.deepEqual(calls.order, ["raw"]);
+        });
+      }
+    }
+    for (const encrypted of encryptedTrees) {
+      for (const allowed of [false, true]) {
+        it(`${tool} refuses ${encrypted.label} before any native compose creation, opt-in=${allowed}`, async () => {
+          const mime = {
+            ...encrypted,
+            get allUserAttachments() { return assert.fail("Refused originals must not expose attachment metadata"); },
+          };
+          const { api, calls } = loadMessageTools({ mime, allowed });
+          assertOriginalRefused(calls, await invoke(api, true));
+          assert.equal(calls.streams, 1);
+          assert.equal(calls.options.length, 1);
+          assert.deepEqual(calls.order, ["raw", "import", "mime"], "Clear raw classification precedes the structured guard");
+        });
+      }
+    }
+    for (const [label, options] of [
+      ["missing MIME result", { mime: null }],
+      ["unclassified content type", { mime: { contentType: "text plain", body: "private body" } }],
+      ["MIME parser failure", { mimeError: new Error("MIME parser failed") }],
+      ["classification failure", { mime: { get contentType() { throw new Error("Classification failed"); } } }],
+      ["body extraction failure", { mime: { contentType: "text/plain", get body() { throw new Error("Body unavailable"); } } }],
+      ["missing structured body and unreadable raw", { mime: { contentType: "message/rfc822", parts: [] }, streamError: new Error("Raw unavailable") }],
+      ["missing structured body and missing raw", { mime: { contentType: "message/rfc822", parts: [] }, raw: "" }],
+    ]) {
+      for (const allowed of [false, true]) {
+        it(`${tool} refuses ${label} before any native compose creation, opt-in=${allowed}`, async () => {
+          const { api, calls } = loadMessageTools({ ...options, allowed });
+          assertOriginalRefused(calls, await invoke(api, true));
+          assert.equal(calls.options.length, options.streamError || options.raw === "" ? 0 : 1);
+          assert.equal(calls.order[0], "raw");
+        });
+      }
+    }
+    for (const allowed of [false, true]) {
+      it(`${tool} allows an ordinary original with opt-in=${allowed}`, async () => {
+        const { api, calls } = loadMessageTools({ allowed });
+        const result = await invoke(api, true);
+        assert.equal(result.success, true, result.error);
+        assert.equal(calls.sends.length, 1);
+        assert.match(calls.sends[0].body, /visible/);
+        assert.equal(calls.options.length, 1);
+        assert.equal(calls.options[0].examineEncryptedParts, false);
+        assert.equal(calls.streams, 1);
+        assert.deepEqual(calls.order, ["raw", "import", "mime"]);
+        assert.equal(calls.attachments.tempCreates.length, 1);
+        assert.equal(calls.attachments.writes.length, 1);
+        assert.ok(calls.attachments.fileAccesses.length > 0);
+      });
+      it(`${tool} allows clear raw classification of an empty structured original, opt-in=${allowed}`, async () => {
+        const { api, calls } = loadMessageTools({
+          allowed, mime: { contentType: "message/rfc822", parts: [] }, raw: "Content-Type: text/plain\r\n\r\nvisible",
+        });
+        const result = await invoke(api, true);
+        assert.equal(result.success, true, result.error);
+        assert.equal(calls.sends.length, 1);
+        assert.equal(calls.options.length, 1);
+        assert.equal(calls.options[0].examineEncryptedParts, false);
+        assert.equal(calls.streams, 1);
+      });
+    }
     for (const unreadable of [false, true]) {
       it(`${tool} rejects direct encrypted sends with pref off/unreadable=${unreadable}`, async () => {
         const { api, calls } = loadMessageTools({ mime: encryptedTrees[2], unreadable });
         const result = await invoke(api, true);
-        assert.match(result.error, /encrypted messages is blocked/);
-        assert.match(result.error, /skipReview: false/);
-        assert.equal(calls.sends.length, 0);
-        assert.equal(calls.options[0].examineEncryptedParts, false);
+        assertOriginalRefused(calls, result);
       });
       it(`${tool} rejects armor from plaintext coercion with pref off/unreadable=${unreadable}`, async () => {
         const { api, calls } = loadMessageTools({
           mime: { parts: [], coerceBodyToPlaintext: () => "-----BEGIN PGP MESSAGE-----\nciphertext" }, unreadable,
         });
         const result = await invoke(api, true);
-        assert.match(result.error, /encrypted messages is blocked/);
-        assert.equal(calls.sends.length, 0);
+        assertOriginalRefused(calls, result);
       });
     }
-    it(`${tool} permits armor from plaintext coercion after explicit opt-in`, async () => {
+    it(`${tool} refuses armor from plaintext coercion even after explicit opt-in`, async () => {
       const { api, calls } = loadMessageTools({
         mime: { parts: [], coerceBodyToPlaintext: () => "-----BEGIN PGP MESSAGE-----\nciphertext" }, allowed: true,
       });
       const result = await invoke(api, true);
-      assert.equal(result.success, true);
-      assert.match(calls.sends[0].body, /-----BEGIN PGP MESSAGE-----/);
+      assertOriginalRefused(calls, result);
     });
-    it(`${tool} sends encrypted quoted content after explicit opt-in`, async () => {
+    it(`${tool} refuses encrypted quoted content even after explicit opt-in`, async () => {
       const { api, calls } = loadMessageTools({ mime: encryptedTrees[2], allowed: true });
       const result = await invoke(api, true);
-      assert.equal(result.success, true);
-      assert.match(calls.sends[0].body, /decrypted body/);
-      assert.equal(calls.options[0].examineEncryptedParts, true);
+      assertOriginalRefused(calls, result);
     });
     it(`${tool} leaves the review path available without MIME extraction`, async () => {
       const { api, calls } = loadMessageTools({ mime: encryptedTrees[2] });
@@ -392,7 +543,7 @@ describe("Standalone inline PGP armor", () => {
           await api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true),
         ];
         for (const send of sends) {
-          if (encrypted) assert.match(send.error, /encrypted messages is blocked/);
+          if (encrypted) assertOriginalRefused(calls, send);
           else assert.equal(send.success, true);
         }
         assert.equal(calls.sends.length, encrypted ? 0 : 2);
@@ -452,14 +603,13 @@ describe("Mixed MIME primary bodies in reads and direct quoting", () => {
         assert.match(fields.body, /Continued discussion/);
         assert.doesNotMatch(fields.body, /Unsubscribe footer|<p>/);
       }
-      assert.equal(calls.streams, 0);
+      assert.equal(calls.streams, 2);
     });
   }
 });
 
 describe("Encryption classification of joined MIME bodies", () => {
   const armor = "-----BEGIN PGP MESSAGE-----";
-  const text = `${armor}\nciphertext`;
   const html = `<p>${armor}</p><p>ciphertext</p>`;
 
   for (const isHtml of [false, true]) {
@@ -491,12 +641,10 @@ describe("Encryption classification of joined MIME bodies", () => {
           await api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true),
         ];
         for (const result of results) {
-          if (allowed) assert.equal(result.success, true);
-          else assert.match(result.error, /encrypted messages is blocked/);
+          assertOriginalRefused(calls, result);
         }
-        assert.equal(calls.sends.length, allowed ? 2 : 0);
-        assert.equal(calls.streams, 0);
-        if (!isHtml && allowed) assert.ok(calls.sends[1].body.includes(text));
+        assert.equal(calls.sends.length, 0);
+        assert.equal(calls.streams, 2);
       });
     }
   }
@@ -557,8 +705,8 @@ describe("Oversized HTML encryption classification", () => {
         assert.equal(result.subject, "[Encrypted message]");
       }
       assert.equal((await api.getMessage("message-1", "folder", false, "html", true)).encryptedContentWithheld, true);
-      for (const send of await directSends(api)) assert.match(send.error, /encrypted messages is blocked/);
-      assert.equal(calls.streams, 0);
+      for (const send of await directSends(api)) assertOriginalRefused(calls, send);
+      assert.equal(calls.streams, 2);
       assert.equal(calls.sends.length, 0);
     });
 
@@ -579,7 +727,7 @@ describe("Oversized HTML encryption classification", () => {
     }
   }
 
-  it("never classifies a standalone armor line created by the presentation cut", async () => {
+  it("keeps read classification intact while refusing oversized direct-send quotes", async () => {
     const encodedHeader = "&#45;----BEGIN PGP MESSAGE-----";
     const prefix = `<p>${" ".repeat(cap - 3 - encodedHeader.length)}${encodedHeader}`;
     const html = `${prefix} is the delimiter.</p>`;
@@ -594,8 +742,8 @@ describe("Oversized HTML encryption classification", () => {
       assert.notEqual(result.encryptedContentWithheld, true);
       assert.equal(result.body, format === "html" ? html : `${header}\n\n[Message body truncated at 2 MiB]`);
     }
-    for (const send of await directSends(api)) assert.equal(send.success, true);
-    assert.equal(calls.sends.length, 2);
+    for (const send of await directSends(api)) assertOriginalRefused(calls, send);
+    assert.equal(calls.sends.length, 0);
 
     const raw = `Content-Type: text/html\n\n${html}`;
     const fallback = loadHtmlFixture(prefix, () => documentTree([elementNode("p", [textNode(header)])]), { raw, mime: { parts: [] } }).api;
@@ -616,7 +764,7 @@ describe("Oversized HTML encryption classification", () => {
         assert.equal(result.encryptedContentWithheld === true, encrypted);
       }
       for (const send of await directSends(api)) {
-        if (encrypted) assert.match(send.error, /encrypted messages is blocked/);
+        if (encrypted) assertOriginalRefused(calls, send);
         else assert.equal(send.success, true);
       }
       assert.equal(calls.sends.length, encrypted ? 0 : 2);
@@ -683,6 +831,24 @@ describe("Encryption classification before raw output or body fallback", () => {
         assert.doesNotMatch(JSON.stringify(result), /ciphertext|protected subject/);
         assert.equal(calls.streams, 1);
         assert.equal(calls.options[0].examineEncryptedParts, false);
+      });
+    }
+    for (const allowed of [false, true]) {
+      it(`direct replies and forwards refuse ${label} with empty structured MIME, opt-in=${allowed}`, async () => {
+        const { api, calls } = loadMessageTools({
+          allowed, raw, mime: {
+            contentType: "message/rfc822", parts: [],
+            get allUserAttachments() { return assert.fail("Refused raw content must not expose attachment metadata"); },
+          },
+        });
+        const results = [
+          await api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true),
+          await api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true),
+        ];
+        for (const result of results) assertOriginalRefused(calls, result);
+        assert.equal(calls.streams, 2);
+        assert.equal(calls.options.length, 0);
+        assert.equal(calls.imports, 0);
       });
     }
   }
@@ -1253,7 +1419,6 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
   const PKCS7_SIGNATURE = "application/pkcs7-signature";
   const SIGNED_TEXT = "signed text";
   const SECRET = "decrypted body";
-  const WITHHELD_SEND = /encrypted messages is blocked/;
   const signedHeaderValue = protocol => `multipart/signed; micalg=sha-256; protocol="${protocol}"; boundary="sig"`;
   const signedContainer = (parts, { protocol = PGP_SIGNATURE, isEncrypted = true, headerValue = signedHeaderValue(protocol) } = {}) => ({
     contentType: "message/rfc822", headers: { "content-type": [headerValue] },
@@ -1291,7 +1456,6 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
   const reply = api => api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true);
   const forward = api => api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true);
   const assertNoDecryption = calls => {
-    assert.ok(calls.options.length > 0);
     for (const options of calls.options) assert.equal(options.examineEncryptedParts, false);
   };
 
@@ -1334,13 +1498,36 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     assertNoDecryption(calls);
   });
 
-  it("replies to and forwards flagged clear-signed mail directly", async () => {
-    const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(plainPart) });
-    for (const result of [await reply(api), await forward(api)]) assert.equal(result.success, true);
-    assert.equal(calls.sends.length, 2);
-    for (const sent of calls.sends) assert.match(sent.body, /signed text/);
-    assert.doesNotMatch(calls.sends[1].body, /PGP SIGNATURE/);
-    assertNoDecryption(calls);
+  for (const allowed of [false, true]) {
+    for (const protocol of [PGP_SIGNATURE, PKCS7_SIGNATURE, "application/x-pkcs7-signature"]) {
+      it(`replies to and forwards flagged clear-signed mail directly, ${protocol}, opt-in=${allowed}`, async () => {
+        const { api, calls } = loadMessageTools({
+          allowed, mime: signedContainer([], { protocol }), raw: signedRaw(plainPart, protocol),
+        });
+        for (const result of [await reply(api), await forward(api)]) assert.equal(result.success, true, result.error);
+        assert.equal(calls.sends.length, 2);
+        for (const sent of calls.sends) assert.match(sent.body, /signed text/);
+        assert.doesNotMatch(calls.sends[1].body, /PGP SIGNATURE/);
+        assert.equal(calls.streams, 2);
+        assert.equal(calls.options.length, 2);
+        assertNoDecryption(calls);
+      });
+    }
+  }
+
+  it("keeps oversized clear-signed HTML readable with the existing presentation truncation", async () => {
+    const cap = 2 * 1024 * 1024;
+    const html = "<p>" + " ".repeat(cap) + "clear tail</p>";
+    const raw = signedRaw(["Content-Type: text/html; charset=utf-8", "", html]);
+    const { api, calls } = loadHtmlFixture(html.slice(0, cap),
+      () => documentTree([elementNode("p", [textNode("visible prefix")])]), {
+        mime: signedContainer([]), raw,
+      });
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.notEqual(result.encryptedContentWithheld, true);
+    assert.equal(result.body, "visible prefix\n\n[Message body truncated at 2 MiB]");
+    assert.equal(calls.streams, 1);
+    assert.equal(calls.sends.length, 0);
   });
 
   it("refuses a direct forward that would drop the signed message's attachments", async () => {
@@ -1360,8 +1547,13 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.equal(result.attachments.length, 0);
         assert.doesNotMatch(JSON.stringify(result), /signed text|intro|ciphertext|hQEM|protected subject/);
       }
-      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
       assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+    it(`refuses a signed wrapper containing ${label} despite encrypted-read opt-in`, async () => {
+      const { api, calls } = loadMessageTools({ allowed: true, mime: signedContainer([]), raw: signedRaw(part) });
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
       assertNoDecryption(calls);
     });
   }
@@ -1384,7 +1576,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     }] } },
   ];
   for (const { label, mime } of flaggedTrees) {
-    it(`withholds ${label} without reading the raw message`, async () => {
+    it(`withholds ${label} in reads and after the direct-send raw check`, async () => {
       // The raw source is clear; only the structural classification may decide here.
       const { api, calls } = loadMessageTools({ mime, raw: signedRaw(plainPart) });
       for (const rawSource of [false, true]) {
@@ -1392,9 +1584,15 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.equal(result.encryptedContentWithheld, true);
         assert.doesNotMatch(JSON.stringify(result), /decrypted body|signed text|protected subject/);
       }
-      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
-      assert.equal(calls.streams, 0);
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
+      assert.equal(calls.streams, 2);
       assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+    it(`refuses ${label} despite encrypted-read opt-in`, async () => {
+      const { api, calls } = loadMessageTools({ allowed: true, mime, raw: signedRaw(plainPart) });
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
+      assert.equal(calls.streams, 2);
       assertNoDecryption(calls);
     });
   }
@@ -1402,8 +1600,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
   it("withholds the raw path when the raw message cannot be read", async () => {
     const { api, calls } = loadMessageTools({ mime: signedContainer([]), streamError: new Error("stream failed") });
     assert.equal((await api.getMessage("message-1", "folder", false, "text")).encryptedContentWithheld, true);
-    assert.match((await reply(api)).error, WITHHELD_SEND);
-    assert.equal(calls.sends.length, 0);
+    assertOriginalRefused(calls, await reply(api));
   });
 
   const ZWSP_ARMOR_PART = ["Content-Type: text/plain; charset=utf-8", "", "intro", "\xE2\x80\x8B-----BEGIN PGP MESSAGE-----", "", "hQEM", "-----END PGP MESSAGE-----"];
@@ -1426,7 +1623,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
       const rawResult = await api.getMessage("message-1", "folder", false, "text", true);
       assert.equal(rawResult.encryptedContentWithheld, true);
       assert.equal(rawResult.rawSource, undefined);
-      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
       assert.equal(calls.sends.length, 0);
       assertNoDecryption(calls);
     });
@@ -1552,7 +1749,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     const result = await api.getMessage("message-1", "folder", false, "text");
     assert.equal(result.encryptedContentWithheld, true);
     assert.match(result.body, /could not be determined/);
-    assert.match((await reply(api)).error, WITHHELD_SEND);
+    assertOriginalRefused(calls, await reply(api));
     assert.deepEqual(limits, [50 * 1024 * 1024, 50 * 1024 * 1024]);
     assert.equal(calls.sends.length, 0);
   });
@@ -1608,7 +1805,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
           assert.equal(result.attachments.length, 0);
           assert.doesNotMatch(JSON.stringify(result), /signed text|MIIB|hQEM|LS0t/);
         }
-        for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+        for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
         assert.equal(calls.sends.length, 0);
         assertNoDecryption(calls);
       });
@@ -1728,7 +1925,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.equal(result.attachments.length, 0);
         assert.doesNotMatch(JSON.stringify(result), /signed text|MIIB|protected subject/);
       }
-      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
       assert.equal(calls.sends.length, 0);
       assertNoDecryption(calls);
     });
@@ -1813,7 +2010,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.equal(result.attachments.length, 0);
         assert.doesNotMatch(JSON.stringify(result), /signed text|visible|MIIB|protected subject/);
       }
-      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
       assert.equal(calls.sends.length, 0);
       assertNoDecryption(calls);
     });
@@ -1980,7 +2177,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.equal(result.attachments.length, 0);
         assert.doesNotMatch(JSON.stringify(result), /signed|visible|MIIB|protected subject/);
       }
-      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
       assert.equal(calls.sends.length, 0);
       assertNoDecryption(calls);
     });
@@ -2049,7 +2246,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
       assert.equal(result.attachments.length, 0);
       assert.doesNotMatch(JSON.stringify(result), /signed text|MIAGCS|protected subject/);
     }
-    for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+    for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
     assert.equal(calls.sends.length, 0);
     assertNoDecryption(calls);
   });
@@ -2139,8 +2336,8 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
 
   it("never requests decryption from Gloda while the preference is off", () => {
     const values = [...source.matchAll(/examineEncryptedParts\s*:\s*([^\s},]+)/g)].map(match => match[1]);
-    assert.equal(values.length, 3);
-    for (const value of values) assert.equal(value, "allowEncrypted");
+    assert.deepEqual(values.sort(), ["allowEncrypted", "allowEncrypted", "false"]);
+    assert.match(snippet("DIRECT SEND ORIGINAL GUARD"), /examineEncryptedParts:\s*false/);
   });
 });
 
@@ -2316,7 +2513,8 @@ describe("Attachment and forward handling of external attachment links", () => {
       const { api, calls } = loadSaver(MAIL_STORE_URLS.map((url, i) => attachment(url, { name: `file${i}.pdf` })));
       const result = await forward(api);
       assert.equal(result.success, true);
-      assert.deepEqual(Array.from(calls.sends[0].attachments, desc => desc.url), MAIL_STORE_URLS);
+      assert.deepEqual(Array.from(calls.sends[0].attachments.slice(0, MAIL_STORE_URLS.length), desc => desc.url), MAIL_STORE_URLS);
+      assert.equal(calls.sends[0].attachments.length, MAIL_STORE_URLS.length + 2);
     });
   });
 });

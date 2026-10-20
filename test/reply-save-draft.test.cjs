@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 // Use the production marker+VM pattern from privacy-messages.test.cjs.
@@ -22,12 +23,13 @@ function loadReply(options = {}) {
   const { enabled = true, blocked = true, attachmentError, mode = "success" } = options;
   const calls = { finds: 0, sends: 0, opens: [], saves: 0, timers: [], windows: [], mime: [], lookups: [], flags: [], dialogs: 0 };
   const identity = {
+    key: "sender",
     draftsFolderURI: DRAFTS_URI,
     get showSaveMsgDlg() { return true; },
     set showSaveMsgDlg(_value) { assert.fail("shared identity preference must not change"); },
   };
   const composeIdentity = Object.hasOwn(options, "composeIdentity") ? options.composeIdentity : identity;
-  const folder = { server: {}, getUriForMsg: () => "message-uri" };
+  const folder = { server: {}, getUriForMsg: () => "message-uri", getMsgInputStream: () => ({ close() {} }) };
   const destination = Object.hasOwn(options, "destination") ? options.destination : {
     URI: DRAFTS_URI,
     server: { accountKey: "allowed" },
@@ -37,7 +39,7 @@ function loadReply(options = {}) {
     TextDecoder,
     Uint8Array,
     atob,
-    Services: { prefs: { getBoolPref: () => options.allowEncrypted === true } },
+    Services: { prefs: { ...makeDirectSendPrefs(), getBoolPref: () => options.allowEncrypted === true } },
     Components: { isSuccessCode: status => status === 0 },
     ChromeUtils: {
       generateQI: () => () => {},
@@ -48,7 +50,7 @@ function loadReply(options = {}) {
         },
       }),
     },
-    Ci: { nsIMsgCompType: { Reply: 1, ReplyAll: 2 }, nsITimer: { TYPE_ONE_SHOT: 0 }, nsMsgFolderFlags: { Drafts: 0x400 } },
+    Ci: { nsIPrefBranch: prefTypes, nsIMsgCompType: { Reply: 1, ReplyAll: 2 }, nsITimer: { TYPE_ONE_SHOT: 0 }, nsMsgFolderFlags: { Drafts: 0x400 } },
     MailServices: {
       folderLookup: { getFolderForURL(uri) {
         calls.lookups.push(uri);
@@ -74,7 +76,7 @@ function loadReply(options = {}) {
     },
     isToolEnabled(name) { assert.equal(name, "saveDraft"); return enabled; },
     isSkipReviewBlocked: () => blocked,
-    findMessage() { calls.finds++; return { msgHdr: {}, folder }; },
+    findMessage() { calls.finds++; return { msgHdr: { folder }, folder }; },
     filePathsToAttachDescs(attachments) {
       if (attachmentError) throw new Error(attachmentError);
       return { descs: attachments || [] };
@@ -139,12 +141,15 @@ function loadReply(options = {}) {
     source.match(/^const PREF_ALLOW_ENCRYPTED_MESSAGES = .+;$/m)[0],
     snippet("PRIVACY PREFERENCE HELPERS"), snippet("MCP TEXT SANITIZATION"),
     snippet("MESSAGE TEXT CONVERSION"), snippet("RAW MIME PARSING HELPERS"),
+    snippet("RAW MIME ATTACHMENT HELPERS"),
     snippet("ENCRYPTED MESSAGE GUARD"), snippet("DRAFT HELPERS"),
     source.slice(accessStart, accessEnd),
     snippet("COMPOSE WINDOW DRAFT HELPER"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("REPLY TOOL"),
     snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
+  sandbox.readMessageStreamFully = () => "Content-Type: text/plain\r\n\r\noriginal text";
   const reply = args => sandbox.dispatchTool("replyToMessage", {
     messageId: "original@example.com", folderPath: "imap://example/INBOX", body: "reply text", saveAsDraft: true, ...args,
   });

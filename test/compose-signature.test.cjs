@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const MAX_SIGNATURE_BYTES = 1024 * 1024;
@@ -51,12 +52,14 @@ function loadSignatureHelpers(options = {}) {
     },
   };
   const sandbox = {
+    ...clearOriginalRawFixture,
     TextDecoder,
     Uint8Array,
     Cr: { NS_BASE_STREAM_CLOSED: "NS_BASE_STREAM_CLOSED" },
     console: { warn: (...args) => calls.warnings.push(args), error() {} },
     NetUtil: { readInputStreamToString: (input, count) => input.read(count) },
     Ci: {
+      nsIPrefBranch: prefTypes,
       nsIDocumentEncoder: { OutputFormatted: 1, OutputLFLineBreak: 2 },
       nsIMsgCompType: { New: 0, Draft: 9 },
       nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 4 },
@@ -99,7 +102,8 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
   calls.reviews = [];
   const folder = { URI: DRAFTS_URI, getFlag: () => true };
   Object.assign(api, {
-    setComposeIdentity(params) { params.identity = { draftsFolderURI: DRAFTS_URI, ...identity }; },
+    Services: { prefs: makeDirectSendPrefs() },
+    setComposeIdentity(params) { params.identity = { key: "sender", draftsFolderURI: DRAFTS_URI, ...identity }; },
     resolveComposeFormat: (_identity, isHtml) => ({ useHtml: isHtml === true, format: 0 }),
     filePathsToAttachDescs: () => ({ descs: [], failed: [] }),
     descsToMsgAttachments: () => [],
@@ -123,6 +127,7 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
     }) },
   });
   vm.runInContext([
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), api);
   return loaded;

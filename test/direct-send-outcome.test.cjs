@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const modes = { Now: 0, Later: 1, SaveAsDraft: 4 };
@@ -25,6 +26,7 @@ function loadSend(options = {}) {
   const timer = {
     cancelled: false,
     initWithCallback(callback, delay) {
+      this.cancelled = false;
       this.callback = callback;
       this.delay = delay;
       if (options.timerInitError) throw options.timerInitError;
@@ -73,7 +75,9 @@ function loadSend(options = {}) {
     return compose;
   };
   const sandbox = {
+    ...clearOriginalRawFixture,
     Ci: {
+      nsIPrefBranch: prefTypes,
       nsIMsgCompDeliverMode: modes, nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
       nsIMsgCompFormat: { Default: 0, HTML: 1, PlainText: 2, OppositeOfDefault: 3 },
@@ -104,9 +108,10 @@ function loadSend(options = {}) {
     },
     ChromeUtils: {
       generateQI: () => () => {},
-      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, {}) }),
+      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, { contentType: "text/plain", body: "Original body" }) }),
     },
     Components: { isSuccessCode: status => status === 0 },
+    Services: { prefs: makeDirectSendPrefs() },
     MailServices: { accounts: { get accounts() {
       if (options.accountError) throw options.accountError;
       return [
@@ -131,6 +136,7 @@ function loadSend(options = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("DIRECT SEND HELPER"), snippet("COMPOSE SEND HELPER"),
     snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
@@ -411,6 +417,7 @@ describe("reply and forward send through nsIMsgCompose", () => {
     it(`sends ${tool} with the original's URI and type so Thunderbird threads and flags it`, async () => {
       const h = loadSend();
       const result = h.start(tool);
+      await assertPending(h);
       const { params } = h.compose.init;
       assert.equal(params.originalMsgURI, "message-uri");
       assert.equal(params.type, tool === "reply" ? 1 : 3);
@@ -425,10 +432,13 @@ describe("reply and forward send through nsIMsgCompose", () => {
     if (tool === "reply") {
       it("keeps the reply threading headers", async () => {
         const h = loadSend();
-        h.start(tool);
+        const result = h.start(tool);
+        await assertPending(h);
         const fields = h.compose.init.params.composeFields;
         assert.equal(fields.references, "<original>");
         assert.equal(fields.headers["In-Reply-To"], "<original>");
+        h.state.listener.onStopSending("id", 0);
+        assert.equal((await result).success, true);
       });
     }
 
@@ -436,6 +446,7 @@ describe("reply and forward send through nsIMsgCompose", () => {
       it(`reports ${tool} ${label}`, async () => {
         const h = loadSend();
         const result = h.start(tool);
+        await assertPending(h);
         trigger(h);
         const value = await result;
         assert.match(value.error, pattern);

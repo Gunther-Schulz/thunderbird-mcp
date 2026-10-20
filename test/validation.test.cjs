@@ -18,6 +18,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require('./helpers/direct-send-prefs.cjs');
 
 const apiSource = fs.readFileSync(
   path.resolve(__dirname, '../extension/mcp_server/api.js'),
@@ -34,6 +35,7 @@ function getMarkedApiSnippet(startMarker, endMarker) {
 
 function loadProductionAttachmentValidation(overrides = {}) {
   const sandbox = {
+    ...clearOriginalRawFixture,
     getConfiguredGetMessagesLimit: () => 20,
     _tempAttachFiles: new Set(),
     _tempFileCounter: 0,
@@ -47,6 +49,8 @@ function loadProductionAttachmentValidation(overrides = {}) {
     getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
     getMarkedApiSnippet('// BEGIN THUNDERBIRD PROFILE ROOTS', '// END THUNDERBIRD PROFILE ROOTS'),
     getMarkedApiSnippet('// BEGIN NATIVE ATTACHMENT CONVERSION', '// END NATIVE ATTACHMENT CONVERSION'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND ENCRYPTION GUARD', '// END DIRECT SEND ENCRYPTION GUARD'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND ORIGINAL GUARD', '// END DIRECT SEND ORIGINAL GUARD'),
     getMarkedApiSnippet('// BEGIN OUTBOUND MAIL TOOLS', '// END OUTBOUND MAIL TOOLS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
@@ -1706,6 +1710,7 @@ function makeOutboundMailRuntime(options = {}) {
       return options.files?.get(filePath) || makeMockLocalFile(filePath, { exists: !filePath.includes('missing'), normalizedPath });
     },
     Services: {
+      prefs: makeDirectSendPrefs(),
       appinfo: { OS: options.os || 'Linux' },
       dirsvc: { get(key) {
         state.dirCalls++;
@@ -1717,11 +1722,14 @@ function makeOutboundMailRuntime(options = {}) {
       io: { newFileURI: file => ({ spec: 'file://' + file.path }) },
     },
     Ci: {
+      nsIPrefBranch: prefTypes,
+      nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
       nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 1 },
       nsIFile: { DIRECTORY_TYPE: 1 },
     },
     Cc: {
+      '@mozilla.org/timer;1': { createInstance: () => ({ initWithCallback() {}, cancel() {} }) },
       '@mozilla.org/messengercompose/attachment;1': { createInstance: () => new Proxy({}, {
         set(target, prop, value) {
           if (options.descriptorError && prop === 'name' && value === 'broken.pdf') throw new Error('invalid native attachment');
@@ -1753,16 +1761,24 @@ function makeOutboundMailRuntime(options = {}) {
     readRequestBody: req => req.body,
     isToolEnabled: () => true,
     isSkipReviewBlocked: () => false,
-    setComposeIdentity(params) { params.identity = {}; },
+    setComposeIdentity(params) { params.identity = { key: 'sender' }; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     buildBodyWithSignature: body => body || '',
     findMessage: () => ({ msgHdr: {}, folder: { server: {}, getUriForMsg: () => 'message://fixture' } }),
+    getDirectQuoteContent: () => ({ body: 'Original text' }),
     sendMessageDirectly(_fields, _identity, _descs, _uri, _type, mode) {
       if (mode === 1) state.drafts++; else state.sent++;
       return Promise.resolve({ success: true });
     },
     openComposeWindowWithCustomizations() { state.windows++; return Promise.resolve({ success: true }); },
-    ChromeUtils: { importESModule() { state.mimeReads++; throw new Error('unexpected MIME read'); } },
+    ChromeUtils: { importESModule() {
+      return {
+        MsgHdrToMimeMessage(msgHdr, _listener, callback) {
+          state.mimeReads++;
+          callback(msgHdr, { contentType: 'text/plain', body: 'Original text' });
+        },
+      };
+    } },
   });
   // Both send paths must trip the existing no-send assertions.
   runtime.sendThroughCompose = runtime.sendMessageDirectly;
@@ -1802,7 +1818,7 @@ describe('Outbound attachment failures are atomic', () => {
         assert.equal(state.sent, 0);
         assert.equal(state.drafts, 0);
         assert.equal(state.windows, 0);
-        assert.equal(state.mimeReads, 0);
+        assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
         assert.equal(state.created.size, 0);
         assert.equal(state.removed.length, 1);
         assert.deepEqual(Array.from(runtime._tempAttachFiles), ['/prior-call.txt']);
@@ -1817,7 +1833,8 @@ describe('Outbound attachment failures are atomic', () => {
         { name: 'inline.txt', base64: 'QQ==' }, '/home/user/Documents/broken.pdf',
       ]);
       assert.match(result.error, /broken.pdf.*invalid native attachment/);
-      assert.equal(state.sent + state.drafts + state.windows + state.mimeReads, 0);
+      assert.equal(state.sent + state.drafts + state.windows, 0);
+      assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
       assert.equal(state.created.size, 0);
       assert.equal(state.removed.length, 1);
     });
@@ -2035,7 +2052,8 @@ describe('Outbound attachment failures are atomic', () => {
         assert.equal(state.fileCalls, 1);
         assert.equal(state.removed.length, 1);
         assert.equal(state.created.size, 0);
-        assert.equal(state.sent + state.drafts + state.windows + state.mimeReads, 0);
+        assert.equal(state.sent + state.drafts + state.windows, 0);
+        assert.equal(state.mimeReads, skipReview && ['replyToMessage', 'forwardMessage'].includes(name) ? 1 : 0);
       });
     }
   }
