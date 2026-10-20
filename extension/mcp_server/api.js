@@ -5133,18 +5133,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             const HTML_TRUNCATION_NOTE = "[Message body truncated at 2 MiB]";
 
-            function truncateHtmlForParsing(html) {
+            function truncateHtmlForParsing(html, maxBytes = MAX_HTML_PARSE_BYTES) {
               // Cap UTF-8 input without allocating encoded copies or splitting
-              // a UTF-16 surrogate pair. Only Gecko interprets the markup.
+              // a UTF-16 surrogate pair. The optional budget also measures direct
+              // send bodies; only Gecko interprets the markup.
               let bytes = 0;
               let end = 0;
               for (const char of html) {
                 const cp = char.codePointAt(0);
                 bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
-                if (bytes > MAX_HTML_PARSE_BYTES) return { html: html.slice(0, end), truncated: true };
+                if (bytes > maxBytes) return { html: html.slice(0, end), truncated: true, bytes };
                 end += char.length;
               }
-              return { html, truncated: false };
+              return { html, truncated: false, bytes };
             }
 
             function escapeMarkdownText(text) {
@@ -8281,16 +8282,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const MESSAGE_STREAM_READ_CHUNK_BYTES = 64 * 1024;
             // Ceiling for synchronous raw-MIME work on a whole stored message.
             const RAW_MESSAGE_MAX_BYTES = 50 * 1024 * 1024;
+            const MESSAGE_STREAM_DEADLINE_ERROR = "message read deadline exceeded";
 
             // Reads a message stream fully, looping on stream.available() to handle
             // mbox-stored messages where msgHdr.offlineMessageSize/messageSize can
             // underreport (observed at ~56% of true size for locally-injected mbox
             // entries). Returns the raw Latin-1 bytestring or throws. Caller must
             // close the stream.
-            function readMessageStreamFully(stream, maxBytes) {
+            function readMessageStreamFully(stream, maxBytes, deadline) {
               let raw = "";
               const hasByteLimit = typeof maxBytes === "number" && Number.isFinite(maxBytes);
               while (true) {
+                if (deadline !== undefined && Date.now() >= deadline) throw new Error(MESSAGE_STREAM_DEADLINE_ERROR);
                 let available;
                 try {
                   available = stream.available();
@@ -8317,16 +8320,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   throw error;
                 }
               }
+              if (deadline !== undefined && Date.now() >= deadline) throw new Error(MESSAGE_STREAM_DEADLINE_ERROR);
               return raw;
             }
 
             // Reads the stored message within RAW_MESSAGE_MAX_BYTES. Throws on
             // read failure or overflow.
-            function readBoundedRawMessage(msgHdr) {
+            function readBoundedRawMessage(msgHdr, deadline) {
               let stream = null;
               try {
                 stream = msgHdr.folder.getMsgInputStream(msgHdr, {});
-                return readMessageStreamFully(stream, RAW_MESSAGE_MAX_BYTES);
+                return readMessageStreamFully(stream, RAW_MESSAGE_MAX_BYTES, deadline);
               } finally {
                 if (stream) try { stream.close(); } catch { /* ignore */ }
               }
@@ -8737,10 +8741,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // for withheld clear-signed content or direct-send preflight
             // (names, embedded roots, encoded files, header syntax). Other
             // callers keep the 0.9.1 classification.
+            // options.rejectTruncatedHtml: direct sends require complete HTML
+            // classification and quoting, including the clear-signed raw fallback.
             function classifyRawMessageEncryption(rawBytes, depth = 0, options = {}) {
               const defaultType = options.defaultType || "text/plain";
               const insideEmbedded = options.insideEmbedded === true;
               const signedRaw = options.signedRaw === true;
+              const rejectTruncatedHtml = options.rejectTruncatedHtml === true;
               try {
                 if (depth > 10) return "unknown";
                 const raw = rawMimeToByteString(rawBytes);
@@ -8801,6 +8808,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     defaultType: childType,
                     insideEmbedded,
                     signedRaw,
+                    rejectTruncatedHtml,
                   }));
                   return states.includes("encrypted") ? "encrypted" : states.includes("unknown") ? "unknown" : "clear";
                 }
@@ -8815,7 +8823,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (RAW_MIME_EMBEDDED_MESSAGE_TYPES.has(contentType.value)) {
                   // Same rule as the strict gate on the signed raw path.
                   if (signedRaw && !/^(?:7bit|8bit|binary)?$/.test(encoding)) return "unknown";
-                  return classifyRawMessageEncryption(decoded, depth + 1, { embeddedRoot: true, insideEmbedded: true, signedRaw });
+                  return classifyRawMessageEncryption(decoded, depth + 1, { embeddedRoot: true, insideEmbedded: true, signedRaw, rejectTruncatedHtml });
                 }
                 if (contentType.value.startsWith("text/")) {
                   const charsetParams = splitRawMimeHeaderParameters(contentTypeValue).slice(1)
@@ -8826,6 +8834,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (!text || text.charsetFallback) return "unknown";
                   if (signedRaw && (untyped || insideEmbedded) && hasRawMimeEncodedProtectedFile(text.text)) return "unknown";
                   const isHtml = contentType.value === "text/html";
+                  if (rejectTruncatedHtml && isHtml && truncateHtmlForParsing(text.text).truncated) return "unknown";
                   if (hasInlinePgpArmor(text.text, isHtml ? text.text : null)) return "encrypted";
                   // Match the structured-body check: invisible characters and HTML
                   // markup must not hide a standalone armor line.
@@ -8866,16 +8875,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // Reads the stored message of a top-level signed message and applies
             // the signed-message checks. Returns { raw } when it is "clear",
             // otherwise { state } ("encrypted" or "unknown"; read failures are
-            // "unknown").
-            function checkSignedRawMessage(msgHdr) {
-              let raw;
+            // "unknown"). Direct preflight supplies its bounded raw snapshot
+            // and deadline so quoting never rereads the original.
+            function checkSignedRawMessage(msgHdr, { raw, deadline } = {}) {
               try {
-                raw = readBoundedRawMessage(msgHdr);
+                if (raw === undefined) raw = readBoundedRawMessage(msgHdr, deadline);
               } catch (e) {
                 console.error("thunderbird-mcp: signed message raw read failed:", e);
                 return { state: "unknown" };
               }
+              if (deadline !== undefined && Date.now() >= deadline) return { state: "unknown" };
               const state = classifyRawMessageEncryption(raw, 0, { signedRaw: true });
+              if (deadline !== undefined && Date.now() >= deadline) return { state: "unknown" };
               return state === "clear" ? { raw } : { state };
             }
 
@@ -8883,7 +8894,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // message preference applies. Returns null when the message must be
             // withheld, otherwise { body } plus { raw } when the body came from the
             // stored message because Gloda withheld a clear-signed container.
-            function getDirectQuoteContent(msgHdr, aMimeMsg, allowEncrypted) {
+            function getDirectQuoteContent(msgHdr, aMimeMsg, allowEncrypted, rawSnapshot) {
               if (allowEncrypted) return { body: extractPlainTextBody(aMimeMsg) };
               if (!aMimeMsg) return null;
               const state = classifyMimeMessageEncryption(aMimeMsg);
@@ -8891,11 +8902,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (state === "clear") {
                 // A signed message Gloda shows with its children still gets the
                 // same raw checks as one Gloda withholds.
-                if (isMimeTopLevelMultipartSigned(aMimeMsg) && !checkSignedRawMessage(msgHdr).raw) return null;
+                if (isMimeTopLevelMultipartSigned(aMimeMsg) && !checkSignedRawMessage(msgHdr, rawSnapshot).raw) return null;
                 const body = extractPlainTextBody(aMimeMsg);
                 return hasInlinePgpBodyArmor(aMimeMsg, body) ? null : { body };
               }
-              const { raw } = checkSignedRawMessage(msgHdr);
+              const { raw } = checkSignedRawMessage(msgHdr, rawSnapshot);
               if (!raw) return null;
               const part = extractBodyPartFromRawMime(raw, "text");
               const body = !part ? "" : part.isHtml ? stripHtml(part.text) : stripInvisibleCharacters(part.text);
@@ -10067,6 +10078,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // BEGIN DIRECT SEND ORIGINAL GUARD
             const DIRECT_SEND_ORIGINAL_ERROR = `Direct reply/forward of encrypted messages is blocked, including protected or unknown MIME content. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+            // Leaves room for the 120s sender within the bridge's 150s mail timeout.
+            const DIRECT_SEND_PREFLIGHT_TIMEOUT_MS = 15000;
+
+            // Searched for MIME byte budgets: truncateHtmlForParsing already
+            // counts UTF-8 without allocating encoded copies. Reuse that count
+            // across the tree and refuse anything our HTML parsing would trim.
+            function isDirectSendMimeComplete(mime, deadline) {
+              const pending = [mime];
+              const seen = new Set();
+              let remaining = RAW_MESSAGE_MAX_BYTES;
+              let htmlRemaining = MAX_HTML_PARSE_BYTES;
+              while (pending.length) {
+                if (Date.now() >= deadline) return false;
+                const part = pending.pop();
+                if (!part || typeof part !== "object" || seen.has(part) ||
+                    part.truncated || part.isTruncated || part.bodyTruncated) return false;
+                seen.add(part);
+                if (part.body !== undefined) {
+                  if (typeof part.body !== "string") return false;
+                  const isHtml = getMimePartContentTypes(part).some(
+                    value => parseRawMimeHeaderValue(value).value === "text/html"
+                  );
+                  const measured = truncateHtmlForParsing(part.body, isHtml ? Math.min(remaining, htmlRemaining) : remaining);
+                  if (measured.truncated) return false;
+                  remaining -= measured.bytes;
+                  if (isHtml) htmlRemaining -= measured.bytes;
+                }
+                if (part.parts !== undefined) {
+                  if (!Array.isArray(part.parts)) return false;
+                  for (const child of part.parts) pending.push(child);
+                }
+              }
+              return Date.now() < deadline;
+            }
 
             // Gloda can decrypt S/MIME before hiding its parts, even with
             // examineEncryptedParts disabled. Prove the stored MIME is clear
@@ -10074,29 +10119,63 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // and syntax that libmime could interpret as protected content.
             function getDirectSendOriginal(msgHdr) {
               return new Promise(resolve => {
+                const deadline = Date.now() + DIRECT_SEND_PREFLIGHT_TIMEOUT_MS;
+                let settled = false;
+                let timer = null;
+                // Reuse the send helper's settle-once timer pattern. Gloda has
+                // no public cancellation handle, so ignore every late callback.
+                const settle = result => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer?.cancel(); } catch {}
+                  timer = null;
+                  resolve(Date.now() >= deadline ? { error: DIRECT_SEND_ORIGINAL_ERROR } : result);
+                };
                 try {
-                  const raw = readBoundedRawMessage(msgHdr);
-                  if (classifyRawMessageEncryption(raw, 0, { signedRaw: true }) !== "clear") {
-                    resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                  timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timer.initWithCallback({
+                    notify() { settle({ error: DIRECT_SEND_ORIGINAL_ERROR }); },
+                  }, DIRECT_SEND_PREFLIGHT_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+                  if (settled || Date.now() >= deadline) {
+                    settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                    return;
+                  }
+                  const raw = readBoundedRawMessage(msgHdr, deadline);
+                  if (settled || Date.now() >= deadline ||
+                      classifyRawMessageEncryption(raw, 0, { signedRaw: true, rejectTruncatedHtml: true }) !== "clear" ||
+                      Date.now() >= deadline) {
+                    settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                     return;
                   }
                   const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
                     "resource:///modules/gloda/MimeMessage.sys.mjs"
                   );
+                  if (settled || Date.now() >= deadline) {
+                    settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                    return;
+                  }
+                  // Raw preflight already required local bytes. Do not start an
+                  // IMAP download or enable Gloda's silent 20 KiB body truncation.
                   MsgHdrToMimeMessage(msgHdr, null, (_msgHdr, mime) => {
+                    if (settled) return;
                     try {
-                      const quoted = getDirectQuoteContent(msgHdr, mime, false);
-                      if (!quoted) {
-                        resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                      if (!isDirectSendMimeComplete(mime, deadline)) {
+                        settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                         return;
                       }
-                      resolve({ mime, quoted });
+                      const quoted = getDirectQuoteContent(msgHdr, mime, false, { raw, deadline });
+                      if (!quoted || typeof quoted.body !== "string" ||
+                          !isDirectSendMimeComplete({ body: quoted.body }, deadline)) {
+                        settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                        return;
+                      }
+                      settle({ mime, quoted, deadline });
                     } catch {
-                      resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                      settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                     }
-                  }, true, { examineEncryptedParts: false });
+                  }, false, { examineEncryptedParts: false, saneBodySize: false });
                 } catch {
-                  resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                  settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                 }
               });
             }
@@ -10399,6 +10478,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  const error = getDirectSendIdentityError(selectedIdentity.identity);
 	                  if (error) return { error };
 	                }
+	                if (directOriginal && Date.now() >= directOriginal.deadline) return { error: DIRECT_SEND_ORIGINAL_ERROR };
 	                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 	                return await new Promise((resolve) => {
 	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
@@ -10600,6 +10680,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const error = getDirectSendIdentityError(selectedIdentity.identity);
                   if (error) return { error };
                 }
+                if (directOriginal && Date.now() >= directOriginal.deadline) return { error: DIRECT_SEND_ORIGINAL_ERROR };
                 const { descs: fileDescs } = filePathsToAttachDescs(attachments);
                 return await new Promise((resolve) => {
                   const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]

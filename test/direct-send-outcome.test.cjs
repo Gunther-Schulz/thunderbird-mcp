@@ -26,6 +26,7 @@ function loadSend(options = {}) {
   const timer = {
     cancelled: false,
     initWithCallback(callback, delay) {
+      this.cancelled = false;
       this.callback = callback;
       this.delay = delay;
       if (options.timerInitError) throw options.timerInitError;

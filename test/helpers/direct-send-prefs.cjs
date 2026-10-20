@@ -1,5 +1,10 @@
 "use strict";
 
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+
 const prefTypes = { PREF_INVALID: 0, PREF_STRING: 32, PREF_INT: 64, PREF_BOOL: 128 };
 
 // Searched for shared typed preference fixtures -> found local mocks in
@@ -45,5 +50,22 @@ const clearOriginalRawFixture = {
   classifyRawMessageEncryption: () => "clear",
   isRawTopLevelMultipartSigned: () => false,
 };
+
+// Searched for reusable UTF-8/MIME completeness dependencies -> found production
+// marker blocks and the shared attachment fixture's isolated VM pattern.
+// Export the real dependencies once instead of duplicating counting or parsing
+// in the lifecycle harnesses that otherwise stub their original-message quote.
+const source = fs.readFileSync(path.resolve(__dirname, "../../extension/mcp_server/api.js"), "utf8");
+const dependencySource = [
+  "MESSAGE TEXT CONVERSION", "RAW MIME PARSING HELPERS",
+  "RAW MIME ATTACHMENT HELPERS", "ENCRYPTED MESSAGE GUARD",
+].map(name => {
+  const start = source.indexOf(`// BEGIN ${name}`);
+  const end = source.indexOf(`// END ${name}`, start);
+  assert.ok(start >= 0 && end > start, `Missing production marker: ${name}`);
+  return source.slice(start, end);
+}).join("\n");
+const dependencies = vm.runInNewContext(dependencySource + "\n({ RAW_MESSAGE_MAX_BYTES, MAX_HTML_PARSE_BYTES, getMimePartContentTypes, parseRawMimeHeaderValue, truncateHtmlForParsing });");
+Object.assign(clearOriginalRawFixture, dependencies);
 
 module.exports = { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture };

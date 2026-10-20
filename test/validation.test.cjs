@@ -1723,11 +1723,13 @@ function makeOutboundMailRuntime(options = {}) {
     },
     Ci: {
       nsIPrefBranch: prefTypes,
+      nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
       nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 1 },
       nsIFile: { DIRECTORY_TYPE: 1 },
     },
     Cc: {
+      '@mozilla.org/timer;1': { createInstance: () => ({ initWithCallback() {}, cancel() {} }) },
       '@mozilla.org/messengercompose/attachment;1': { createInstance: () => new Proxy({}, {
         set(target, prop, value) {
           if (options.descriptorError && prop === 'name' && value === 'broken.pdf') throw new Error('invalid native attachment');

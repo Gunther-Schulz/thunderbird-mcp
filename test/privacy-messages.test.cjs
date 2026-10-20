@@ -20,7 +20,7 @@ function snippet(name) {
 function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError } = {}) {
   const attachments = makeDirectSendAttachments();
   const calls = {
-    options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [],
+    options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [], timers: [],
     created: { params: 0, fields: 0, compose: 0, sender: 0 },
     attachments: attachments.calls,
   };
@@ -70,6 +70,14 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     filePathsToAttachDescs: attachments.convert,
     descsToMsgAttachments: attachments.toNative,
     Cc: {
+      "@mozilla.org/timer;1": { createInstance() {
+        const timer = {
+          initWithCallback(callback, delay) { this.callback = callback; this.delay = delay; },
+          cancel() { this.cancelled = true; },
+        };
+        calls.timers.push(timer);
+        return timer;
+      } },
       "@mozilla.org/messengercompose/composeparams;1": { createInstance() {
         calls.created.params++;
         return {};
@@ -87,7 +95,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
         return {};
       } },
     },
-    Ci: { nsIPrefBranch: prefTypes, nsIMsgCompType: { Reply: 1, ReplyAll: 2, ForwardInline: 3 }, nsIMsgCompDeliverMode: { Now: 0 }, nsIMsgFolder: {} },
+    Ci: { nsIPrefBranch: prefTypes, nsITimer: { TYPE_ONE_SHOT: 0 }, nsIMsgCompType: { Reply: 1, ReplyAll: 2, ForwardInline: 3 }, nsIMsgCompDeliverMode: { Now: 0 }, nsIMsgFolder: {} },
     setComposeIdentity(params) { params.identity = { key: "sender" }; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     async sendThroughCompose(params, attachments) {
@@ -719,7 +727,7 @@ describe("Oversized HTML encryption classification", () => {
     }
   }
 
-  it("never classifies a standalone armor line created by the presentation cut", async () => {
+  it("keeps read classification intact while refusing oversized direct-send quotes", async () => {
     const encodedHeader = "&#45;----BEGIN PGP MESSAGE-----";
     const prefix = `<p>${" ".repeat(cap - 3 - encodedHeader.length)}${encodedHeader}`;
     const html = `${prefix} is the delimiter.</p>`;
@@ -734,8 +742,8 @@ describe("Oversized HTML encryption classification", () => {
       assert.notEqual(result.encryptedContentWithheld, true);
       assert.equal(result.body, format === "html" ? html : `${header}\n\n[Message body truncated at 2 MiB]`);
     }
-    for (const send of await directSends(api)) assert.equal(send.success, true);
-    assert.equal(calls.sends.length, 2);
+    for (const send of await directSends(api)) assertOriginalRefused(calls, send);
+    assert.equal(calls.sends.length, 0);
 
     const raw = `Content-Type: text/html\n\n${html}`;
     const fallback = loadHtmlFixture(prefix, () => documentTree([elementNode("p", [textNode(header)])]), { raw, mime: { parts: [] } }).api;
@@ -1500,12 +1508,27 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.equal(calls.sends.length, 2);
         for (const sent of calls.sends) assert.match(sent.body, /signed text/);
         assert.doesNotMatch(calls.sends[1].body, /PGP SIGNATURE/);
-        assert.equal(calls.streams, 4);
+        assert.equal(calls.streams, 2);
         assert.equal(calls.options.length, 2);
         assertNoDecryption(calls);
       });
     }
   }
+
+  it("keeps oversized clear-signed HTML readable with the existing presentation truncation", async () => {
+    const cap = 2 * 1024 * 1024;
+    const html = "<p>" + " ".repeat(cap) + "clear tail</p>";
+    const raw = signedRaw(["Content-Type: text/html; charset=utf-8", "", html]);
+    const { api, calls } = loadHtmlFixture(html.slice(0, cap),
+      () => documentTree([elementNode("p", [textNode("visible prefix")])]), {
+        mime: signedContainer([]), raw,
+      });
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.notEqual(result.encryptedContentWithheld, true);
+    assert.equal(result.body, "visible prefix\n\n[Message body truncated at 2 MiB]");
+    assert.equal(calls.streams, 1);
+    assert.equal(calls.sends.length, 0);
+  });
 
   it("refuses a direct forward that would drop the signed message's attachments", async () => {
     const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(mixedPart) });
