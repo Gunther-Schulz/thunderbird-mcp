@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const modes = { Now: 0, Later: 1, SaveAsDraft: 4 };
@@ -74,6 +75,7 @@ function loadSend(options = {}) {
   };
   const sandbox = {
     Ci: {
+      nsIPrefBranch: prefTypes,
       nsIMsgCompDeliverMode: modes, nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
       nsIMsgCompFormat: { Default: 0, HTML: 1, PlainText: 2, OppositeOfDefault: 3 },
@@ -107,6 +109,7 @@ function loadSend(options = {}) {
       importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, {}) }),
     },
     Components: { isSuccessCode: status => status === 0 },
+    Services: { prefs: makeDirectSendPrefs() },
     MailServices: { accounts: { get accounts() {
       if (options.accountError) throw options.accountError;
       return [
@@ -131,6 +134,7 @@ function loadSend(options = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
+    snippet("DIRECT SEND ENCRYPTION GUARD"),
     snippet("DIRECT SEND HELPER"), snippet("COMPOSE SEND HELPER"),
     snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);

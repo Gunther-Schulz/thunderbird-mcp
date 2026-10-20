@@ -5669,6 +5669,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * provided but not found / restricted.  Fallback to default only
              * applies when `from` is omitted.
              */
+            // BEGIN COMPOSE IDENTITY HELPER
             function setComposeIdentity(msgComposeParams, from, fallbackServer) {
               if (from) {
                 // Explicit `from` -- must resolve or fail, never silently substitute
@@ -5714,6 +5715,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               return "";
             }
+            // END COMPOSE IDENTITY HELPER
 
 	            /**
 	             * Opens a folder and its message database.
@@ -10010,6 +10012,59 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END MESSAGE READ TOOLS
 
+            // BEGIN DIRECT SEND ENCRYPTION GUARD
+            const DIRECT_SEND_REVIEW_INSTRUCTION = "Use skipReview: false to open the review window, where Thunderbird applies its own encryption.";
+            const AUTO_ENABLE_ENCRYPTION_PREF = "mail.e2ee.auto_enable";
+
+            // Searched for identity policy readers: readAccessListPref supplies
+            // the strict pref-type pattern, but no identity encryption guard exists.
+            // nsIMsgIdentity.encryptionPolicy masks failed preference reads as 0.
+            function getDirectSendIdentityError(identity) {
+              try {
+                const key = identity?.key;
+                if (typeof key !== "string" || !key.trim()) throw new Error("Missing identity key");
+                let configured = false;
+                for (const [name, type] of [
+                  ["encryptionpolicy", Ci.nsIPrefBranch.PREF_INT],
+                  ["openpgp_key_id", Ci.nsIPrefBranch.PREF_STRING],
+                  ["encryption_cert_name", Ci.nsIPrefBranch.PREF_STRING],
+                ]) {
+                  let pref = `mail.identity.${key}.${name}`;
+                  if (Services.prefs.getPrefType(pref) === Ci.nsIPrefBranch.PREF_INVALID) {
+                    pref = `mail.identity.default.${name}`;
+                  }
+                  if (Services.prefs.getPrefType(pref) !== type) throw new Error("Invalid identity preference type");
+                  if (type === Ci.nsIPrefBranch.PREF_INT) {
+                    const policy = Services.prefs.getIntPref(pref);
+                    if (!Number.isInteger(policy) || policy < 0) throw new Error("Invalid encryption policy");
+                    if (policy > 0) {
+                      return `Unreviewed sending is blocked because the identity requires encryption. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                    }
+                  } else {
+                    const value = Services.prefs.getStringPref(pref);
+                    if (typeof value !== "string") throw new Error("Invalid encryption configuration");
+                    configured ||= value.length > 0;
+                  }
+                }
+                // A keyless identity cannot auto-encrypt, even if this global
+                // preference is enabled or cannot be read.
+                if (configured) {
+                  if (Services.prefs.getPrefType(AUTO_ENABLE_ENCRYPTION_PREF) !== Ci.nsIPrefBranch.PREF_BOOL) {
+                    throw new Error("Invalid automatic encryption preference");
+                  }
+                  const autoEnable = Services.prefs.getBoolPref(AUTO_ENABLE_ENCRYPTION_PREF);
+                  if (typeof autoEnable !== "boolean") throw new Error("Invalid automatic encryption setting");
+                  if (autoEnable) {
+                    return `Unreviewed sending is blocked because automatic encryption is enabled for this identity. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+                  }
+                }
+                return null;
+              } catch {
+                return `Unreviewed sending is blocked because the identity's encryption settings could not be read. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+              }
+            }
+            // END DIRECT SEND ENCRYPTION GUARD
+
             /**
              * Composes a new email. Opens a compose window for review, or sends
              * directly when skipReview is true.
@@ -10025,8 +10080,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (skipReview && isSkipReviewBlocked()) {
                   return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
                 }
+                const selectedIdentity = {};
+                const identityResult = setComposeIdentity(selectedIdentity, from, null);
+                if (identityResult && identityResult.error) return identityResult;
+                if (skipReview) {
+                  const error = getDirectSendIdentityError(selectedIdentity.identity);
+                  if (error) return { error };
+                }
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
+                msgComposeParams.identity = selectedIdentity.identity;
 
                 const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
                   .createInstance(Ci.nsIMsgCompFields);
@@ -10038,9 +10101,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
-
-                const identityResult = setComposeIdentity(msgComposeParams, from, null);
-                if (identityResult && identityResult.error) return identityResult;
 
                 // Match body shape and format to caller intent / identity pref.
                 // When the resolved mode is plain, ship a plain body -- the HTML
@@ -10287,12 +10347,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    return;
 	                  }
 	                  const { msgHdr, folder } = found;
+	                  const selectedIdentity = {};
+	                  const identityResult = setComposeIdentity(selectedIdentity, from, folder.server);
+	                  if (identityResult && identityResult.error) {
+	                    resolve(identityResult);
+	                    return;
+	                  }
+	                  if (skipReview) {
+	                    const error = getDirectSendIdentityError(selectedIdentity.identity);
+	                    if (error) {
+	                      resolve({ error });
+	                      return;
+	                    }
+	                  }
 	                  const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 	                  const msgURI = folder.getUriForMsg(msgHdr);
 	                  const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
 
 	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
 	                    .createInstance(Ci.nsIMsgComposeParams);
+	                  msgComposeParams.identity = selectedIdentity.identity;
 
 	                  const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
 	                    .createInstance(Ci.nsIMsgCompFields);
@@ -10304,12 +10378,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  try {
 	                    msgComposeParams.origMsgHdr = msgHdr;
 	                  } catch {}
-
-	                  const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
-	                  if (identityResult && identityResult.error) {
-	                    resolve(identityResult);
-	                    return;
-	                  }
 
 	                  // Resolve compose mode against caller intent + identity pref.
 	                  // The skipReview branch reads useHtml below to shape the body.
@@ -10476,12 +10544,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return;
                   }
                   const { msgHdr, folder } = found;
+                  const selectedIdentity = {};
+                  const identityResult = setComposeIdentity(selectedIdentity, from, folder.server);
+                  if (identityResult && identityResult.error) {
+                    resolve(identityResult);
+                    return;
+                  }
+                  if (skipReview) {
+                    const error = getDirectSendIdentityError(selectedIdentity.identity);
+                    if (error) {
+                      resolve({ error });
+                      return;
+                    }
+                  }
                   const { descs: fileDescs } = filePathsToAttachDescs(attachments);
                   const msgURI = folder.getUriForMsg(msgHdr);
                   const compType = Ci.nsIMsgCompType.ForwardInline;
 
                   const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                     .createInstance(Ci.nsIMsgComposeParams);
+                  msgComposeParams.identity = selectedIdentity.identity;
 
                   const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
                     .createInstance(Ci.nsIMsgCompFields);
@@ -10493,12 +10575,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try {
                     msgComposeParams.origMsgHdr = msgHdr;
                   } catch {}
-
-                  const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
-                  if (identityResult && identityResult.error) {
-                    resolve(identityResult);
-                    return;
-                  }
 
                   // ForwardInline only passes the format flag through when it is
                   // Default or OppositeOfDefault -- HTML/PlainText are ignored and

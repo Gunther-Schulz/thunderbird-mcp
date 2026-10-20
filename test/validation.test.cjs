@@ -18,6 +18,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { makeDirectSendPrefs, prefTypes } = require('./helpers/direct-send-prefs.cjs');
 
 const apiSource = fs.readFileSync(
   path.resolve(__dirname, '../extension/mcp_server/api.js'),
@@ -47,6 +48,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
     getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
     getMarkedApiSnippet('// BEGIN THUNDERBIRD PROFILE ROOTS', '// END THUNDERBIRD PROFILE ROOTS'),
     getMarkedApiSnippet('// BEGIN NATIVE ATTACHMENT CONVERSION', '// END NATIVE ATTACHMENT CONVERSION'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND ENCRYPTION GUARD', '// END DIRECT SEND ENCRYPTION GUARD'),
     getMarkedApiSnippet('// BEGIN OUTBOUND MAIL TOOLS', '// END OUTBOUND MAIL TOOLS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
@@ -1706,6 +1708,7 @@ function makeOutboundMailRuntime(options = {}) {
       return options.files?.get(filePath) || makeMockLocalFile(filePath, { exists: !filePath.includes('missing'), normalizedPath });
     },
     Services: {
+      prefs: makeDirectSendPrefs(),
       appinfo: { OS: options.os || 'Linux' },
       dirsvc: { get(key) {
         state.dirCalls++;
@@ -1717,6 +1720,7 @@ function makeOutboundMailRuntime(options = {}) {
       io: { newFileURI: file => ({ spec: 'file://' + file.path }) },
     },
     Ci: {
+      nsIPrefBranch: prefTypes,
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
       nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 1 },
       nsIFile: { DIRECTORY_TYPE: 1 },
@@ -1753,7 +1757,7 @@ function makeOutboundMailRuntime(options = {}) {
     readRequestBody: req => req.body,
     isToolEnabled: () => true,
     isSkipReviewBlocked: () => false,
-    setComposeIdentity(params) { params.identity = {}; },
+    setComposeIdentity(params) { params.identity = { key: 'sender' }; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     buildBodyWithSignature: body => body || '',
     findMessage: () => ({ msgHdr: {}, folder: { server: {}, getUriForMsg: () => 'message://fixture' } }),

@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 // Same marker assertions and VM loading pattern as validation.test.cjs.
@@ -37,7 +38,10 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     Uint8Array,
     atob,
     btoa,
-    Services: { prefs: { getBoolPref() { if (unreadable) throw Error("unreadable"); return allowed; } } },
+    Services: { prefs: {
+      ...makeDirectSendPrefs(),
+      getBoolPref() { if (unreadable) throw Error("unreadable"); return allowed; },
+    } },
     ChromeUtils: { importESModule: () => ({
       MsgHdrToMimeMessage(msgHdr, _listener, callback, _download, options) {
         calls.options.push(options);
@@ -56,8 +60,8 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
       "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ setHeader() {} }) },
     },
-    Ci: { nsIMsgCompType: { Reply: 1, ReplyAll: 2, ForwardInline: 3 }, nsIMsgCompDeliverMode: { Now: 0 }, nsIMsgFolder: {} },
-    setComposeIdentity(params) { params.identity = {}; },
+    Ci: { nsIPrefBranch: prefTypes, nsIMsgCompType: { Reply: 1, ReplyAll: 2, ForwardInline: 3 }, nsIMsgCompDeliverMode: { Now: 0 }, nsIMsgFolder: {} },
+    setComposeIdentity(params) { params.identity = { key: "sender" }; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     async sendThroughCompose(params, attachments) {
       calls.sends.push({ ...params.composeFields, attachments });
@@ -72,6 +76,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     snippet("MESSAGE TEXT CONVERSION"), snippet("RAW MIME PARSING HELPERS"),
     snippet("RAW MIME ATTACHMENT HELPERS"), snippet("INLINE IMAGE CONTENT HELPERS"),
     snippet("INLINE ATTACHMENT BASE64 HELPERS"), snippet("ENCRYPTED MESSAGE GUARD"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"),
     snippet("MESSAGE READ TOOLS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   // The production stream reader is loaded with its helper block; serve the fixture instead.
