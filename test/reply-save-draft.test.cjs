@@ -29,7 +29,7 @@ function loadReply(options = {}) {
     set showSaveMsgDlg(_value) { assert.fail("shared identity preference must not change"); },
   };
   const composeIdentity = Object.hasOwn(options, "composeIdentity") ? options.composeIdentity : identity;
-  const folder = { server: {}, getUriForMsg: () => "message-uri" };
+  const folder = { server: {}, getUriForMsg: () => "message-uri", getMsgInputStream: () => ({ close() {} }) };
   const destination = Object.hasOwn(options, "destination") ? options.destination : {
     URI: DRAFTS_URI,
     server: { accountKey: "allowed" },
@@ -76,7 +76,7 @@ function loadReply(options = {}) {
     },
     isToolEnabled(name) { assert.equal(name, "saveDraft"); return enabled; },
     isSkipReviewBlocked: () => blocked,
-    findMessage() { calls.finds++; return { msgHdr: {}, folder }; },
+    findMessage() { calls.finds++; return { msgHdr: { folder }, folder }; },
     filePathsToAttachDescs(attachments) {
       if (attachmentError) throw new Error(attachmentError);
       return { descs: attachments || [] };
@@ -141,6 +141,7 @@ function loadReply(options = {}) {
     source.match(/^const PREF_ALLOW_ENCRYPTED_MESSAGES = .+;$/m)[0],
     snippet("PRIVACY PREFERENCE HELPERS"), snippet("MCP TEXT SANITIZATION"),
     snippet("MESSAGE TEXT CONVERSION"), snippet("RAW MIME PARSING HELPERS"),
+    snippet("RAW MIME ATTACHMENT HELPERS"),
     snippet("ENCRYPTED MESSAGE GUARD"), snippet("DRAFT HELPERS"),
     source.slice(accessStart, accessEnd),
     snippet("COMPOSE WINDOW DRAFT HELPER"),
@@ -148,6 +149,7 @@ function loadReply(options = {}) {
     snippet("REPLY TOOL"),
     snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
+  sandbox.readMessageStreamFully = () => "Content-Type: text/plain\r\n\r\noriginal text";
   const reply = args => sandbox.dispatchTool("replyToMessage", {
     messageId: "original@example.com", folderPath: "imap://example/INBOX", body: "reply text", saveAsDraft: true, ...args,
   });

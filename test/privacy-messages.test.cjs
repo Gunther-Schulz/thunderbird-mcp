@@ -16,9 +16,9 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "raw MIME", DOMParser: Parser = null, streamError, mimeError } = {}) {
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError } = {}) {
   const calls = {
-    options: [], streams: 0, sends: [], reviews: 0, logs: [],
+    options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [],
     created: { params: 0, fields: 0, compose: 0, sender: 0 },
   };
   const folder = {
@@ -26,6 +26,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     getUriForMsg: () => "message-uri",
     getMsgInputStream() {
       calls.streams++;
+      calls.order.push("raw");
       if (streamError) throw streamError;
       return { close() {} };
     },
@@ -45,13 +46,18 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
       ...makeDirectSendPrefs(),
       getBoolPref() { if (unreadable) throw Error("unreadable"); return allowed; },
     } },
-    ChromeUtils: { importESModule: () => ({
+    ChromeUtils: { importESModule: () => {
+      calls.imports++;
+      calls.order.push("import");
+      return {
       MsgHdrToMimeMessage(msgHdr, _listener, callback, _download, options) {
         calls.options.push(options);
+        calls.order.push("mime");
         if (mimeError) throw mimeError;
         callback(msgHdr, mime);
       },
-    }) },
+      };
+    } },
     findMessage: () => ({ msgHdr: hdr, folder }),
     getUserTags: () => [],
     getConfiguredGetMessagesLimit: () => 10,
@@ -114,7 +120,6 @@ function assertOriginalRefused(calls, result) {
   assert.deepEqual(calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
   assert.equal(calls.sends.length, 0);
   assert.equal(calls.reviews, 0);
-  assert.equal(calls.options.at(-1).examineEncryptedParts, false);
 }
 
 const encryptedTrees = [
@@ -127,6 +132,21 @@ const encryptedTrees = [
   { label: "ambiguous PKCS7", contentType: "application/pkcs7-mime; smime-type=enveloped-data; smime-type=signed-data" },
   { label: "empty encrypted MIME tree", contentType: "message/rfc822", headers: { "content-type": ["application/pkcs7-mime; smime-type=enveloped-data"] }, parts: [] },
   { label: "inline OpenPGP", contentType: "text/plain", body: "-----BEGIN PGP MESSAGE-----\nciphertext" },
+];
+
+const protectedRawOriginals = [
+  ["OpenPGP MIME", [
+    'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="enc"', "",
+    "--enc", "Content-Type: application/pgp-encrypted", "", "Version: 1",
+    "--enc", "Content-Type: application/octet-stream", "", "ciphertext", "--enc--", "",
+  ].join("\r\n")],
+  ["S/MIME encrypted", "Content-Type: application/pkcs7-mime; smime-type=enveloped-data\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["S/MIME opaque signed", "Content-Type: application/pkcs7-mime; smime-type=signed-data\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["legacy S/MIME", "Content-Type: application/x-pkcs7-mime\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["inline armor", "Content-Type: text/plain\r\n\r\n-----BEGIN PGP MESSAGE-----\r\nciphertext"],
+  ["CMS filename without a reliable MIME type", "Content-Type: application/octet-stream; name=smime.p7m\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIB"],
+  ["unknown malformed MIME", "Content-Type: multipart/mixed\r\n\r\nno boundary"],
+  ["incomplete raw MIME", "Content-Type: text/plain"],
 ];
 
 describe("Encrypted message privacy", () => {
@@ -237,6 +257,21 @@ describe("Encrypted message privacy", () => {
     const invoke = (api, skipReview) => tool === "replyToMessage"
       ? api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, skipReview)
       : api.forwardMessage("message-1", "folder", "recipient@example.test", "intro", false, undefined, undefined, undefined, undefined, skipReview);
+    for (const [label, raw] of protectedRawOriginals) {
+      for (const allowed of [false, true]) {
+        it(`${tool} refuses ${label} raw content before Gloda can run, opt-in=${allowed}`, async () => {
+          const { api, calls } = loadMessageTools({
+            allowed, raw,
+            mime: { contentType: "text/plain", body: "decrypted plaintext that Gloda must never produce" },
+          });
+          assertOriginalRefused(calls, await invoke(api, true));
+          assert.equal(calls.streams, 1);
+          assert.equal(calls.imports, 0, "The MIME module is not imported for protected or unknown raw content");
+          assert.equal(calls.options.length, 0, "Gloda/libmime must never receive a protected original");
+          assert.deepEqual(calls.order, ["raw"]);
+        });
+      }
+    }
     for (const encrypted of encryptedTrees) {
       for (const allowed of [false, true]) {
         it(`${tool} refuses ${encrypted.label} before any native compose creation, opt-in=${allowed}`, async () => {
@@ -246,8 +281,9 @@ describe("Encrypted message privacy", () => {
           };
           const { api, calls } = loadMessageTools({ mime, allowed });
           assertOriginalRefused(calls, await invoke(api, true));
-          assert.equal(calls.streams, 0);
+          assert.equal(calls.streams, 1);
           assert.equal(calls.options.length, 1);
+          assert.deepEqual(calls.order, ["raw", "import", "mime"], "Clear raw classification precedes the structured guard");
         });
       }
     }
@@ -264,7 +300,8 @@ describe("Encrypted message privacy", () => {
         it(`${tool} refuses ${label} before any native compose creation, opt-in=${allowed}`, async () => {
           const { api, calls } = loadMessageTools({ ...options, allowed });
           assertOriginalRefused(calls, await invoke(api, true));
-          assert.equal(calls.options.length, 1);
+          assert.equal(calls.options.length, options.streamError || options.raw === "" ? 0 : 1);
+          assert.equal(calls.order[0], "raw");
         });
       }
     }
@@ -277,7 +314,8 @@ describe("Encrypted message privacy", () => {
         assert.match(calls.sends[0].body, /visible/);
         assert.equal(calls.options.length, 1);
         assert.equal(calls.options[0].examineEncryptedParts, false);
-        assert.equal(calls.streams, 0);
+        assert.equal(calls.streams, 1);
+        assert.deepEqual(calls.order, ["raw", "import", "mime"]);
       });
       it(`${tool} allows clear raw classification of an empty structured original, opt-in=${allowed}`, async () => {
         const { api, calls } = loadMessageTools({
@@ -536,7 +574,7 @@ describe("Mixed MIME primary bodies in reads and direct quoting", () => {
         assert.match(fields.body, /Continued discussion/);
         assert.doesNotMatch(fields.body, /Unsubscribe footer|<p>/);
       }
-      assert.equal(calls.streams, 0);
+      assert.equal(calls.streams, 2);
     });
   }
 });
@@ -577,7 +615,7 @@ describe("Encryption classification of joined MIME bodies", () => {
           assertOriginalRefused(calls, result);
         }
         assert.equal(calls.sends.length, 0);
-        assert.equal(calls.streams, 0);
+        assert.equal(calls.streams, 2);
       });
     }
   }
@@ -639,7 +677,7 @@ describe("Oversized HTML encryption classification", () => {
       }
       assert.equal((await api.getMessage("message-1", "folder", false, "html", true)).encryptedContentWithheld, true);
       for (const send of await directSends(api)) assertOriginalRefused(calls, send);
-      assert.equal(calls.streams, 0);
+      assert.equal(calls.streams, 2);
       assert.equal(calls.sends.length, 0);
     });
 
@@ -780,7 +818,8 @@ describe("Encryption classification before raw output or body fallback", () => {
         ];
         for (const result of results) assertOriginalRefused(calls, result);
         assert.equal(calls.streams, 2);
-        assert.equal(calls.options.length, 2);
+        assert.equal(calls.options.length, 0);
+        assert.equal(calls.imports, 0);
       });
     }
   }
@@ -1388,7 +1427,6 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
   const reply = api => api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true);
   const forward = api => api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true);
   const assertNoDecryption = calls => {
-    assert.ok(calls.options.length > 0);
     for (const options of calls.options) assert.equal(options.examineEncryptedParts, false);
   };
 
@@ -1441,7 +1479,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.equal(calls.sends.length, 2);
         for (const sent of calls.sends) assert.match(sent.body, /signed text/);
         assert.doesNotMatch(calls.sends[1].body, /PGP SIGNATURE/);
-        assert.equal(calls.streams, 2);
+        assert.equal(calls.streams, 4);
         assert.equal(calls.options.length, 2);
         assertNoDecryption(calls);
       });
@@ -1494,7 +1532,7 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     }] } },
   ];
   for (const { label, mime } of flaggedTrees) {
-    it(`withholds ${label} without reading the raw message`, async () => {
+    it(`withholds ${label} in reads and after the direct-send raw check`, async () => {
       // The raw source is clear; only the structural classification may decide here.
       const { api, calls } = loadMessageTools({ mime, raw: signedRaw(plainPart) });
       for (const rawSource of [false, true]) {
@@ -1503,14 +1541,14 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         assert.doesNotMatch(JSON.stringify(result), /decrypted body|signed text|protected subject/);
       }
       for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
-      assert.equal(calls.streams, 0);
+      assert.equal(calls.streams, 2);
       assert.equal(calls.sends.length, 0);
       assertNoDecryption(calls);
     });
     it(`refuses ${label} despite encrypted-read opt-in`, async () => {
       const { api, calls } = loadMessageTools({ allowed: true, mime, raw: signedRaw(plainPart) });
       for (const result of [await reply(api), await forward(api)]) assertOriginalRefused(calls, result);
-      assert.equal(calls.streams, 0);
+      assert.equal(calls.streams, 2);
       assertNoDecryption(calls);
     });
   }

@@ -37,4 +37,13 @@ function makeDirectSendPrefs(overrides = {}) {
   };
 }
 
-module.exports = { makeDirectSendPrefs, prefTypes };
+// Searched for shared raw-message fixtures -> found only per-suite privacy
+// classifiers. Other direct-send harnesses stub MIME quoting, so reuse one
+// explicit clear-raw control while privacy-messages runs the real classifiers.
+const clearOriginalRawFixture = {
+  readBoundedRawMessage: () => "Content-Type: text/plain\r\n\r\nOriginal text",
+  classifyRawMessageEncryption: () => "clear",
+  isRawTopLevelMultipartSigned: () => false,
+};
+
+module.exports = { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture };

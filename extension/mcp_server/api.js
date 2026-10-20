@@ -8733,10 +8733,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // options.defaultType: type of a part without Content-Type.
             // options.embeddedRoot: rawBytes is the whole of an embedded message.
             // options.insideEmbedded: rawBytes is in an embedded message.
-            // options.signedRaw: the message is read raw because Gloda withheld a
-            // clear-signed container. Only then do the libmime-differential
-            // rules below apply (names, embedded roots, encoded files, header
-            // syntax); every other caller keeps the 0.9.1 classification.
+            // options.signedRaw: require the strict libmime-differential checks
+            // for withheld clear-signed content or direct-send preflight
+            // (names, embedded roots, encoded files, header syntax). Other
+            // callers keep the 0.9.1 classification.
             function classifyRawMessageEncryption(rawBytes, depth = 0, options = {}) {
               const defaultType = options.defaultType || "text/plain";
               const insideEmbedded = options.insideEmbedded === true;
@@ -10068,12 +10068,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // BEGIN DIRECT SEND ORIGINAL GUARD
             const DIRECT_SEND_ORIGINAL_ERROR = `Direct reply/forward of encrypted messages is blocked, including protected or unknown MIME content. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
 
-            // Searched for original-message preflight: getDirectQuoteContent and
-            // the raw classifiers cover the content checks, but no helper runs
-            // them before native compose allocation. Never decrypt for a send.
+            // Gloda can decrypt S/MIME before hiding its parts, even with
+            // examineEncryptedParts disabled. Prove the stored MIME is clear
+            // before invoking it. Reuse the strict raw checks to reject names
+            // and syntax that libmime could interpret as protected content.
             function getDirectSendOriginal(msgHdr) {
               return new Promise(resolve => {
                 try {
+                  const raw = readBoundedRawMessage(msgHdr);
+                  if (classifyRawMessageEncryption(raw, 0, { signedRaw: true }) !== "clear") {
+                    resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                    return;
+                  }
                   const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
                     "resource:///modules/gloda/MimeMessage.sys.mjs"
                   );
@@ -10083,18 +10089,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (!quoted) {
                         resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
                         return;
-                      }
-                      // Match getMessage's raw check when structured body
-                      // extraction yields nothing, including local mbox mail.
-                      if (!quoted.body && !quoted.raw) {
-                        const raw = readBoundedRawMessage(msgHdr);
-                        const state = classifyRawMessageEncryption(raw, 0, {
-                          signedRaw: isRawTopLevelMultipartSigned(raw),
-                        });
-                        if (state !== "clear") {
-                          resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
-                          return;
-                        }
                       }
                       resolve({ mime, quoted });
                     } catch {

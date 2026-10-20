@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const tools = ["sendMail", "replyToMessage", "forwardMessage"];
@@ -57,6 +57,7 @@ function loadEncryptionTools(options = {}) {
   const hdr = { folder, messageId: "original@example.test", subject: "Subject", author: "author@example.test", date: 0 };
   const account = { key: "account", defaultIdentity: options.defaultIdentity || identity, identities: [identity] };
   const sandbox = {
+    ...clearOriginalRawFixture,
     Ci: {
       nsIPrefBranch: prefTypes,
       nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
