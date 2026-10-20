@@ -10076,6 +10076,86 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END DIRECT SEND ENCRYPTION GUARD
 
+            // BEGIN DIRECT SEND MIME COMPLETENESS
+            // Searched for an independent MIME parse: existing helpers classify
+            // raw content and extract quotes, but none supplies complete Gloda
+            // bodies. MimeParser creates a fresh Thunderbird JS parser per call.
+            function completeDirectSendMime(mime, raw, deadline) {
+              const attachments = mime.allUserAttachments || [];
+              const attachedNames = attachments.map(attachment => attachment.partName).filter(Boolean);
+              // Reuse extractBodyContent's attachment exclusion, including the
+              // descendants of attached messages that Gloda replaces with metadata.
+              const isAttached = name => attachedNames.some(attached =>
+                name === attached || name.startsWith(attached + "."));
+              const root = {};
+              const parts = new Map();
+              const unfilled = new Set();
+              const pending = [[mime, root]];
+              while (pending.length) {
+                if (Date.now() >= deadline) throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+                const [source, target] = pending.pop();
+                for (const key of ["contentType", "headers", "partName", "isEncrypted"]) target[key] = source[key];
+                if (typeof source.partName === "string") {
+                  if (parts.has(source.partName)) throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+                  parts.set(source.partName, target);
+                }
+                if (source.body !== undefined && !isAttached(source.partName || "")) {
+                  unfilled.add(target);
+                }
+                target.parts = (source.parts || []).map(child => {
+                  const copy = {};
+                  pending.push([child, copy]);
+                  return copy;
+                });
+              }
+              root.allUserAttachments = attachments;
+              const receiving = new Map();
+              let remaining = RAW_MESSAGE_MAX_BYTES;
+              let htmlRemaining = MAX_HTML_PARSE_BYTES;
+              let complete = false;
+              const { MimeParser } = ChromeUtils.importESModule("resource:///modules/mimeParser.sys.mjs");
+              MimeParser.parseSync(raw, {
+                startPart(number, headers) {
+                  if (Date.now() >= deadline) throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+                  const type = headers.contentType.type;
+                  if (type !== "text/plain" && type !== "text/html") return;
+                  // JSMime starts at ""; Gloda adds an outer message root and
+                  // uses ".1" for JSMime's embedded-message "$" component.
+                  const name = "1" + (number ? "." + number.replace(/\$/g, ".1") : "");
+                  if (isAttached(name)) return;
+                  const part = parts.get(name);
+                  if (!part || parseRawMimeHeaderValue(part.contentType).value !== type) {
+                    throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+                  }
+                  part.body = "";
+                  unfilled.delete(part);
+                  receiving.set(number, part);
+                },
+                deliverPartData(number, data) {
+                  if (Date.now() >= deadline) throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+                  const part = receiving.get(number);
+                  if (!part) return;
+                  if (typeof data !== "string") throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+                  const html = parseRawMimeHeaderValue(part.contentType).value === "text/html";
+                  const measured = truncateHtmlForParsing(data, html ? Math.min(remaining, htmlRemaining) : remaining);
+                  if (measured.truncated) throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+                  remaining -= measured.bytes;
+                  if (html) htmlRemaining -= measured.bytes;
+                  part.body += data;
+                },
+                endMessage() { complete = true; },
+              }, {
+                bodyformat: "decode", strformat: "unicode", charset: "UTF-8",
+                // The parser otherwise swallows emitter exceptions.
+                onerror(error) { throw error; },
+              });
+              if (!complete || unfilled.size || !isDirectSendMimeComplete(root, deadline)) {
+                throw new Error(DIRECT_SEND_ORIGINAL_ERROR);
+              }
+              return root;
+            }
+            // END DIRECT SEND MIME COMPLETENESS
+
             // BEGIN DIRECT SEND ORIGINAL GUARD
             const DIRECT_SEND_ORIGINAL_ERROR = `Direct reply/forward of encrypted messages is blocked, including protected or unknown MIME content. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
             const DIRECT_SEND_RAW_ERROR = `${DIRECT_SEND_ORIGINAL_ERROR} The complete original could not be retrieved within the direct-send limits. You can also make the folder available offline and retry.`;
@@ -10164,7 +10244,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
                           return;
                         }
-                        const quoted = getDirectQuoteContent(msgHdr, mime, false, { raw, deadline });
+                        // Gloda can piggyback on a saneBodySize request and return
+                        // a silently truncated body. Only its checked raw fallback
+                        // or bodies from our fresh parse may supply the quote.
+                        const view = classifyMimeMessageEncryption(mime) === "raw"
+                          ? mime : completeDirectSendMime(mime, raw, deadline);
+                        const quoted = getDirectQuoteContent(msgHdr, view, false, { raw, deadline });
                         if (!quoted || typeof quoted.body !== "string" ||
                             !isDirectSendMimeComplete({ body: quoted.body }, deadline)) {
                           settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
