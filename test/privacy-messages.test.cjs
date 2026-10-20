@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { makeDirectSendPrefs, prefTypes } = require("./helpers/direct-send-prefs.cjs");
+const { makeDirectSendAttachments, assertNoAttachmentEffects } = require("./helpers/direct-send-attachments.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 // Same marker assertions and VM loading pattern as validation.test.cjs.
@@ -17,9 +18,11 @@ function snippet(name) {
 }
 
 function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError } = {}) {
+  const attachments = makeDirectSendAttachments();
   const calls = {
     options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [],
     created: { params: 0, fields: 0, compose: 0, sender: 0 },
+    attachments: attachments.calls,
   };
   const folder = {
     server: {},
@@ -64,7 +67,8 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     readMessageStreamFully: () => raw,
     isSkipReviewBlocked: () => false,
     isToolEnabled: () => true,
-    filePathsToAttachDescs: () => ({ descs: [], failed: [] }),
+    filePathsToAttachDescs: attachments.convert,
+    descsToMsgAttachments: attachments.toNative,
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance() {
         calls.created.params++;
@@ -104,6 +108,19 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
   ].join("\n"), sandbox);
   // The production stream reader is loaded with its helper block; serve the fixture instead.
   sandbox.readMessageStreamFully = () => raw;
+  // Searched for test call-through defaults -> found the invoke lambdas below.
+  // Give every direct call real path and inline inputs without changing reads,
+  // review windows, or automatic drafts that omit their caller attachments.
+  for (const [name, attachmentIndex, skipReviewIndex] of [
+    ["replyToMessage", 9, 10],
+    ["forwardMessage", 8, 9],
+  ]) {
+    const invoke = sandbox[name];
+    sandbox[name] = (...args) => {
+      if (args[skipReviewIndex] && args[attachmentIndex] === undefined) args[attachmentIndex] = attachments.entries;
+      return invoke(...args);
+    };
+  }
   return { api: sandbox, calls };
 }
 
@@ -120,6 +137,7 @@ function assertOriginalRefused(calls, result) {
   assert.deepEqual(calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
   assert.equal(calls.sends.length, 0);
   assert.equal(calls.reviews, 0);
+  assertNoAttachmentEffects(calls.attachments);
 }
 
 const encryptedTrees = [
@@ -316,6 +334,9 @@ describe("Encrypted message privacy", () => {
         assert.equal(calls.options[0].examineEncryptedParts, false);
         assert.equal(calls.streams, 1);
         assert.deepEqual(calls.order, ["raw", "import", "mime"]);
+        assert.equal(calls.attachments.tempCreates.length, 1);
+        assert.equal(calls.attachments.writes.length, 1);
+        assert.ok(calls.attachments.fileAccesses.length > 0);
       });
       it(`${tool} allows clear raw classification of an empty structured original, opt-in=${allowed}`, async () => {
         const { api, calls } = loadMessageTools({
@@ -2469,7 +2490,8 @@ describe("Attachment and forward handling of external attachment links", () => {
       const { api, calls } = loadSaver(MAIL_STORE_URLS.map((url, i) => attachment(url, { name: `file${i}.pdf` })));
       const result = await forward(api);
       assert.equal(result.success, true);
-      assert.deepEqual(Array.from(calls.sends[0].attachments, desc => desc.url), MAIL_STORE_URLS);
+      assert.deepEqual(Array.from(calls.sends[0].attachments.slice(0, MAIL_STORE_URLS.length), desc => desc.url), MAIL_STORE_URLS);
+      assert.equal(calls.sends[0].attachments.length, MAIL_STORE_URLS.length + 2);
     });
   });
 });

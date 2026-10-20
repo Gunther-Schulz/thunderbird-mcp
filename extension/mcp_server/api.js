@@ -10124,6 +10124,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const error = getDirectSendIdentityError(selectedIdentity.identity);
                   if (error) return { error };
                 }
+                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
                 msgComposeParams.identity = selectedIdentity.identity;
@@ -10153,8 +10154,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 } else {
                   composeFields.body = body || "";
                 }
-
-                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 
                 if (skipReview) {
                   // Direct send bypasses the compose window, so the identity
@@ -10390,7 +10389,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    return { error };
 	                  }
 	                }
-	                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 	                const msgURI = folder.getUriForMsg(msgHdr);
 	                const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
 
@@ -10401,6 +10399,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  const error = getDirectSendIdentityError(selectedIdentity.identity);
 	                  if (error) return { error };
 	                }
+	                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 	                return await new Promise((resolve) => {
 	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
 	                    .createInstance(Ci.nsIMsgComposeParams);
@@ -10587,7 +10586,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error };
                   }
                 }
-                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
                 const msgURI = folder.getUriForMsg(msgHdr);
                 const compType = Ci.nsIMsgCompType.ForwardInline;
 
@@ -10602,6 +10600,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const error = getDirectSendIdentityError(selectedIdentity.identity);
                   if (error) return { error };
                 }
+                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
                 return await new Promise((resolve) => {
                   const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                     .createInstance(Ci.nsIMsgComposeParams);

@@ -1763,12 +1763,20 @@ function makeOutboundMailRuntime(options = {}) {
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     buildBodyWithSignature: body => body || '',
     findMessage: () => ({ msgHdr: {}, folder: { server: {}, getUriForMsg: () => 'message://fixture' } }),
+    getDirectQuoteContent: () => ({ body: 'Original text' }),
     sendMessageDirectly(_fields, _identity, _descs, _uri, _type, mode) {
       if (mode === 1) state.drafts++; else state.sent++;
       return Promise.resolve({ success: true });
     },
     openComposeWindowWithCustomizations() { state.windows++; return Promise.resolve({ success: true }); },
-    ChromeUtils: { importESModule() { state.mimeReads++; throw new Error('unexpected MIME read'); } },
+    ChromeUtils: { importESModule() {
+      return {
+        MsgHdrToMimeMessage(msgHdr, _listener, callback) {
+          state.mimeReads++;
+          callback(msgHdr, { contentType: 'text/plain', body: 'Original text' });
+        },
+      };
+    } },
   });
   // Both send paths must trip the existing no-send assertions.
   runtime.sendThroughCompose = runtime.sendMessageDirectly;
@@ -1808,7 +1816,7 @@ describe('Outbound attachment failures are atomic', () => {
         assert.equal(state.sent, 0);
         assert.equal(state.drafts, 0);
         assert.equal(state.windows, 0);
-        assert.equal(state.mimeReads, 0);
+        assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
         assert.equal(state.created.size, 0);
         assert.equal(state.removed.length, 1);
         assert.deepEqual(Array.from(runtime._tempAttachFiles), ['/prior-call.txt']);
@@ -1823,7 +1831,8 @@ describe('Outbound attachment failures are atomic', () => {
         { name: 'inline.txt', base64: 'QQ==' }, '/home/user/Documents/broken.pdf',
       ]);
       assert.match(result.error, /broken.pdf.*invalid native attachment/);
-      assert.equal(state.sent + state.drafts + state.windows + state.mimeReads, 0);
+      assert.equal(state.sent + state.drafts + state.windows, 0);
+      assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
       assert.equal(state.created.size, 0);
       assert.equal(state.removed.length, 1);
     });
@@ -2041,7 +2050,8 @@ describe('Outbound attachment failures are atomic', () => {
         assert.equal(state.fileCalls, 1);
         assert.equal(state.removed.length, 1);
         assert.equal(state.created.size, 0);
-        assert.equal(state.sent + state.drafts + state.windows + state.mimeReads, 0);
+        assert.equal(state.sent + state.drafts + state.windows, 0);
+        assert.equal(state.mimeReads, skipReview && ['replyToMessage', 'forwardMessage'].includes(name) ? 1 : 0);
       });
     }
   }

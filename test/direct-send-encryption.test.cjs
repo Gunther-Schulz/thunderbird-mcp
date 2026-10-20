@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require("./helpers/direct-send-prefs.cjs");
+const { makeDirectSendAttachments, assertNoAttachmentEffects } = require("./helpers/direct-send-attachments.cjs");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
 const tools = ["sendMail", "replyToMessage", "forwardMessage"];
@@ -26,9 +27,11 @@ function snippet(name) {
 // harnesses -> found direct-send-outcome's native mocks, but no runtime that
 // combines real identity selection with typed preferences and all three tools.
 function loadEncryptionTools(options = {}) {
+  const attachments = makeDirectSendAttachments();
   const calls = {
     created: { params: 0, fields: 0, compose: 0, sender: 0 },
     sends: [], drafts: 0, draftSaves: 0, reviews: 0, mime: 0, preferences: [],
+    attachments: attachments.calls,
   };
   const identity = {
     key: "sender", email: "sender@example.test", composeHtml: false,
@@ -129,8 +132,8 @@ function loadEncryptionTools(options = {}) {
     isSkipReviewBlocked: () => options.blocked === true,
     isToolEnabled: () => true,
     findMessage: () => ({ msgHdr: hdr, folder }),
-    filePathsToAttachDescs: () => ({ descs: [] }),
-    descsToMsgAttachments: descs => descs,
+    filePathsToAttachDescs: attachments.convert,
+    descsToMsgAttachments: attachments.toNative,
     buildBodyWithSignature: body => body,
     getDirectQuoteContent: () => ({ body: "Original text" }),
     getReplyAllCcRecipients: () => "",
@@ -160,7 +163,8 @@ function loadEncryptionTools(options = {}) {
     prefs,
     run: (tool, args = {}) => sandbox.dispatchTool(tool, {
       to: "recipient@example.test", subject: "Subject", body: "Body", isHtml: false,
-      messageId: hdr.messageId, folderPath: "folder", skipReview: true, ...args,
+      messageId: hdr.messageId, folderPath: "folder", skipReview: true,
+      attachments: attachments.entries, ...args,
     }),
   };
 }
@@ -178,6 +182,7 @@ function assertRefused(harness, result, mimeReads = 0) {
   assert.equal(harness.calls.drafts, 0);
   assert.equal(harness.calls.reviews, 0);
   assert.equal(harness.calls.mime, mimeReads, "An initial identity refusal precedes reading the original");
+  assertNoAttachmentEffects(harness.calls.attachments);
 }
 
 const invalidPolicies = [
@@ -286,6 +291,9 @@ describe("direct send identity encryption pass-through cases", () => {
         assert.equal(h.calls.sends.length, 1);
         assert.equal(h.calls.reviews, 0);
         assert.equal(h.calls.sends[0].identity, h.identity);
+        assert.equal(h.calls.attachments.tempCreates.length, 1);
+        assert.equal(h.calls.attachments.writes.length, 1);
+        assert.ok(h.calls.attachments.fileAccesses.length > 0);
         assert.equal(h.calls.sends[0].composeFields.composeSecure, undefined, "No cryptographic signing or encryption is requested");
         assert.ok(h.calls.preferences.every(({ name }) => !/sign_mail|attachPgpKey|autoEncryptDrafts|protectSubject/.test(name)));
         if (label.startsWith("no encryption capability")) {
@@ -321,6 +329,7 @@ describe("direct send identity encryption pass-through cases", () => {
       assert.deepEqual(h.calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
       assert.equal(h.calls.preferences.length, 0);
       assert.equal(h.calls.mime, 0);
+      assertNoAttachmentEffects(h.calls.attachments);
     });
   }
   for (const tool of ["saveDraft", "replyToMessage"]) {
@@ -347,6 +356,7 @@ describe("direct send identity policy changes while the original is being classi
         assert.equal(h.calls.mime, 1);
         assert.deepEqual(h.calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
         assert.equal(h.calls.sends.length, 0);
+        assertNoAttachmentEffects(h.calls.attachments);
         if (change === "requires encryption") h.prefs.getIntPref = () => 1;
         else if (change === "automatic encryption enabled") h.prefs.getBoolPref = () => true;
         else h.prefs.getIntPref = () => { throw new Error("Preference unavailable"); };
