@@ -10078,6 +10078,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // BEGIN DIRECT SEND ORIGINAL GUARD
             const DIRECT_SEND_ORIGINAL_ERROR = `Direct reply/forward of encrypted messages is blocked, including protected or unknown MIME content. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+            const DIRECT_SEND_RAW_ERROR = `${DIRECT_SEND_ORIGINAL_ERROR} The complete original could not be retrieved within the direct-send limits. You can also make the folder available offline and retry.`;
             // Leaves room for the 120s sender within the bridge's 150s mail timeout.
             const DIRECT_SEND_PREFLIGHT_TIMEOUT_MS = 15000;
 
@@ -10122,6 +10123,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const deadline = Date.now() + DIRECT_SEND_PREFLIGHT_TIMEOUT_MS;
                 let settled = false;
                 let timer = null;
+                let rawRequest = null;
+                let failure = DIRECT_SEND_RAW_ERROR;
                 // Reuse the send helper's settle-once timer pattern. Gloda has
                 // no public cancellation handle, so ignore every late callback.
                 const settle = result => {
@@ -10129,53 +10132,123 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   settled = true;
                   try { timer?.cancel(); } catch {}
                   timer = null;
-                  resolve(Date.now() >= deadline ? { error: DIRECT_SEND_ORIGINAL_ERROR } : result);
+                  try { rawRequest?.cancel(Cr.NS_BINDING_ABORTED); } catch {}
+                  rawRequest = null;
+                  resolve(Date.now() >= deadline ? { error: failure } : result);
+                };
+                // Both local reads and raw-only IMAP retrieval feed the same
+                // existing classification and structured checks.
+                const inspectRaw = raw => {
+                  if (settled) return;
+                  failure = DIRECT_SEND_ORIGINAL_ERROR;
+                  try {
+                    if (settled || Date.now() >= deadline ||
+                        classifyRawMessageEncryption(raw, 0, { signedRaw: true, rejectTruncatedHtml: true }) !== "clear" ||
+                        Date.now() >= deadline) {
+                      settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                      return;
+                    }
+                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                      "resource:///modules/gloda/MimeMessage.sys.mjs"
+                    );
+                    if (settled || Date.now() >= deadline) {
+                      settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                      return;
+                    }
+                    // An uncached original may still need downloading for Gloda.
+                    // Its raw bytes have already passed the non-decrypting guard.
+                    MsgHdrToMimeMessage(msgHdr, null, (_msgHdr, mime) => {
+                      if (settled) return;
+                      try {
+                        if (!isDirectSendMimeComplete(mime, deadline)) {
+                          settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                          return;
+                        }
+                        const quoted = getDirectQuoteContent(msgHdr, mime, false, { raw, deadline });
+                        if (!quoted || typeof quoted.body !== "string" ||
+                            !isDirectSendMimeComplete({ body: quoted.body }, deadline)) {
+                          settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                          return;
+                        }
+                        settle({ mime, quoted, deadline });
+                      } catch {
+                        settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                      }
+                    }, true, { examineEncryptedParts: false, saneBodySize: false });
+                  } catch {
+                    settle({ error: failure });
+                  }
                 };
                 try {
                   timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                   timer.initWithCallback({
-                    notify() { settle({ error: DIRECT_SEND_ORIGINAL_ERROR }); },
+                    notify() { settle({ error: failure }); },
                   }, DIRECT_SEND_PREFLIGHT_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
                   if (settled || Date.now() >= deadline) {
-                    settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                    settle({ error: failure });
                     return;
                   }
-                  const raw = readBoundedRawMessage(msgHdr, deadline);
-                  if (settled || Date.now() >= deadline ||
-                      classifyRawMessageEncryption(raw, 0, { signedRaw: true, rejectTruncatedHtml: true }) !== "clear" ||
-                      Date.now() >= deadline) {
-                    settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
-                    return;
-                  }
-                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-                    "resource:///modules/gloda/MimeMessage.sys.mjs"
-                  );
-                  if (settled || Date.now() >= deadline) {
-                    settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
-                    return;
-                  }
-                  // Raw preflight already required local bytes. Do not start an
-                  // IMAP download or enable Gloda's silent 20 KiB body truncation.
-                  MsgHdrToMimeMessage(msgHdr, null, (_msgHdr, mime) => {
-                    if (settled) return;
-                    try {
-                      if (!isDirectSendMimeComplete(mime, deadline)) {
-                        settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
-                        return;
-                      }
-                      const quoted = getDirectQuoteContent(msgHdr, mime, false, { raw, deadline });
-                      if (!quoted || typeof quoted.body !== "string" ||
-                          !isDirectSendMimeComplete({ body: quoted.body }, deadline)) {
-                        settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
-                        return;
-                      }
-                      settle({ mime, quoted, deadline });
-                    } catch {
-                      settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                  let raw;
+                  try {
+                    raw = readBoundedRawMessage(msgHdr, deadline);
+                  } catch (error) {
+                    if (error?.isStreamSizeLimit || Date.now() >= deadline ||
+                        msgHdr.folder.server.type !== "imap") {
+                      settle({ error: failure });
+                      return;
                     }
-                  }, false, { examineEncryptedParts: false, saneBodySize: false });
+                    // Searched for raw streaming: readBoundedRawMessage is local
+                    // only. Reuse the listener probe's bounded read/cancel pattern
+                    // with the message service's converter explicitly disabled.
+                    raw = "";
+                    const msgURI = msgHdr.folder.getUriForMsg(msgHdr);
+                    MailServices.messageServiceFromURI(msgURI).streamMessage(msgURI, {
+                      QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+                      onStartRequest(request) {
+                        rawRequest = request;
+                        if (settled) {
+                          try { request.cancel(Cr.NS_BINDING_ABORTED); } catch {}
+                          rawRequest = null;
+                        } else if (Date.now() >= deadline) {
+                          settle({ error: failure });
+                        }
+                      },
+                      onDataAvailable(_request, stream, _offset, count) {
+                        if (settled) return;
+                        try {
+                          if (Date.now() >= deadline || count > RAW_MESSAGE_MAX_BYTES - raw.length) {
+                            settle({ error: failure });
+                            return;
+                          }
+                          while (count > 0) {
+                            const length = Math.min(count, MESSAGE_STREAM_READ_CHUNK_BYTES);
+                            const bytes = NetUtil.readInputStreamToString(stream, length);
+                            if (bytes.length !== length || Date.now() >= deadline) {
+                              settle({ error: failure });
+                              return;
+                            }
+                            raw += bytes;
+                            count -= length;
+                          }
+                        } catch {
+                          settle({ error: failure });
+                        }
+                      },
+                      onStopRequest(_request, status) {
+                        rawRequest = null;
+                        if (settled) return;
+                        if (!Components.isSuccessCode(status) || Date.now() >= deadline) {
+                          settle({ error: failure });
+                          return;
+                        }
+                        inspectRaw(raw);
+                      },
+                    }, null, null, false, "", false);
+                    return;
+                  }
+                  inspectRaw(raw);
                 } catch {
-                  settle({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                  settle({ error: failure });
                 }
               });
             }

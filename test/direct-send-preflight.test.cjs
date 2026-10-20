@@ -27,10 +27,14 @@ function snippet(name) {
 // Searched for raw-stream, timer, clock, and preflight runtimes -> found local
 // read-message-stream and direct-send-outcome mocks, but no shared combination.
 // Retain their stream/native timer patterns and reuse real attachment conversion.
+// Searched for streamMessage/nsIStreamListener fixtures -> found server-lifecycle
+// callback mocks, but no shared IMAP raw retrieval fixture. Reuse that callback
+// pattern here alongside the existing raw-stream and controlled-clock fixture.
 function loadPreflight(options = {}) {
   const attachments = makeDirectSendAttachments();
   const calls = {
-    rawOpens: 0, rawCloses: 0, rawReads: [], bytesRead: 0, imports: 0,
+    rawOpenAttempts: 0, rawOpens: 0, rawCloses: 0, rawReads: [], bytesRead: 0, imports: 0,
+    rawServices: [], rawFetches: [], fetchReads: [], fetchBytesRead: 0, fetchCancellations: [],
     mime: [], timers: [], sends: 0, reviews: 0, settlements: 0,
     created: { params: 0, fields: 0, compose: 0, sender: 0 },
   };
@@ -39,11 +43,13 @@ function loadPreflight(options = {}) {
   const mime = options.mime ?? { contentType: "text/plain", body: "Original text" };
   const identity = { key: "sender", email: "sender@example.test", composeHtml: false };
   const folder = {
-    server: {},
+    server: { type: options.serverType ?? (options.uncached ? "imap" : undefined) },
     getUriForMsg: () => "message-uri",
     getMsgInputStream() {
-      calls.rawOpens++;
+      calls.rawOpenAttempts++;
       clock.now += options.openDuration || 0;
+      if (options.uncached) throw new Error("Original is not available offline");
+      calls.rawOpens++;
       let cursor = 0;
       return {
         available() {
@@ -72,7 +78,7 @@ function loadPreflight(options = {}) {
     TextDecoder, Uint8Array, atob, btoa,
     DOMParser: options.DOMParser,
     Date: class extends Date { static now() { return clock.now; } },
-    Cr: { NS_BASE_STREAM_CLOSED: "NS_BASE_STREAM_CLOSED" },
+    Cr: { NS_BASE_STREAM_CLOSED: "NS_BASE_STREAM_CLOSED", NS_BINDING_ABORTED: "NS_BINDING_ABORTED" },
     Services: { prefs: makeDirectSendPrefs() },
     Ci: {
       nsIPrefBranch: prefTypes, nsITimer: { TYPE_ONE_SHOT: 0 },
@@ -98,7 +104,62 @@ function loadPreflight(options = {}) {
         };
       },
     },
-    MailServices: { accounts: { accounts: [{ key: "account", identities: [identity] }] } },
+    MailServices: {
+      accounts: { accounts: [{ key: "account", identities: [identity] }] },
+      messageServiceFromURI(uri) {
+        calls.rawServices.push(uri);
+        clock.now += options.serviceDuration || 0;
+        if (options.serviceError) throw new Error("Message service unavailable");
+        return {
+          streamMessage(...args) {
+            calls.rawFetches.push(args);
+            if (options.fetchError) throw new Error("Raw retrieval unavailable");
+            const listener = args[1];
+            let offset = 0;
+            const request = {
+              QueryInterface() { return this; },
+              cancel(status) {
+                calls.fetchCancellations.push(status);
+                if (options.cancelError) throw new Error("Request cancellation failed");
+              },
+            };
+            calls.fetchRequest = request;
+            calls.fetchListener = listener;
+            calls.startFetch = () => listener.onStartRequest(request);
+            calls.deliverRaw = (chunk, count = chunk.length) => {
+              let cursor = 0;
+              const stream = {
+                available() { return chunk.length - cursor; },
+                read(readCount) {
+                  calls.fetchReads.push(readCount);
+                  clock.now += options.fetchReadDuration || 0;
+                  if (options.fetchReadError) throw new Error("Raw retrieval read failed");
+                  if (options.fetchNoProgress) return "";
+                  const size = Math.min(readCount, options.fetchReadLimit ?? readCount);
+                  const value = chunk.slice(cursor, cursor + size);
+                  cursor += value.length;
+                  calls.fetchBytesRead += value.length;
+                  return value;
+                },
+              };
+              listener.onDataAvailable(request, stream, offset, count);
+              offset += count;
+            };
+            calls.stopFetch = (status = 0) => listener.onStopRequest(request, status);
+            const finish = () => {
+              calls.startFetch();
+              for (const chunk of options.fetchChunks || [raw]) calls.deliverRaw(chunk);
+              calls.stopFetch(options.fetchStatus ?? 0);
+            };
+            if (!options.deferFetch) {
+              if (options.synchronousFetch) finish();
+              else queueMicrotask(finish);
+            }
+            return { spec: "imap://fixture/original" };
+          },
+        };
+      },
+    },
     Cc: {
       "@mozilla.org/timer;1": { createInstance() {
         if (options.timerCreateError) throw new Error("Timer unavailable");
@@ -199,7 +260,7 @@ function assertPreflightRefused(harness, result) {
   }
 }
 
-describe("direct-send preflight limits and ordinary completion", () => {
+if (require.main === module) describe("direct-send preflight limits and ordinary completion", () => {
   for (const tool of tools) {
     it(`${tool}: completes clear MIME and cancels its bounded preflight timer`, async () => {
       const h = loadPreflight();
@@ -212,7 +273,7 @@ describe("direct-send preflight limits and ordinary completion", () => {
       assert.deepEqual(h.calls.created, { params: 1, fields: 1, compose: 1, sender: 0 });
       assert.equal(h.calls.rawOpens, 1);
       assert.equal(h.calls.rawCloses, 1);
-      assert.deepEqual(h.calls.mime, [{ allowDownload: false, examineEncryptedParts: false, saneBodySize: false }]);
+      assert.deepEqual(h.calls.mime, [{ allowDownload: true, examineEncryptedParts: false, saneBodySize: false }]);
       assert.deepEqual(h.calls.timers.map(timer => timer.delay), [TIME_LIMIT, 120000]);
       assert.ok(h.calls.timers.every(timer => timer.cancelled));
       assert.ok(h.calls.timers.reduce((total, timer) => total + timer.delay, 0) < 150000);
@@ -246,7 +307,238 @@ describe("direct-send preflight limits and ordinary completion", () => {
   }
 });
 
-describe("direct-send preflight byte limits", () => {
+if (require.main === module) describe("direct-send preflight retrieves uncached IMAP originals before Gloda", () => {
+  for (const tool of tools) {
+    for (const synchronousFetch of [false, true]) {
+      it(`${tool}: clear uncached IMAP mail sends after ${synchronousFetch ? "synchronous" : "asynchronous"} raw retrieval`, async () => {
+        const h = loadPreflight({ uncached: true, synchronousFetch });
+        const result = await h.run(tool);
+        assert.equal(result.success, true, result.error);
+        assert.equal(h.calls.rawOpenAttempts, 1);
+        assert.equal(h.calls.rawOpens, 0);
+        assert.deepEqual(h.calls.rawServices, ["message-uri"]);
+        assert.equal(h.calls.rawFetches.length, 1);
+        const [uri, listener, ...args] = h.calls.rawFetches[0];
+        assert.equal(uri, "message-uri");
+        assert.equal(typeof listener.onDataAvailable, "function");
+        assert.deepEqual(args, [null, null, false, "", false], "Retrieval streams the original raw MIME");
+        assert.deepEqual(h.calls.mime, [{ allowDownload: true, examineEncryptedParts: false, saneBodySize: false }]);
+        assert.equal(h.calls.fetchBytesRead, (RAW_HEADER + "Original text").length);
+        assert.ok(h.calls.fetchReads.every(count => count <= 64 * 1024));
+        assert.equal(h.calls.sends, 1);
+        assert.equal(h.calls.settlements, 1);
+        assert.equal(h.attachments.calls.tempCreates.length, 1);
+        assert.deepEqual(h.calls.created, { params: 1, fields: 1, compose: 1, sender: 0 });
+        assert.ok(h.calls.timers.every(timer => timer.cancelled));
+        assert.equal(h.calls.fetchCancellations.length, 0);
+      });
+    }
+    it(`${tool}: waits for successful completion of every raw chunk before importing Gloda`, async () => {
+      const h = loadPreflight({ uncached: true, deferFetch: true });
+      const pending = h.run(tool);
+      await Promise.resolve();
+      h.calls.startFetch();
+      h.calls.deliverRaw(RAW_HEADER + "Original ");
+      assert.equal(h.calls.imports, 0);
+      assert.equal(h.calls.mime.length, 0);
+      assertNoAttachmentEffects(h.attachments.calls);
+      h.calls.deliverRaw("text");
+      assert.equal(h.calls.imports, 0);
+      assert.equal(h.calls.mime.length, 0);
+      assertNoAttachmentEffects(h.attachments.calls);
+      h.calls.stopFetch();
+      const result = await pending;
+      assert.equal(result.success, true, result.error);
+      assert.equal(h.calls.sends, 1);
+      assert.equal(h.calls.imports, 1);
+      assert.equal(h.calls.mime.length, 1);
+    });
+    it(`${tool}: retries an unreadable cached IMAP stream after closing it`, async () => {
+      const h = loadPreflight({ serverType: "imap", readError: true });
+      const result = await h.run(tool);
+      assert.equal(result.success, true, result.error);
+      assert.equal(h.calls.rawOpens, 1);
+      assert.equal(h.calls.rawCloses, 1);
+      assert.equal(h.calls.rawFetches.length, 1);
+      assert.equal(h.calls.sends, 1);
+    });
+    for (const serverType of ["pop3", "none", undefined]) {
+      it(`${tool}: does not download an unavailable ${serverType || "unknown"} original`, async () => {
+        const h = loadPreflight({ uncached: true, serverType: serverType || "" });
+        assertPreflightRefused(h, await h.run(tool));
+        assert.equal(h.calls.rawFetches.length, 0);
+        assert.equal(h.calls.imports, 0);
+      });
+    }
+    for (const [label, raw] of [
+      ["encrypted S/MIME", "Content-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\nMIIB"],
+      ["opaque-signed S/MIME", "Content-Type: application/pkcs7-mime; smime-type=signed-data\r\n\r\nMIIB"],
+      ["encrypted OpenPGP", "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=p\r\n\r\n--p\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--p--\r\n"],
+      ["inline OpenPGP", RAW_HEADER + "-----BEGIN PGP MESSAGE-----\r\nVersion: GnuPG\r\n\r\nYWJj\r\n-----END PGP MESSAGE-----"],
+      ["incomplete MIME", "Content-Type: multipart/mixed; boundary=p\r\n\r\n--p\r\nContent-Type: text/plain\r\n\r\npartial"],
+      ["empty raw content", ""],
+    ]) {
+      it(`${tool}: refuses downloaded ${label} before invoking any structured parser`, async () => {
+        const h = loadPreflight({ uncached: true, raw });
+        assertPreflightRefused(h, await h.run(tool));
+        assert.equal(h.calls.rawFetches.length, 1);
+        assert.equal(h.calls.imports, 0);
+        assert.equal(h.calls.mime.length, 0);
+      });
+    }
+    for (const [label, options] of [
+      ["message service failure", { serviceError: true }],
+      ["streamMessage failure", { fetchError: true }],
+      ["failed request completion", { fetchStatus: 1 }],
+      ["read failure", { fetchReadError: true }],
+      ["read without progress", { fetchNoProgress: true }],
+      ["short callback read", { fetchReadLimit: 7 }],
+    ]) {
+      it(`${tool}: raw retrieval ${label} refuses without attachment or native compose effects`, async () => {
+        const h = loadPreflight({ uncached: true, ...options });
+        assertPreflightRefused(h, await h.run(tool));
+        assert.equal(h.calls.imports, 0);
+        assert.equal(h.calls.mime.length, 0);
+        if (options.fetchReadError || options.fetchNoProgress || options.fetchReadLimit) {
+          assert.equal(h.calls.fetchCancellations.length, 1);
+        }
+      });
+    }
+    it(`${tool}: refuses raw callback counts larger than the bytes actually read`, async () => {
+      const h = loadPreflight({ uncached: true, deferFetch: true });
+      const pending = h.run(tool);
+      await Promise.resolve();
+      h.calls.startFetch();
+      const raw = RAW_HEADER + "Original text";
+      h.calls.deliverRaw(raw, raw.length + 1);
+      h.calls.stopFetch();
+      assertPreflightRefused(h, await pending);
+      assert.equal(h.calls.imports, 0);
+      assert.equal(h.calls.fetchCancellations.length, 1);
+    });
+    it(`${tool}: refuses a failed completion even after receiving complete clear MIME`, async () => {
+      const h = loadPreflight({ uncached: true, deferFetch: true });
+      const pending = h.run(tool);
+      await Promise.resolve();
+      h.calls.startFetch();
+      h.calls.deliverRaw(RAW_HEADER + "Original text");
+      assert.equal(h.calls.imports, 0);
+      h.calls.stopFetch(1);
+      assertPreflightRefused(h, await pending);
+      assert.equal(h.calls.imports, 0);
+    });
+    it(`${tool}: downloaded raw overflow is bounded and cancels the request`, async () => {
+      const raw = RAW_HEADER + "x".repeat(RAW_LIMIT + 1 - RAW_HEADER.length);
+      const h = loadPreflight({ uncached: true, raw });
+      assertPreflightRefused(h, await h.run(tool));
+      assert.ok(h.calls.fetchBytesRead <= RAW_LIMIT + 1);
+      assert.equal(h.calls.fetchCancellations.length, 1);
+      assert.equal(h.calls.imports, 0);
+    });
+    it(`${tool}: downloaded raw content exactly at the limit remains eligible to send`, async () => {
+      const raw = RAW_HEADER + "x".repeat(RAW_LIMIT - RAW_HEADER.length);
+      const h = loadPreflight({ uncached: true, raw });
+      const result = await h.run(tool);
+      assert.equal(result.success, true, result.error);
+      assert.equal(h.calls.fetchBytesRead, RAW_LIMIT);
+      assert.ok(h.calls.fetchReads.every(count => count <= 64 * 1024));
+      assert.equal(h.calls.fetchCancellations.length, 0);
+      assert.equal(h.calls.sends, 1);
+    });
+    it(`${tool}: aggregate raw retrieval overflow cannot be hidden across callbacks`, async () => {
+      const h = loadPreflight({
+        uncached: true,
+        fetchChunks: [RAW_HEADER + "x".repeat(RAW_LIMIT - RAW_HEADER.length), "x"],
+      });
+      assertPreflightRefused(h, await h.run(tool));
+      assert.ok(h.calls.fetchBytesRead <= RAW_LIMIT + 1);
+      assert.equal(h.calls.fetchCancellations.length, 1);
+      assert.equal(h.calls.imports, 0);
+    });
+    it(`${tool}: cached raw overflow refuses without attempting an IMAP download`, async () => {
+      const raw = RAW_HEADER + "x".repeat(RAW_LIMIT + 1 - RAW_HEADER.length);
+      const h = loadPreflight({ serverType: "imap", raw });
+      assertPreflightRefused(h, await h.run(tool));
+      assert.equal(h.calls.rawFetches.length, 0);
+      assert.equal(h.calls.imports, 0);
+    });
+    it(`${tool}: an expired cache read does not start an IMAP download`, async () => {
+      const h = loadPreflight({ uncached: true, openDuration: TIME_LIMIT });
+      assertPreflightRefused(h, await h.run(tool));
+      assert.equal(h.calls.rawFetches.length, 0);
+      assert.equal(h.calls.imports, 0);
+    });
+    for (const elapsed of [TIME_LIMIT - 1, TIME_LIMIT, TIME_LIMIT + 1]) {
+      it(`${tool}: raw request completion at ${elapsed} ms obeys the shared deadline`, async () => {
+        const h = loadPreflight({ uncached: true, deferFetch: true });
+        const pending = h.run(tool);
+        await Promise.resolve();
+        h.calls.startFetch();
+        h.calls.deliverRaw(RAW_HEADER + "Original text");
+        h.clock.now += elapsed;
+        h.calls.stopFetch();
+        const result = await pending;
+        if (elapsed < TIME_LIMIT) {
+          assert.equal(result.success, true, result.error);
+          assert.equal(h.calls.sends, 1);
+        } else {
+          assertPreflightRefused(h, result);
+          assert.equal(h.calls.imports, 0);
+        }
+      });
+    }
+    it(`${tool}: expiry during a raw callback read cancels retrieval before Gloda`, async () => {
+      const h = loadPreflight({ uncached: true, fetchReadDuration: TIME_LIMIT });
+      assertPreflightRefused(h, await h.run(tool));
+      assert.equal(h.calls.fetchCancellations.length, 1);
+      assert.equal(h.calls.imports, 0);
+    });
+    for (const started of [false, true]) {
+      it(`${tool}: timeout ${started ? "after" : "before"} onStartRequest ignores all late raw callbacks`, async () => {
+        const h = loadPreflight({ uncached: true, deferFetch: true });
+        const pending = h.run(tool);
+        await Promise.resolve();
+        if (started) h.calls.startFetch();
+        const timer = h.calls.timers[0];
+        h.clock.now += TIME_LIMIT;
+        timer.callback.notify();
+        assertPreflightRefused(h, await pending);
+        assert.equal(h.calls.fetchCancellations.length, started ? 1 : 0,
+          "A request becomes cancellable when onStartRequest supplies it");
+        let lateReads = 0;
+        h.calls.fetchListener.onDataAvailable(h.calls.fetchRequest, {
+          read() { lateReads++; throw new Error("Late raw data must not be read"); },
+          available() { lateReads++; throw new Error("Late raw data must not be inspected"); },
+        }, 0, 10);
+        if (!started) h.calls.startFetch();
+        h.calls.stopFetch();
+        timer.callback.notify();
+        await Promise.resolve();
+        assertPreflightRefused(h, await pending);
+        assert.equal(lateReads, 0);
+        assert.equal(h.calls.imports, 0);
+        assert.equal(h.calls.mime.length, 0);
+        assert.equal(h.calls.fetchCancellations.length, 1);
+      });
+    }
+    it(`${tool}: a cancellation error cannot reopen a timed out raw preflight`, async () => {
+      const h = loadPreflight({ uncached: true, deferFetch: true, cancelError: true });
+      const pending = h.run(tool);
+      await Promise.resolve();
+      h.calls.startFetch();
+      h.clock.now += TIME_LIMIT;
+      h.calls.timers[0].callback.notify();
+      assertPreflightRefused(h, await pending);
+      h.calls.deliverRaw(RAW_HEADER + "late clear text");
+      h.calls.stopFetch();
+      await Promise.resolve();
+      assertPreflightRefused(h, await pending);
+      assert.equal(h.calls.imports, 0);
+    });
+  }
+});
+
+if (require.main === module) describe("direct-send preflight byte limits", () => {
   for (const tool of tools) {
     it(`${tool}: raw overflow reads at most one byte beyond the limit and never invokes Gloda`, async () => {
       const raw = RAW_HEADER + "x".repeat(RAW_LIMIT + 1 - RAW_HEADER.length);
@@ -318,7 +610,7 @@ describe("direct-send preflight byte limits", () => {
   }
 });
 
-describe("direct-send raw HTML completeness before Gloda", () => {
+if (require.main === module) describe("direct-send raw HTML completeness before Gloda", () => {
   const signedType = 'multipart/signed; protocol="application/pgp-signature"; boundary="sig"';
   const signedMime = {
     contentType: "message/rfc822", headers: { "content-type": [signedType] },
@@ -409,7 +701,7 @@ describe("direct-send raw HTML completeness before Gloda", () => {
   }
 });
 
-describe("direct-send preflight refuses incomplete structured MIME", () => {
+if (require.main === module) describe("direct-send preflight refuses incomplete structured MIME", () => {
   for (const tool of tools) {
     for (const flag of ["truncated", "isTruncated", "bodyTruncated"]) {
       for (const nested of [false, true]) {
@@ -441,7 +733,7 @@ describe("direct-send preflight refuses incomplete structured MIME", () => {
   }
 });
 
-describe("direct-send preflight deadline and late callbacks", () => {
+if (require.main === module) describe("direct-send preflight deadline and late callbacks", () => {
   for (const tool of tools) {
     for (const [label, options] of [
       ["before opening the raw stream", { timerInitDuration: TIME_LIMIT }],
@@ -541,3 +833,5 @@ describe("direct-send preflight deadline and late callbacks", () => {
     });
   }
 });
+
+module.exports = { loadPreflight, assertPreflightRefused };
