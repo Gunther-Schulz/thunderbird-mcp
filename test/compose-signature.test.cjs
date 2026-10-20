@@ -126,7 +126,7 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
     }) },
   });
   vm.runInContext([
-    snippet("DIRECT SEND ENCRYPTION GUARD"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), api);
   return loaded;

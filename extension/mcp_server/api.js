@@ -10065,6 +10065,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END DIRECT SEND ENCRYPTION GUARD
 
+            // BEGIN DIRECT SEND ORIGINAL GUARD
+            const DIRECT_SEND_ORIGINAL_ERROR = `Direct reply/forward of encrypted messages is blocked, including protected or unknown MIME content. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+
+            // Searched for original-message preflight: getDirectQuoteContent and
+            // the raw classifiers cover the content checks, but no helper runs
+            // them before native compose allocation. Never decrypt for a send.
+            function getDirectSendOriginal(msgHdr) {
+              return new Promise(resolve => {
+                try {
+                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+                  );
+                  MsgHdrToMimeMessage(msgHdr, null, (_msgHdr, mime) => {
+                    try {
+                      const quoted = getDirectQuoteContent(msgHdr, mime, false);
+                      if (!quoted) {
+                        resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                        return;
+                      }
+                      // Match getMessage's raw check when structured body
+                      // extraction yields nothing, including local mbox mail.
+                      if (!quoted.body && !quoted.raw) {
+                        const raw = readBoundedRawMessage(msgHdr);
+                        const state = classifyRawMessageEncryption(raw, 0, {
+                          signedRaw: isRawTopLevelMultipartSigned(raw),
+                        });
+                        if (state !== "clear") {
+                          resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                          return;
+                        }
+                      }
+                      resolve({ mime, quoted });
+                    } catch {
+                      resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                    }
+                  }, true, { examineEncryptedParts: false });
+                } catch {
+                  resolve({ error: DIRECT_SEND_ORIGINAL_ERROR });
+                }
+              });
+            }
+            // END DIRECT SEND ORIGINAL GUARD
+
             /**
              * Composes a new email. Opens a compose window for review, or sends
              * directly when skipReview is true.
@@ -10326,44 +10369,45 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * to Drafts and closes the window instead of leaving it open.
              */
 	            // BEGIN REPLY TOOL
-	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, saveAsDraft) {
-	              return new Promise((resolve) => {
-	                try {
-	                  if (skipReview && saveAsDraft) {
-	                    resolve({ error: "saveAsDraft cannot be combined with skipReview" });
-	                    return;
+	            async function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, saveAsDraft) {
+	              try {
+	                if (skipReview && saveAsDraft) {
+	                  return { error: "saveAsDraft cannot be combined with skipReview" };
+	                }
+	                if (saveAsDraft && !isToolEnabled("saveDraft")) {
+	                  return { error: "saveAsDraft requires the saveDraft tool to be enabled" };
+	                }
+	                if (skipReview && isSkipReviewBlocked()) {
+	                  return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
+	                }
+	                const found = findMessage(messageId, folderPath);
+	                if (found.error) {
+	                  return { error: found.error };
+	                }
+	                const { msgHdr, folder } = found;
+	                const selectedIdentity = {};
+	                const identityResult = setComposeIdentity(selectedIdentity, from, folder.server);
+	                if (identityResult && identityResult.error) {
+	                  return identityResult;
+	                }
+	                if (skipReview) {
+	                  const error = getDirectSendIdentityError(selectedIdentity.identity);
+	                  if (error) {
+	                    return { error };
 	                  }
-	                  if (saveAsDraft && !isToolEnabled("saveDraft")) {
-	                    resolve({ error: "saveAsDraft requires the saveDraft tool to be enabled" });
-	                    return;
-	                  }
-	                  if (skipReview && isSkipReviewBlocked()) {
-	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
-	                    return;
-	                  }
-	                  const found = findMessage(messageId, folderPath);
-	                  if (found.error) {
-	                    resolve({ error: found.error });
-	                    return;
-	                  }
-	                  const { msgHdr, folder } = found;
-	                  const selectedIdentity = {};
-	                  const identityResult = setComposeIdentity(selectedIdentity, from, folder.server);
-	                  if (identityResult && identityResult.error) {
-	                    resolve(identityResult);
-	                    return;
-	                  }
-	                  if (skipReview) {
-	                    const error = getDirectSendIdentityError(selectedIdentity.identity);
-	                    if (error) {
-	                      resolve({ error });
-	                      return;
-	                    }
-	                  }
-	                  const { descs: fileDescs } = filePathsToAttachDescs(attachments);
-	                  const msgURI = folder.getUriForMsg(msgHdr);
-	                  const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
+	                }
+	                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
+	                const msgURI = folder.getUriForMsg(msgHdr);
+	                const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
 
+	                const directOriginal = skipReview ? await getDirectSendOriginal(msgHdr) : null;
+	                if (directOriginal?.error) return directOriginal;
+	                if (skipReview) {
+	                  // MIME reading can yield to preference changes. Recheck before allocation.
+	                  const error = getDirectSendIdentityError(selectedIdentity.identity);
+	                  if (error) return { error };
+	                }
+	                return await new Promise((resolve) => {
 	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
 	                    .createInstance(Ci.nsIMsgComposeParams);
 	                  msgComposeParams.identity = selectedIdentity.identity;
@@ -10394,85 +10438,82 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  const reviewTo = to;
 	                  const reviewCc = cc;
 
-	                  if (skipReview || saveAsDraft) {
+	                  if (saveAsDraft) {
 	                    const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
 	                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
 	                      "resource:///modules/gloda/MimeMessage.sys.mjs"
-                      );
-
-	                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+	                    );
+	                    MsgHdrToMimeMessage(msgHdr, null, (_msgHdr, mime) => {
 	                      try {
-	                        const quoted = getDirectQuoteContent(msgHdr, aMimeMsg, allowEncrypted);
-	                        if (!quoted) {
-	                          resolve({ error: "Direct reply or automatic drafting of encrypted messages is blocked. Use skipReview: false and saveAsDraft: false to review in Thunderbird, or enable \"Allow MCP clients to read encrypted messages\" in the extension options." });
+	                        if (!getDirectQuoteContent(msgHdr, mime, allowEncrypted)) {
+	                          resolve({ error: "Automatic drafting of encrypted messages is blocked. Use skipReview: false and saveAsDraft: false to review in Thunderbird, or enable \"Allow MCP clients to read encrypted messages\" in the extension options." });
 	                          return;
 	                        }
-	                        const originalBody = quoted.body;
-
-	                        if (saveAsDraft) {
-	                          openReplyWindow();
-	                          return;
-	                        }
-
-	                        if (replyAll) {
-	                          composeFields.to = to || msgHdr.author;
-	                          if (cc) {
-	                            composeFields.cc = cc;
-	                          } else {
-	                            const replyAllCc = getReplyAllCcRecipients(msgHdr, folder);
-	                            if (replyAllCc) composeFields.cc = replyAllCc;
-	                          }
-	                        } else {
-	                          composeFields.to = to || msgHdr.author;
-	                          if (cc) composeFields.cc = cc;
-	                        }
-
-	                        composeFields.bcc = bcc || "";
-
-	                        // nsIMsgCompose.initialize sets the "Re:" subject from msgHdr.
-	                        composeFields.references = `<${messageId}>`;
-	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
-
-	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-
-	                        // Quoting and signature placement run in the compose window's
-	                        // editor, so direct send uses a hand-built quoted body. The shape
-	                        // matches the resolved compose mode -- shipping an HTML envelope
-	                        // for a plain-format send would otherwise render as literal
-	                        // markup in the recipient's mail client.
-	                        if (replyUseHtml) {
-	                          const quotedLines = originalBody.split('\n').map(line =>
-	                            `&gt; ${escapeHtml(line)}`
-	                          ).join('<br>');
-	                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-	                          const quoteBlock = isHtml
-	                            ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
-	                            : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
-	                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
-	                        } else {
-	                          const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
-	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
-	                        }
-
-	                        // On success Thunderbird marks the original replied.
-	                        sendThroughCompose(msgComposeParams, fileDescs, replyUseHtml).then(result => {
-	                          if (result.success) {
-	                            let msg = "Reply sent";
-	                            result.message = msg;
-	                          }
-	                          resolve(result);
-	                        }).catch(e => {
-	                          // The promise helpers above resolve rather than reject today, but
-	                          // nothing in their signature guarantees it and this promise has no
-	                          // timeout of its own -- an unhandled rejection would hang the request
-	                          // forever instead of failing it.
-	                          resolve({ error: e.toString() });
-	                        });
+	                        openReplyWindow();
 	                      } catch (e) {
 	                        resolve({ error: e.toString() });
 	                      }
 	                    }, true, { examineEncryptedParts: allowEncrypted });
+	                    return;
+	                  }
+
+	                  if (skipReview) {
+	                    const originalBody = directOriginal.quoted.body;
+	                    if (replyAll) {
+	                      composeFields.to = to || msgHdr.author;
+	                      if (cc) {
+	                        composeFields.cc = cc;
+	                      } else {
+	                        const replyAllCc = getReplyAllCcRecipients(msgHdr, folder);
+	                        if (replyAllCc) composeFields.cc = replyAllCc;
+	                      }
+	                    } else {
+	                      composeFields.to = to || msgHdr.author;
+	                      if (cc) composeFields.cc = cc;
+	                    }
+
+	                    composeFields.bcc = bcc || "";
+
+	                    // nsIMsgCompose.initialize sets the "Re:" subject from msgHdr.
+	                    composeFields.references = `<${messageId}>`;
+	                    composeFields.setHeader("In-Reply-To", `<${messageId}>`);
+
+	                    const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
+	                    const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+
+	                    // Quoting and signature placement run in the compose window's
+	                    // editor, so direct send uses a hand-built quoted body. The shape
+	                    // matches the resolved compose mode -- shipping an HTML envelope
+	                    // for a plain-format send would otherwise render as literal
+	                    // markup in the recipient's mail client.
+	                    if (replyUseHtml) {
+	                      const quotedLines = originalBody.split('\n').map(line =>
+	                        `&gt; ${escapeHtml(line)}`
+	                      ).join('<br>');
+	                      const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
+	                      const quoteBlock = isHtml
+	                        ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
+	                        : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
+	                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
+	                    } else {
+	                      const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
+	                      composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
+	                    }
+
+	                    // On success Thunderbird marks the original replied.
+	                    sendThroughCompose(msgComposeParams, fileDescs, replyUseHtml).then(result => {
+	                      if (result.success) {
+	                        let msg = "Reply sent";
+	                        result.message = msg;
+	                      }
+	                      resolve(result);
+	                    }).catch(e => {
+	                      // The promise helpers above resolve rather than reject today, but
+	                      // nothing in their signature guarantees it and this promise has no
+	                      // timeout of its own -- an unhandled rejection would hang the request
+	                      // forever instead of failing it.
+	                      resolve({ error: e.toString() });
+	                    });
 	                    return;
 	                  }
 
@@ -10508,10 +10549,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    });
 	                  }
 
-	                } catch (e) {
-	                  resolve({ error: e.toString() });
-	                }
-	              });
+	                });
+	              } catch (e) {
+	                return { error: e.toString() };
+	              }
             }
             // END REPLY TOOL
 
@@ -10531,36 +10572,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Thunderbird sets the subject, References and $Forwarded disposition.
              */
             // BEGIN FORWARD TOOL
-            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
-              return new Promise((resolve) => {
-                try {
-                  if (skipReview && isSkipReviewBlocked()) {
-                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
-                    return;
+            async function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
+              try {
+                if (skipReview && isSkipReviewBlocked()) {
+                  return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
+                }
+                const found = findMessage(messageId, folderPath);
+                if (found.error) {
+                  return { error: found.error };
+                }
+                const { msgHdr, folder } = found;
+                const selectedIdentity = {};
+                const identityResult = setComposeIdentity(selectedIdentity, from, folder.server);
+                if (identityResult && identityResult.error) {
+                  return identityResult;
+                }
+                if (skipReview) {
+                  const error = getDirectSendIdentityError(selectedIdentity.identity);
+                  if (error) {
+                    return { error };
                   }
-                  const found = findMessage(messageId, folderPath);
-                  if (found.error) {
-                    resolve({ error: found.error });
-                    return;
-                  }
-                  const { msgHdr, folder } = found;
-                  const selectedIdentity = {};
-                  const identityResult = setComposeIdentity(selectedIdentity, from, folder.server);
-                  if (identityResult && identityResult.error) {
-                    resolve(identityResult);
-                    return;
-                  }
-                  if (skipReview) {
-                    const error = getDirectSendIdentityError(selectedIdentity.identity);
-                    if (error) {
-                      resolve({ error });
-                      return;
-                    }
-                  }
-                  const { descs: fileDescs } = filePathsToAttachDescs(attachments);
-                  const msgURI = folder.getUriForMsg(msgHdr);
-                  const compType = Ci.nsIMsgCompType.ForwardInline;
+                }
+                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
+                const msgURI = folder.getUriForMsg(msgHdr);
+                const compType = Ci.nsIMsgCompType.ForwardInline;
 
+                const directOriginal = skipReview ? await getDirectSendOriginal(msgHdr) : null;
+                if (directOriginal?.error) return directOriginal;
+                // Withheld clear-signed parts have no safe message-part URLs.
+                if (directOriginal?.quoted.raw && rawMessageHasForwardableParts(directOriginal.quoted.raw)) {
+                  return { error: `Direct forward of this signed message cannot include its attachments without review. ${DIRECT_SEND_REVIEW_INSTRUCTION}` };
+                }
+                if (skipReview) {
+                  // MIME reading can yield to preference changes. Recheck before allocation.
+                  const error = getDirectSendIdentityError(selectedIdentity.identity);
+                  if (error) return { error };
+                }
+                return await new Promise((resolve) => {
                   const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                     .createInstance(Ci.nsIMsgComposeParams);
                   msgComposeParams.identity = selectedIdentity.identity;
@@ -10587,114 +10635,93 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.format = fwdFormat;
 
                   if (skipReview) {
-                    const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
-                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-                      "resource:///modules/gloda/MimeMessage.sys.mjs"
-                    );
+                    const { mime: aMimeMsg, quoted } = directOriginal;
+                    const originalBody = quoted.body;
 
-                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
-                      try {
-                        const quoted = getDirectQuoteContent(msgHdr, aMimeMsg, allowEncrypted);
-                        if (!quoted) {
-                          resolve({ error: "Direct reply/forward of encrypted messages is blocked. Use skipReview: false to review in Thunderbird, or enable \"Allow MCP clients to read encrypted messages\" in the extension options." });
+                    composeFields.to = to;
+                    composeFields.cc = cc || "";
+                    composeFields.bcc = bcc || "";
+
+                    // nsIMsgCompose.initialize sets the "Fwd:" subject and References from msgHdr.
+                    const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+
+                    const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
+                    const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+                    const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
+
+                    // Forward body population runs in the compose window, so
+                    // direct send hand-builds the forward block. The shape matches the
+                    // resolved compose mode -- shipping an HTML envelope for a
+                    // plain-format send would render as literal markup in the
+                    // recipient's mail client.
+                    if (fwdUseHtml) {
+                      const fwdHeaderHtml =
+                        `-------- Forwarded Message --------<br>` +
+                        `Subject: ${escapeHtml(origSubject)}<br>` +
+                        `Date: ${dateStr}<br>` +
+                        `From: ${escapeHtml(fwdAuthor)}<br>` +
+                        `To: ${escapeHtml(fwdRecipients)}<br><br>`;
+                      const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
+                      const quotedLinesHtml = originalBody.split('\n').map(line =>
+                        `&gt; ${escapeHtml(line)}`
+                      ).join('<br>');
+                      const forwardBlock = isHtml
+                        ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
+                        : `${fwdHeaderHtml}${quotedLinesHtml}`;
+                      const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
+                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+                    } else {
+                      const fwdHeader =
+                        `-------- Forwarded Message --------\n` +
+                        `Subject: ${origSubject}\n` +
+                        `Date: ${dateStr}\n` +
+                        `From: ${fwdAuthor}\n` +
+                        `To: ${fwdRecipients}\n\n`;
+                      composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
+                    }
+
+                    // Original attachments must be stored in the message and pass
+                    // the same URL policy used when reading attachments.
+                    if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                      for (const att of aMimeMsg.allUserAttachments) {
+                        if (isExternalAttachment(att)) {
+                          resolve({ error: "Direct forward cannot include an external attachment link, because its content is not stored in the message. Use skipReview: false to review in Thunderbird." });
                           return;
                         }
-                        // Gloda withheld this clear-signed message's parts, so its
-                        // attachments have no message-part URLs to forward safely.
-                        if (quoted.raw && rawMessageHasForwardableParts(quoted.raw)) {
-                          resolve({ error: "Direct forward of this signed message cannot include its attachments while encrypted message access is off. Use skipReview: false to review in Thunderbird." });
+                        const fetchRefusal = getSystemPrincipalFetchRefusal(att?.url);
+                        if (fetchRefusal) {
+                          resolve({ error: `Direct forward cannot include this attachment: ${fetchRefusal}. Use skipReview: false to review in Thunderbird.` });
                           return;
                         }
-                        const originalBody = quoted.body;
-
-                        composeFields.to = to;
-                        composeFields.cc = cc || "";
-                        composeFields.bcc = bcc || "";
-
-                        // nsIMsgCompose.initialize sets the "Fwd:" subject and References from msgHdr.
-                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-
-                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-                        const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-                        const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
-
-                        // Forward body population runs in the compose window, so
-                        // direct send hand-builds the forward block. The shape matches the
-                        // resolved compose mode -- shipping an HTML envelope for a
-                        // plain-format send would render as literal markup in the
-                        // recipient's mail client.
-                        if (fwdUseHtml) {
-                          const fwdHeaderHtml =
-                            `-------- Forwarded Message --------<br>` +
-                            `Subject: ${escapeHtml(origSubject)}<br>` +
-                            `Date: ${dateStr}<br>` +
-                            `From: ${escapeHtml(fwdAuthor)}<br>` +
-                            `To: ${escapeHtml(fwdRecipients)}<br><br>`;
-                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-                          const quotedLinesHtml = originalBody.split('\n').map(line =>
-                            `&gt; ${escapeHtml(line)}`
-                          ).join('<br>');
-                          const forwardBlock = isHtml
-                            ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
-                            : `${fwdHeaderHtml}${quotedLinesHtml}`;
-                          const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
-                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
-                        } else {
-                          const fwdHeader =
-                            `-------- Forwarded Message --------\n` +
-                            `Subject: ${origSubject}\n` +
-                            `Date: ${dateStr}\n` +
-                            `From: ${fwdAuthor}\n` +
-                            `To: ${fwdRecipients}\n\n`;
-                          composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
-                        }
-
-                        // Original attachments must be stored in the message and pass
-                        // the same URL policy used when reading attachments.
-                        if (aMimeMsg && aMimeMsg.allUserAttachments) {
-                          for (const att of aMimeMsg.allUserAttachments) {
-                            if (isExternalAttachment(att)) {
-                              resolve({ error: "Direct forward cannot include an external attachment link, because its content is not stored in the message. Use skipReview: false to review in Thunderbird." });
-                              return;
-                            }
-                            const fetchRefusal = getSystemPrincipalFetchRefusal(att?.url);
-                            if (fetchRefusal) {
-                              resolve({ error: `Direct forward cannot include this attachment: ${fetchRefusal}. Use skipReview: false to review in Thunderbird.` });
-                              return;
-                            }
-                          }
-                        }
-
-                        const origDescs = [];
-                        if (aMimeMsg && aMimeMsg.allUserAttachments) {
-                          for (const att of aMimeMsg.allUserAttachments) {
-                            try {
-                              origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
-                            } catch {
-                              // Skip unreadable original attachments
-                            }
-                          }
-                        }
-                        const allDescs = [...origDescs, ...fileDescs];
-
-                        // On success Thunderbird marks the original forwarded.
-                        sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml).then(result => {
-                          if (result.success) {
-                            let msg = `Forward sent with ${allDescs.length} attachment(s)`;
-                            result.message = msg;
-                          }
-                          resolve(result);
-                        }).catch(e => {
-                          // The promise helpers above resolve rather than reject today, but
-                          // nothing in their signature guarantees it and this promise has no
-                          // timeout of its own -- an unhandled rejection would hang the request
-                          // forever instead of failing it.
-                          resolve({ error: e.toString() });
-                        });
-                      } catch (e) {
-                        resolve({ error: e.toString() });
                       }
-                    }, true, { examineEncryptedParts: allowEncrypted });
+                    }
+
+                    const origDescs = [];
+                    if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                      for (const att of aMimeMsg.allUserAttachments) {
+                        try {
+                          origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
+                        } catch {
+                          // Skip unreadable original attachments
+                        }
+                      }
+                    }
+                    const allDescs = [...origDescs, ...fileDescs];
+
+                    // On success Thunderbird marks the original forwarded.
+                    sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml).then(result => {
+                      if (result.success) {
+                        let msg = `Forward sent with ${allDescs.length} attachment(s)`;
+                        result.message = msg;
+                      }
+                      resolve(result);
+                    }).catch(e => {
+                      // The promise helpers above resolve rather than reject today, but
+                      // nothing in their signature guarantees it and this promise has no
+                      // timeout of its own -- an unhandled rejection would hang the request
+                      // forever instead of failing it.
+                      resolve({ error: e.toString() });
+                    });
                     return;
                   }
 
@@ -10727,10 +10754,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // forever instead of failing it.
                     resolve({ error: e.toString() });
                   });
-                } catch (e) {
-                  resolve({ error: e.toString() });
-                }
-              });
+                });
+              } catch (e) {
+                return { error: e.toString() };
+              }
             }
 
             // END OUTBOUND MAIL TOOLS

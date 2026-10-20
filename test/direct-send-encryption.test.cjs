@@ -71,7 +71,9 @@ function loadEncryptionTools(options = {}) {
       importESModule: () => ({
         MsgHdrToMimeMessage(msg, _listener, callback) {
           calls.mime++;
-          callback(msg, { contentType: "text/plain", body: "Original text" });
+          const finish = () => callback(msg, { contentType: "text/plain", body: "Original text" });
+          if (options.deferMime) calls.finishMime = finish;
+          else finish();
         },
       }),
     },
@@ -146,13 +148,15 @@ function loadEncryptionTools(options = {}) {
   vm.createContext(sandbox);
   vm.runInContext([
     snippet("COMPOSE IDENTITY HELPER"), snippet("COMPOSE FORMAT HELPER"),
-    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND HELPER"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
+    snippet("DIRECT SEND HELPER"),
     snippet("COMPOSE SEND HELPER"), snippet("OUTBOUND MAIL TOOLS"),
     snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
   return {
     calls,
     identity,
+    prefs,
     run: (tool, args = {}) => sandbox.dispatchTool(tool, {
       to: "recipient@example.test", subject: "Subject", body: "Body", isHtml: false,
       messageId: hdr.messageId, folderPath: "folder", skipReview: true, ...args,
@@ -162,7 +166,7 @@ function loadEncryptionTools(options = {}) {
 
 // Searched for zero-allocation refusal assertions -> found send-only checks in
 // direct-send-outcome, but none checks all native constructors and review text.
-function assertRefused(harness, result) {
+function assertRefused(harness, result, mimeReads = 0) {
   assert.equal(result.success, undefined);
   assert.match(result.error, /skipReview: false/);
   assert.match(result.error, /review window/);
@@ -172,7 +176,7 @@ function assertRefused(harness, result) {
   assert.equal(harness.calls.sends.length, 0);
   assert.equal(harness.calls.drafts, 0);
   assert.equal(harness.calls.reviews, 0);
-  assert.equal(harness.calls.mime, 0, "Identity refusal precedes reading the original");
+  assert.equal(harness.calls.mime, mimeReads, "An initial identity refusal precedes reading the original");
 }
 
 const invalidPolicies = [
@@ -327,5 +331,27 @@ describe("direct send identity encryption pass-through cases", () => {
       assert.equal(h.calls.sends.length, 0);
       assert.equal(h.calls.drafts + h.calls.draftSaves, 1);
     });
+  }
+});
+
+describe("direct send identity policy changes while the original is being classified", () => {
+  for (const tool of ["replyToMessage", "forwardMessage"]) {
+    for (const change of ["requires encryption", "automatic encryption enabled", "policy becomes unreadable"]) {
+      it(`${tool}: refuses before native creation when ${change}`, async () => {
+        const h = loadEncryptionTools({
+          deferMime: true,
+          prefs: { [`${identityPrefix}openpgp_key_id`]: "ABCD" },
+        });
+        const pending = h.run(tool);
+        assert.equal(h.calls.mime, 1);
+        assert.deepEqual(h.calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
+        assert.equal(h.calls.sends.length, 0);
+        if (change === "requires encryption") h.prefs.getIntPref = () => 1;
+        else if (change === "automatic encryption enabled") h.prefs.getBoolPref = () => true;
+        else h.prefs.getIntPref = () => { throw new Error("Preference unavailable"); };
+        h.calls.finishMime();
+        assertRefused(h, await pending, 1);
+      });
+    }
   }
 });

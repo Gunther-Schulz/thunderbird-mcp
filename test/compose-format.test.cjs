@@ -40,7 +40,7 @@ function loadComposeFormat(composeHtml) {
     },
     ChromeUtils: {
       generateQI: () => () => {},
-      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, {}) }),
+      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, { contentType: "text/plain", body: "Original <text>\nSecond line" }) }),
     },
     Components: { isSuccessCode: status => status === 0 },
     Services: { prefs: makeDirectSendPrefs() },
@@ -117,7 +117,7 @@ function loadComposeFormat(composeHtml) {
     source.slice(escapeStart, escapeEnd),
     snippet("MESSAGE TEXT CONVERSION"), snippet("COMPOSE HTML FRAGMENT"),
     snippet("COMPOSE SIGNATURE HELPERS"), snippet("COMPOSE FORMAT HELPER"),
-    snippet("DIRECT SEND ENCRYPTION GUARD"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("DIRECT SEND HELPER"), snippet("COMPOSE SEND HELPER"),
     snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL DISPATCH"),
   ].join("\n"), sandbox);

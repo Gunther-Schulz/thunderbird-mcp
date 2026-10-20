@@ -106,7 +106,7 @@ function loadSend(options = {}) {
     },
     ChromeUtils: {
       generateQI: () => () => {},
-      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, {}) }),
+      importESModule: () => ({ MsgHdrToMimeMessage: (msg, _listener, callback) => callback(msg, { contentType: "text/plain", body: "Original body" }) }),
     },
     Components: { isSuccessCode: status => status === 0 },
     Services: { prefs: makeDirectSendPrefs() },
@@ -134,7 +134,7 @@ function loadSend(options = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
-    snippet("DIRECT SEND ENCRYPTION GUARD"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("DIRECT SEND HELPER"), snippet("COMPOSE SEND HELPER"),
     snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
@@ -415,6 +415,7 @@ describe("reply and forward send through nsIMsgCompose", () => {
     it(`sends ${tool} with the original's URI and type so Thunderbird threads and flags it`, async () => {
       const h = loadSend();
       const result = h.start(tool);
+      await assertPending(h);
       const { params } = h.compose.init;
       assert.equal(params.originalMsgURI, "message-uri");
       assert.equal(params.type, tool === "reply" ? 1 : 3);
@@ -429,10 +430,13 @@ describe("reply and forward send through nsIMsgCompose", () => {
     if (tool === "reply") {
       it("keeps the reply threading headers", async () => {
         const h = loadSend();
-        h.start(tool);
+        const result = h.start(tool);
+        await assertPending(h);
         const fields = h.compose.init.params.composeFields;
         assert.equal(fields.references, "<original>");
         assert.equal(fields.headers["In-Reply-To"], "<original>");
+        h.state.listener.onStopSending("id", 0);
+        assert.equal((await result).success, true);
       });
     }
 
@@ -440,6 +444,7 @@ describe("reply and forward send through nsIMsgCompose", () => {
       it(`reports ${tool} ${label}`, async () => {
         const h = loadSend();
         const result = h.start(tool);
+        await assertPending(h);
         trigger(h);
         const value = await result;
         assert.match(value.error, pattern);

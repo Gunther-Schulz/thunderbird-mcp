@@ -144,7 +144,7 @@ function loadReply(options = {}) {
     snippet("ENCRYPTED MESSAGE GUARD"), snippet("DRAFT HELPERS"),
     source.slice(accessStart, accessEnd),
     snippet("COMPOSE WINDOW DRAFT HELPER"),
-    snippet("DIRECT SEND ENCRYPTION GUARD"),
+    snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("REPLY TOOL"),
     snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
