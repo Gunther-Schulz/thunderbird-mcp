@@ -24,26 +24,6 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-// Searched for fixture part-name assignment -> found explicit names in
-// privacy-messages, but no shared helper. Supply Gloda's root numbering without
-// reading getters used by refusal and late-callback tests.
-function assignFixturePartNames(mime) {
-  const rootType = mime && Object.getOwnPropertyDescriptor(mime, "contentType")?.value;
-  const pending = [[mime, rootType === "message/rfc822" ? "" : "1"]];
-  const seen = new Set();
-  while (pending.length) {
-    const [part, name] = pending.pop();
-    if (!part || typeof part !== "object" || seen.has(part)) continue;
-    seen.add(part);
-    if (!Object.hasOwn(part, "partName")) part.partName = name;
-    const children = Object.getOwnPropertyDescriptor(part, "parts")?.value;
-    if (Array.isArray(children)) {
-      children.forEach((child, index) => pending.push([child, name ? `${name}.${index + 1}` : `${index + 1}`]));
-    }
-  }
-  return mime;
-}
-
 // Searched for raw-stream, timer, clock, and preflight runtimes -> found local
 // read-message-stream and direct-send-outcome mocks, but no shared combination.
 // Retain their stream/native timer patterns and reuse real attachment conversion.
@@ -55,13 +35,12 @@ function loadPreflight(options = {}) {
   const calls = {
     rawOpenAttempts: 0, rawOpens: 0, rawCloses: 0, rawReads: [], bytesRead: 0, imports: 0,
     rawServices: [], rawFetches: [], fetchReads: [], fetchBytesRead: 0, fetchCancellations: [],
-    mime: [], parserCalls: [], timers: [], sends: 0, sentBodies: [], reviews: 0, settlements: 0,
+    mime: [], timers: [], sends: 0, reviews: 0, settlements: 0,
     created: { params: 0, fields: 0, compose: 0, sender: 0 },
   };
   const clock = { now: 1000 };
   const raw = options.raw ?? RAW_HEADER + "Original text";
-  const mime = assignFixturePartNames(options.mime ?? { contentType: "text/plain", body: "Original text" });
-  let parserMime = mime;
+  const mime = options.mime ?? { contentType: "text/plain", body: "Original text" };
   const identity = { key: "sender", email: "sender@example.test", composeHtml: false };
   const folder = {
     server: { type: options.serverType ?? (options.uncached ? "imap" : undefined) },
@@ -111,44 +90,7 @@ function loadPreflight(options = {}) {
     Components: { isSuccessCode: status => status === 0 },
     ChromeUtils: {
       generateQI: () => () => {},
-      importESModule(name) {
-        if (name === "resource:///modules/mimeParser.sys.mjs") {
-          return { MimeParser: {
-            // Searched for independent parser emitter fixtures -> none shared.
-            // This lifecycle harness models its declared MIME fixture; the
-            // coalescing suite independently decodes the actual full raw input.
-            parseSync(input, emitter, parserOptions) {
-              calls.parserCalls.push({ input, options: parserOptions });
-              clock.now += options.parseDuration || 0;
-              if (options.parserError) throw new Error("Independent MIME parser failed");
-              let decodedParts = options.parserParts;
-              if (!decodedParts) {
-                decodedParts = [];
-                const pending = [parserMime];
-                while (pending.length) {
-                  const part = pending.pop();
-                  if (typeof part.body === "string") {
-                    decodedParts.push({
-                      number: part.partName === "1" ? "" : part.partName.slice(2),
-                      type: part.contentType, body: part.body,
-                    });
-                  }
-                  for (const child of part.parts || []) pending.push(child);
-                }
-                if (!decodedParts.length && input.startsWith(RAW_HEADER)) {
-                  decodedParts.push({ number: "", type: "text/plain", body: input.slice(RAW_HEADER.length) });
-                }
-              }
-              emitter.startMessage?.();
-              for (const part of decodedParts) {
-                emitter.startPart(part.number, { contentType: { type: part.type } });
-                for (const chunk of part.chunks || [part.body]) emitter.deliverPartData(part.number, chunk);
-                emitter.endPart?.(part.number);
-              }
-              if (!options.parserIncomplete) emitter.endMessage();
-            },
-          } };
-        }
+      importESModule() {
         calls.imports++;
         clock.now += options.importDuration || 0;
         if (options.importError) throw new Error("MIME module unavailable");
@@ -156,11 +98,8 @@ function loadPreflight(options = {}) {
           MsgHdrToMimeMessage(msg, _listener, callback, allowDownload, mimeOptions) {
             calls.mime.push({ allowDownload, ...mimeOptions });
             if (options.mimeError) throw new Error("MIME parser failed");
-            calls.deliverMime = value => {
-              parserMime = assignFixturePartNames(value);
-              callback(msg, parserMime);
-            };
-            if (!options.deferMime) calls.deliverMime(mime);
+            calls.deliverMime = value => callback(msg, value);
+            if (!options.deferMime) callback(msg, mime);
           },
         };
       },
@@ -255,7 +194,6 @@ function loadPreflight(options = {}) {
           UnregisterStateListener() {},
           sendMsg() {
             calls.sends++;
-            calls.sentBodies.push(this.params.composeFields.body);
             this.listener.onStopSending("sent@example.test", 0);
             return Promise.resolve();
           },
@@ -285,7 +223,6 @@ function loadPreflight(options = {}) {
     snippet("INLINE ATTACHMENT BASE64 HELPERS"),
     snippet("RAW MIME PARSING HELPERS"), snippet("RAW MIME ATTACHMENT HELPERS"),
     snippet("ENCRYPTED MESSAGE GUARD"), snippet("DIRECT SEND ENCRYPTION GUARD"),
-    snippet("DIRECT SEND MIME COMPLETENESS"),
     snippet("DIRECT SEND ORIGINAL GUARD"), snippet("COMPOSE FORMAT HELPER"),
     snippet("COMPOSE SEND HELPER"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
@@ -794,84 +731,6 @@ if (require.main === module) describe("direct-send preflight refuses incomplete 
       assertPreflightRefused(h, await h.run(tool));
     });
   }
-});
-
-if (require.main === module) describe("direct-send independent MIME completeness", () => {
-  for (const tool of tools) {
-    for (const [label, options] of [
-      ["parser failure", { parserError: true }],
-      ["unfinished parser", { parserIncomplete: true }],
-      ["missing decoded body", { parserParts: [] }],
-      ["unmapped decoded part", { parserParts: [{ number: "9", type: "text/plain", body: "unknown part" }] }],
-      ["decoded type mismatch", { parserParts: [{ number: "", type: "text/html", body: "<p>different type</p>" }] }],
-      ["unsupported enriched text", {
-        mime: { contentType: "text/enriched", body: "Gloda enriched body" },
-        parserParts: [{ number: "", type: "text/enriched", body: "raw enriched body" }],
-      }],
-      ["parser-stage deadline", { parseDuration: TIME_LIMIT }],
-    ]) {
-      it(`${tool}: ${label} refuses before conversion or native composition`, async () => {
-        const h = loadPreflight(options);
-        assertPreflightRefused(h, await h.run(tool));
-        assert.equal(h.calls.parserCalls.length, 1);
-      });
-    }
-    for (const [label, type, decoded] of [
-      ["decoded text bytes", "text/plain", "x".repeat(RAW_LIMIT + 1)],
-      ["decoded HTML bytes", "text/html", "x".repeat(HTML_LIMIT + 1)],
-    ]) {
-      it(`${tool}: independently decoded ${label} cannot exceed its budget`, async () => {
-        const h = loadPreflight({
-          mime: { contentType: type, body: "short Gloda prefix" },
-          parserParts: [{ number: "", type, body: decoded }],
-        });
-        assertPreflightRefused(h, await h.run(tool));
-        assert.equal(h.calls.parserCalls.length, 1);
-      });
-    }
-    it(`${tool}: preserves multipart bodies while excluding attached text from the quote`, async () => {
-      const attachment = {
-        partName: "1.2", name: "attached.txt", contentType: "text/plain",
-        url: "mailbox-message://fixture/original?part=1.2",
-      };
-      const h = loadPreflight({
-        mime: {
-          contentType: "multipart/mixed",
-          parts: [
-            { contentType: "text/plain", body: "Gloda prefix" },
-            { contentType: "text/plain", body: "attachment placeholder" },
-            { contentType: "text/plain", body: "Gloda continuation prefix" },
-          ],
-          allUserAttachments: [attachment],
-        },
-        parserParts: [
-          { number: "1", type: "text/plain", body: "Complete first body.\n" },
-          { number: "2", type: "text/plain", body: "PRIVATE ATTACHMENT TEXT" },
-          { number: "3", type: "text/plain", body: "Complete continuation." },
-        ],
-      });
-      const result = await h.run(tool);
-      assert.equal(result.success, true, result.error);
-      assert.equal(h.calls.sends, 1);
-      assert.match(h.calls.sentBodies[0], /Complete first body/);
-      assert.match(h.calls.sentBodies[0], /Complete continuation/);
-      assert.doesNotMatch(h.calls.sentBodies[0], /PRIVATE ATTACHMENT|Gloda prefix|attachment placeholder/);
-    });
-  }
-
-  it("accepts libmime HTML META/BASE rewrites and retains the independent raw body", () => {
-    const original = '<html><head><meta charset="windows-1252"><base href="https://example.test/"></head><body>Original HTML.</body></html>';
-    const rewritten = '<html><head><meta charset="UTF-8"></head><body>Original HTML.</body></html>';
-    const mime = { contentType: "text/html", body: rewritten };
-    const raw = `Content-Type: text/html; charset=UTF-8\r\n\r\n${original}`;
-    const h = loadPreflight({
-      mime, raw, parserParts: [{ number: "", type: "text/html", body: original }],
-    });
-    const completed = h.api.completeDirectSendMime(mime, raw, h.clock.now + TIME_LIMIT);
-    assert.equal(completed.body, original);
-    assert.equal(mime.body, rewritten, "The shared Gloda tree must remain untouched");
-    assert.equal(h.calls.parserCalls.length, 1);
-  });
 });
 
 if (require.main === module) describe("direct-send preflight deadline and late callbacks", () => {

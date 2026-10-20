@@ -65,8 +65,6 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     getUserTags: () => [],
     getConfiguredGetMessagesLimit: () => 10,
     readMessageStreamFully: () => raw,
-    // Parser completeness has its own production-code preflight/coalescing suites.
-    completeDirectSendMime: mime => mime,
     isSkipReviewBlocked: () => false,
     isToolEnabled: () => true,
     filePathsToAttachDescs: attachments.convert,

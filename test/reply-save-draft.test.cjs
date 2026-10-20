@@ -83,7 +83,6 @@ function loadReply(options = {}) {
     },
     setComposeIdentity(params) { params.identity = identity; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
-    completeDirectSendMime: mime => mime,
     sendMessageDirectly() { calls.sends++; return Promise.resolve({ success: true }); },
     async openComposeWindowWithCustomizations(...args) {
       calls.opens.push(args);

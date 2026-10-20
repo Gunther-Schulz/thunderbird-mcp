@@ -48,8 +48,6 @@ function makeDirectSendPrefs(overrides = {}) {
 const clearOriginalRawFixture = {
   readBoundedRawMessage: () => "Content-Type: text/plain\r\n\r\nOriginal text",
   classifyRawMessageEncryption: () => "clear",
-  classifyMimeMessageEncryption: () => "clear",
-  completeDirectSendMime: mime => mime,
   isRawTopLevelMultipartSigned: () => false,
 };
 
