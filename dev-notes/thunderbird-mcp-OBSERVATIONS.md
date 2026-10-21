@@ -126,3 +126,43 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   entfernen → Neustart → XPI → Neustart) und die neuen Werkzeuge sieht
   erst eine NEUE Claude-Sitzung (CLAUDE.local.md). Drain: Eintrag schließt
   mit Commit-Ref je Punkt oder Verwurf mit Ein-Zeilen-Grund.
+- **Build status (2026-10-21, session_01N4YYTxL1NtXzteY3VpHBLZ):** built on
+  `feat/gui-backchannel`, base upstream v0.9.3 -- NOT `feat/edit-draft`: the
+  running add-on was upstream 0.9.2 (auto-updated 2026-10-02, api.js identical
+  to tag v0.9.2) and #194 is merged upstream, so that base would have
+  downgraded 136 commits. Every point red-first against upstream code.
+  1-3 listTabs / closeTabs / displayMessage read-back: `889fbcc`.
+  4 views closed before delete: `889fbcc`; before saveDraft replace: `c2db49e`.
+  The optional send hook is NOT built: the profile pref
+  `mail.close_message_window.on_delete` (dotfiles `6dfd707`, Probe 4) closes
+  the tab on send/delete already; a global send observer for a case closed by
+  configuration is not worth its surface.
+  5 editDraft: `e882361`. 6 replace proven in Drafts: `c2db49e`.
+  7 complete raw source: extension `b16ba4e` (IMAP without Offline flag
+  streams from the server), bridge `3615872` (closing MIME boundary checked
+  before writing, size read back); saveMessage carried over from
+  feat/save-message as `4277523`, `f101aef`, test loader fix `8390fda`.
+  8 countOnly = listing, scoped search waits for folder sync: `5913b9f`.
+  OPEN until the live pairs ran (operator install + NEW session): per GUI verb
+  one pair; for 6 the field `previousDraft` (gone / marked-deleted / present)
+  settles WHY the predecessor survived on Kasserver.
+
+## 2026-10-21 -- deleteMessages reports success before an IMAP move to Trash has happened
+
+- **Incident + basis:** derived while fixing point 8 above (countOnly 13 vs
+  listing 7 right after a delete), not measured. `deleteMessages` on a Drafts
+  folder calls `MailServices.copy.copyMessages(..., isMove=true, listener=null)`
+  and returns `{success, deleted}` at once (api.js `function deleteMessages`,
+  upstream v0.9.3); on IMAP the move is asynchronous, so a search issued right
+  after can still see the old rows. Inferred, unverified: whether this, the
+  count/listing asymmetry fixed in `5913b9f`, or plain DB staleness produced
+  the 13-vs-7.
+- **Class:** effect without a back channel (same class as the entry above) --
+  success reported from the submission, not from the folder.
+- **Pre-formulated fix:** pass a copy listener, await `onStopCopy` (bounded
+  timeout), then report `moveConfirmed: true|false`; never `deleted` without
+  it. Discriminating live probe first: delete one test draft, then
+  immediately `searchMessages(countOnly, folderPath=Drafts)` with the
+  `5913b9f` build -- a count still including the draft indicts this path.
+- **Consumer/drain:** the next build session on this repo, after the live
+  pairs of the entry above; drain by commit ref or a one-line drop.
