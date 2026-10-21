@@ -11,7 +11,7 @@ const {
   SAVE_MESSAGE_TOOL,
   SAVE_ROOT_ENV,
   saveMessageToDisk,
-} = require('../mcp-bridge.cjs');
+} = require('./helpers/bridge.cjs');
 
 // The tool is opt-in, so every test that expects it to do anything has to turn
 // it on explicitly. Passing env per call (rather than mutating process.env)
