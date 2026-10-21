@@ -6,6 +6,13 @@ Backlog-Retirement-Quote.)
 
 ## 2026-08-19 — rawSource als .eml-Ersatz flutet den Agent-Kontext; das richtige Verb (saveMessage) ist gated und für Sessions unsichtbar
 
+- **Disposition: DONE 2026-10-21.** (a) settled in practice: pbs-mail-poll
+  starts its own bridge with THUNDERBIRD_MCP_SAVE_MESSAGE=1 and a SAVE_ROOT
+  on its intake tree (dotfiles bootstrap/pbs-mail-poll.py, bridge env);
+  interactive sessions stay gated. (b) built: the rawSource descriptions of
+  getMessage/getMessages point to saveMessage -- fork main `4a4f53f`, upstream
+  in #184 (`6bbd322`).
+
 - **Vorfall + Basis:** Session 25-07 B-Plan Bergen (Claude-Session
   `session_01M44JNCCKETVrjurJ8SShS8`): Um eine Angebots-Mail als
   .eml-Beleg abzulegen, zog die Session `getMessage(rawSource=true)` —
@@ -36,6 +43,11 @@ Backlog-Retirement-Quote.)
   beim Einbau oder Verwurf mit Ein-Zeilen-Begründung.
 
 ## 2026-08-19 — searchMessages liefert ungekappte recipients-Listen; eine Trefferzeile kann 5+ KB wiegen
+
+- **Disposition: DONE 2026-10-21.** Built as proposed: rows of
+  searchMessages and getRecentMessages show the first 3 addresses plus
+  "(+N more)", fullRecipients: true for the full lists, getMessage unchanged
+  -- upstream PR #260 (`78fd67d`), merged into fork main.
 
 - **Vorfall + Basis:** gleiche Session, Suche `Bergen` (maxResults 30): eine
   einzelne Antwort ~44 KB (~11k Token), dominiert von Newsletter-Treffern,
