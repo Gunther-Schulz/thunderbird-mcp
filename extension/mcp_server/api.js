@@ -10537,15 +10537,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const DRAFT_SYNC_TIMEOUT_MS = 15000;
             const DRAFT_MOVE_TIMEOUT_MS = 30000;
 
-            // "present", "marked-deleted" (IMAP \Deleted, awaiting expunge) or "gone".
-            function getStoredMessageState(folder, messageKey, messageId) {
+            // Where the replaced draft stands now: { state, hdr }. state is
+            // "present", "marked-deleted" (IMAP \Deleted, awaiting expunge),
+            // "gone", or "unknown" when the database could not be read -- which
+            // is never evidence that the draft was removed.
+            function readStoredMessage(folder, messageKey, messageId) {
               let hdr = null;
               try {
                 const db = folder.msgDatabase;
+                if (!db) return { state: "unknown", hdr: null };
                 if (db.containsKey(messageKey)) hdr = db.getMsgHdrForKey(messageKey);
-              } catch { /* no readable database entry */ }
-              if (!hdr || hdr.messageId !== messageId) return "gone";
-              return hdr.flags & Ci.nsMsgMessageFlags.IMAPDeleted ? "marked-deleted" : "present";
+                // A reassigned key (a rebuilt database, a UIDVALIDITY reset) can
+                // hold another message: look the draft up by Message-ID as well.
+                if (!hdr || hdr.messageId !== messageId) hdr = db.getMsgHdrForMessageID(messageId) || null;
+              } catch {
+                return { state: "unknown", hdr: null };
+              }
+              if (!hdr || hdr.messageId !== messageId) return { state: "gone", hdr: null };
+              return { state: hdr.flags & Ci.nsMsgMessageFlags.IMAPDeleted ? "marked-deleted" : "present", hdr };
             }
 
             function findStoredMessage(folder, messageId) {
@@ -10556,16 +10565,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             // Moves a draft to Trash the way deleteMessages does, and resolves
-            // once the copy service reports back (or the timeout passes).
+            // once the copy service reports back (or the timeout passes) with
+            // the route taken: "trash", or "delete" where no Trash folder exists
+            // (on IMAP that may only mark the draft deleted).
             function moveDraftToTrash(folder, hdr, timeoutMs = DRAFT_MOVE_TIMEOUT_MS) {
               return new Promise((resolve) => {
                 let settled = false;
+                let route = "delete";
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 const settle = () => {
                   if (settled) return;
                   settled = true;
                   try { timer.cancel(); } catch { /* already fired */ }
-                  resolve();
+                  resolve(route);
                 };
                 timer.initWithCallback({ notify: settle }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
                 const listener = {
@@ -10579,6 +10591,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   const trashFolder = findTrashFolder(folder);
                   if (trashFolder) {
+                    route = "trash";
                     MailServices.copy.copyMessages(folder, [hdr], trashFolder, true, listener, null, false);
                   } else {
                     folder.deleteMessages([hdr], null, false, true, listener, false);
@@ -10600,29 +10613,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             async function verifyDraftReplacement(folder, oldKey, oldMessageId, newMessageId) {
               const report = {};
-              if (!(await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS))) report.folderSyncConfirmed = false;
+              const synced = await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS);
+              if (!synced) report.folderSyncConfirmed = false;
               const newHdr = findStoredMessage(folder, newMessageId);
-              let previous = getStoredMessageState(folder, oldKey, oldMessageId);
-              if (!newHdr) {
+              let previous = readStoredMessage(folder, oldKey, oldMessageId);
+              // Without a confirmed sync the local database may not match the
+              // server, so it proves nothing and the old draft is not touched.
+              if (!newHdr || !synced) {
                 report.replaceVerified = false;
-                report.previousDraft = previous;
-                report.message = "Draft saved, but the new draft was not found in the Drafts folder; the previous draft was left untouched. Check Drafts before saving again.";
+                report.previousDraft = previous.state;
+                report.message = !synced
+                  ? "Draft saved, but the Drafts folder could not be synced with the server, so the replacement is unconfirmed; the previous draft was left untouched. Check Drafts before saving again."
+                  : "Draft saved, but the new draft was not found in the Drafts folder; the previous draft was left untouched. Check Drafts before saving again.";
                 return report;
               }
-              if (previous === "present") {
-                await moveDraftToTrash(folder, folder.msgDatabase.getMsgHdrForKey(oldKey));
-                await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS);
-                previous = getStoredMessageState(folder, oldKey, oldMessageId);
-                report.previousDraftMovedToTrash = previous !== "present";
+              if (previous.state === "present") {
+                const route = await moveDraftToTrash(folder, previous.hdr);
+                if (!(await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS))) report.folderSyncConfirmed = false;
+                previous = readStoredMessage(folder, oldKey, oldMessageId);
+                if (route === "trash" && previous.state === "gone" && report.folderSyncConfirmed !== false) {
+                  report.previousDraftMovedToTrash = true;
+                }
               }
-              report.previousDraft = previous;
-              report.replaceVerified = previous !== "present";
+              report.previousDraft = previous.state;
+              report.replaceVerified = (previous.state === "gone" || previous.state === "marked-deleted") &&
+                report.folderSyncConfirmed !== false;
               if (!report.replaceVerified) {
-                report.message = "Draft saved, but the previous draft is still in the Drafts folder and could not be moved to Trash";
+                report.message = previous.state === "present"
+                  ? "Draft saved, but the previous draft is still in the Drafts folder and could not be moved to Trash"
+                  : "Draft saved, but whether the previous draft is gone could not be confirmed. Check Drafts before saving again.";
               } else if (report.previousDraftMovedToTrash) {
                 report.message = "Draft replaced; Thunderbird had left the previous draft in place, so it was moved to Trash";
-              } else if (previous === "marked-deleted") {
-                report.message = "Draft replaced; the previous draft is marked deleted and disappears at the next expunge";
+              } else if (previous.state === "marked-deleted") {
+                report.message = "Draft replaced; the previous draft is marked deleted in the Drafts folder and disappears at the next expunge";
               } else {
                 report.message = "Draft replaced";
               }

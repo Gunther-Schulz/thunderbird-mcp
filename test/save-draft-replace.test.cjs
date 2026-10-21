@@ -24,29 +24,49 @@ const NEW_DRAFT_ID = "new-draft-id@example.test";
  * saving the new draft did on the server: store it (newStored) and what
  * happened to the replaced draft ("expunged", "marked-deleted", "kept").
  */
-function makeImapDrafts(calls, { newStored = true, oldOnServer = "expunged", moveRemovesOld = true, syncStatus = 0 } = {}) {
+function makeImapDrafts(calls, { newStored = true, oldOnServer = "expunged", moveRemovesOld = true, syncStatus = 0, syncStatuses = null, dbThrowsAfterSyncs = null } = {}) {
   const local = new Map();
   const server = new Map();
+  let syncCount = 0;
+  const database = {
+    containsKey: (key) => local.has(key),
+    getMsgHdrForKey: (key) => local.get(key) || null,
+    getMsgHdrForMessageID: (id) => [...local.values()].find(h => h.messageId === id) || null,
+  };
   const folder = {
     URI: DRAFTS_URI,
     server: { type: "imap" },
     getFlag(flag) { calls.flags.push(flag); return true; },
-    msgDatabase: {
-      containsKey: (key) => local.has(key),
-      getMsgHdrForKey: (key) => local.get(key) || null,
-      getMsgHdrForMessageID: (id) => [...local.values()].find(h => h.messageId === id) || null,
+    get msgDatabase() {
+      if (dbThrowsAfterSyncs !== null && syncCount >= dbThrowsAfterSyncs) throw new Error("database is being rebuilt");
+      return database;
     },
     updateFolderWithListener(_window, listener) {
       calls.syncs++;
-      local.clear();
-      for (const [key, h] of server) local.set(key, { ...h });
-      listener.OnStopRunningUrl(null, syncStatus);
+      const status = syncStatuses ? syncStatuses[syncCount] ?? 0 : syncStatus;
+      syncCount++;
+      if (status === 0) {
+        local.clear();
+        for (const [key, h] of server) local.set(key, { ...h });
+      }
+      listener.OnStopRunningUrl(null, status);
+    },
+    // No-Trash removal: on an IMAP "mark as deleted" account it only flags.
+    deleteMessages(hdrs, _window, _deleteStorage, _isMove, listener) {
+      calls.deletes = (calls.deletes || 0) + 1;
+      for (const h of hdrs) server.get(h.messageKey).flags |= Ci.nsMsgMessageFlags.IMAPDeleted;
+      listener.onStopCopy(0);
     },
     store(hdr) { local.set(hdr.messageKey, hdr); server.set(hdr.messageKey, { ...hdr }); },
     applySave() {
       if (newStored) server.set(2, { messageKey: 2, messageId: NEW_DRAFT_ID, flags: 0 });
       if (oldOnServer === "expunged") server.delete(1);
       if (oldOnServer === "marked-deleted") server.get(1).flags |= Ci.nsMsgMessageFlags.IMAPDeleted;
+      if (oldOnServer === "rekeyed") {
+        // The old draft survives under a new key; its old key now holds another message.
+        server.set(7, { ...server.get(1), messageKey: 7 });
+        server.set(1, { messageKey: 1, messageId: "unrelated@example.test", flags: 0 });
+      }
     },
     applyMove(key) { if (moveRemovesOld) server.delete(key); },
   };
@@ -227,10 +247,49 @@ describe("saveDraft replacement is proven in the Drafts folder", () => {
     assert.match(result.message, /still in the Drafts folder/);
   });
 
-  it("flags an unconfirmed folder sync", async () => {
-    const { save } = loadDraftTools({ store: { syncStatus: 0x80004005 } });
+  it("treats an unconfirmed folder sync as no proof and leaves the predecessor untouched", async () => {
+    const { save, calls } = loadDraftTools({ store: { syncStatus: 0x80004005, oldOnServer: "kept" } });
+    const result = await save();
+    assert.equal(result.success, true);
+    assert.equal(result.folderSyncConfirmed, false);
+    assert.equal(result.replaceVerified, false);
+    assert.match(result.message, /could not be synced .* unconfirmed/);
+    assert.equal(calls.moves.length, 0);
+  });
+
+  it("does not report a move to Trash when, without a Trash folder, the draft was only marked deleted", async () => {
+    const { save, calls } = loadDraftTools({ noTrash: true, store: { oldOnServer: "kept" } });
+    const result = await save();
+    assert.equal(calls.deletes, 1);
+    assert.equal(result.previousDraft, "marked-deleted");
+    assert.equal(result.previousDraftMovedToTrash, undefined);
+    assert.doesNotMatch(result.message, /Trash/);
+    assert.match(result.message, /marked deleted in the Drafts folder/);
+  });
+
+  it("never reads an unreadable database as the predecessor being gone", async () => {
+    const { save } = loadDraftTools({ store: { oldOnServer: "kept", dbThrowsAfterSyncs: 2 } });
+    const result = await save();
+    assert.equal(result.previousDraft, "unknown");
+    assert.equal(result.replaceVerified, false);
+    assert.equal(result.previousDraftMovedToTrash, undefined);
+    assert.match(result.message, /could not be confirmed/);
+  });
+
+  it("finds a predecessor whose key was reassigned and moves that one, not the key's new occupant", async () => {
+    const { save, calls } = loadDraftTools({ store: { oldOnServer: "rekeyed" } });
+    const result = await save();
+    assert.deepEqual(calls.moves.map(m => m.keys[0]), [7]);
+    assert.equal(result.previousDraftMovedToTrash, true);
+    assert.equal(result.replaceVerified, true);
+  });
+
+  it("does not confirm a move whose follow-up sync failed", async () => {
+    const { save } = loadDraftTools({ store: { oldOnServer: "kept", syncStatuses: [0, 0x80004005] } });
     const result = await save();
     assert.equal(result.folderSyncConfirmed, false);
+    assert.equal(result.replaceVerified, false);
+    assert.equal(result.previousDraftMovedToTrash, undefined);
   });
 
   it("reports the new draft's Message-ID for plain saves without syncing", async () => {
