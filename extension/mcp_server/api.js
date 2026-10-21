@@ -2409,7 +2409,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "saveDraft",
         group: "messages", crud: "create",
         title: "Save Draft",
-        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Returns folderPath when the destination is accessible under account restrictions. Supports threading headers and replacing an existing draft in the selected identity's accessible Drafts folder. Includes the identity signature by default for new drafts, but not replacements.",
+        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Returns folderPath when the destination is accessible under account restrictions. Supports threading headers and replacing an existing draft in the selected identity's accessible Drafts folder. Returns the new draft's messageId. A replacement is verified in the Drafts folder: replaceVerified is true only once the new draft is stored and the previous one is gone (previousDraft: gone or marked-deleted); a previous draft Thunderbird left in place is moved to Trash (previousDraftMovedToTrash), but only after the new draft is confirmed. Message tabs showing the replaced draft are closed first (closedViews). Includes the identity signature by default for new drafts, but not replacements.",
         inputSchema: {
           type: "object",
           properties: {
@@ -3757,9 +3757,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * (not available on every supported Thunderbird), plus a timeout so
              * an update that never reports back cannot hang the tool call.
              * Local folders resolve at once: their database is the store.
+             *
+             * With attemptMs below timeoutMs the request is re-issued after each
+             * unanswered attempt: right after a draft save Thunderbird answers no
+             * update request for about ten seconds, and a request made in that
+             * window is never answered at all (measured live on IMAP 2026-10-21:
+             * two requests unanswered at t+0 s and t+5 s, the next answered in
+             * 0.04 s at t+10 s). A single long wait would never see an answer.
              */
-            function syncFolderDatabase(folder, timeoutMs) {
-              if (folder?.server?.type !== "imap") return Promise.resolve(true);
+            async function syncFolderDatabase(folder, timeoutMs, attemptMs = timeoutMs) {
+              if (folder?.server?.type !== "imap") return true;
+              for (let remaining = timeoutMs; remaining > 0; remaining -= attemptMs) {
+                if (await requestFolderUpdate(folder, Math.min(attemptMs, remaining))) return true;
+              }
+              return false;
+            }
+
+            function requestFolderUpdate(folder, timeoutMs) {
               return new Promise((resolve) => {
                 let settled = false;
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -10458,6 +10472,128 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END DRAFT HELPERS
 
+            // BEGIN DRAFT REPLACE VERIFICATION
+            // Re-issued every 3 s for up to 30 s: see syncFolderDatabase.
+            const DRAFT_SYNC_TIMEOUT_MS = 30000;
+            const DRAFT_SYNC_ATTEMPT_MS = 3000;
+            const DRAFT_MOVE_TIMEOUT_MS = 30000;
+
+            // Where the replaced draft stands now: { state, hdr }. state is
+            // "present", "marked-deleted" (IMAP \Deleted, awaiting expunge),
+            // "gone", or "unknown" when the database could not be read -- which
+            // is never evidence that the draft was removed.
+            function readStoredMessage(folder, messageKey, messageId) {
+              let hdr = null;
+              try {
+                const db = folder.msgDatabase;
+                if (!db) return { state: "unknown", hdr: null };
+                if (db.containsKey(messageKey)) hdr = db.getMsgHdrForKey(messageKey);
+                // A reassigned key (a rebuilt database, a UIDVALIDITY reset) can
+                // hold another message: look the draft up by Message-ID as well.
+                if (!hdr || hdr.messageId !== messageId) hdr = db.getMsgHdrForMessageID(messageId) || null;
+              } catch {
+                return { state: "unknown", hdr: null };
+              }
+              if (!hdr || hdr.messageId !== messageId) return { state: "gone", hdr: null };
+              return { state: hdr.flags & Ci.nsMsgMessageFlags.IMAPDeleted ? "marked-deleted" : "present", hdr };
+            }
+
+            function findStoredMessage(folder, messageId) {
+              if (!messageId) return null;
+              let hdr = null;
+              try { hdr = folder.msgDatabase.getMsgHdrForMessageID(messageId); } catch { /* not stored */ }
+              return hdr && !(hdr.flags & Ci.nsMsgMessageFlags.IMAPDeleted) ? hdr : null;
+            }
+
+            // Moves a draft to Trash the way deleteMessages does, and resolves
+            // once the copy service reports back (or the timeout passes) with
+            // the route taken: "trash", or "delete" where no Trash folder exists
+            // (on IMAP that may only mark the draft deleted).
+            function moveDraftToTrash(folder, hdr, timeoutMs = DRAFT_MOVE_TIMEOUT_MS) {
+              return new Promise((resolve) => {
+                let settled = false;
+                let route = "delete";
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                const settle = () => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer.cancel(); } catch { /* already fired */ }
+                  resolve(route);
+                };
+                timer.initWithCallback({ notify: settle }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                const listener = {
+                  QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+                  onStartCopy() {},
+                  onProgress() {},
+                  setMessageKey() {},
+                  getMessageId() {},
+                  onStopCopy: settle,
+                };
+                try {
+                  const trashFolder = findTrashFolder(folder);
+                  if (trashFolder) {
+                    route = "trash";
+                    MailServices.copy.copyMessages(folder, [hdr], trashFolder, true, listener, null, false);
+                  } else {
+                    folder.deleteMessages([hdr], null, false, true, listener, false);
+                  }
+                } catch {
+                  settle();
+                }
+              });
+            }
+
+            /**
+             * Proves a draft replacement in the Drafts folder itself: the new
+             * draft must be stored and the replaced one gone. Thunderbird drops
+             * the old draft only as a side effect of saving the new one, and on
+             * IMAP that has been observed to leave it in place five times in a
+             * row while the save reported success. A predecessor still present
+             * is therefore moved to Trash here -- but only once the new draft is
+             * confirmed, so a failed save never costs the previous version.
+             */
+            async function verifyDraftReplacement(folder, oldKey, oldMessageId, newMessageId) {
+              const report = {};
+              const synced = await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS, DRAFT_SYNC_ATTEMPT_MS);
+              if (!synced) report.folderSyncConfirmed = false;
+              const newHdr = findStoredMessage(folder, newMessageId);
+              let previous = readStoredMessage(folder, oldKey, oldMessageId);
+              // Without a confirmed sync the local database may not match the
+              // server, so it proves nothing and the old draft is not touched.
+              if (!newHdr || !synced) {
+                report.replaceVerified = false;
+                report.previousDraft = previous.state;
+                report.message = !synced
+                  ? "Draft saved, but the Drafts folder could not be synced with the server, so the replacement is unconfirmed; the previous draft was left untouched. Check Drafts before saving again."
+                  : "Draft saved, but the new draft was not found in the Drafts folder; the previous draft was left untouched. Check Drafts before saving again.";
+                return report;
+              }
+              if (previous.state === "present") {
+                const route = await moveDraftToTrash(folder, previous.hdr);
+                if (!(await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS, DRAFT_SYNC_ATTEMPT_MS))) report.folderSyncConfirmed = false;
+                previous = readStoredMessage(folder, oldKey, oldMessageId);
+                if (route === "trash" && previous.state === "gone" && report.folderSyncConfirmed !== false) {
+                  report.previousDraftMovedToTrash = true;
+                }
+              }
+              report.previousDraft = previous.state;
+              report.replaceVerified = (previous.state === "gone" || previous.state === "marked-deleted") &&
+                report.folderSyncConfirmed !== false;
+              if (!report.replaceVerified) {
+                report.message = previous.state === "present"
+                  ? "Draft saved, but the previous draft is still in the Drafts folder and could not be moved to Trash"
+                  : "Draft saved, but whether the previous draft is gone could not be confirmed. Check Drafts before saving again.";
+              } else if (report.previousDraftMovedToTrash) {
+                report.message = "Draft replaced; Thunderbird had left the previous draft in place, so it was moved to Trash";
+              } else if (previous.state === "marked-deleted") {
+                report.message = "Draft replaced; the previous draft is marked deleted in the Drafts folder and disappears at the next expunge";
+              } else {
+                report.message = "Draft replaced";
+              }
+              return report;
+            }
+            // END DRAFT REPLACE VERIFICATION
+
             /**
              * Saves a composed message to the identity's Drafts folder without
              * sending or opening a compose window. The destination folder is
@@ -10560,6 +10696,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 
+                // The replaced header may be invalid once Thunderbird drops it.
+                const oldKey = msgToReplace?.messageKey;
+                const oldMessageId = msgToReplace?.messageId;
+                // A view left on the replaced draft jumps to its neighbour.
+                const closedViews = msgToReplace ? closeViewsShowingMessages([msgToReplace]) : [];
+
                 return sendMessageDirectly(
                   composeFields,
                   msgComposeParams.identity,
@@ -10569,10 +10711,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   Ci.nsIMsgCompDeliverMode.SaveAsDraft,
                   useHtml ? "text/html" : "text/plain",
                   msgToReplace
-                ).then(result => {
+                ).then(async result => {
+                  if (closedViews.length > 0) result.closedViews = closedViews;
                   if (result.success) {
-                    let msg = msgToReplace ? "Draft replaced" : "Draft saved";
-                    result.message = msg;
+                    result.message = "Draft saved";
+                    // The send fills in the Message-ID it generated; search
+                    // results carry it without angle brackets.
+                    const newMessageId = String(composeFields.messageId || "").replace(/^<|>$/g, "");
+                    if (newMessageId) result.messageId = newMessageId;
+                    if (msgToReplace) {
+                      try {
+                        Object.assign(result, await verifyDraftReplacement(replaceFolder, oldKey, oldMessageId, newMessageId));
+                      } catch (e) {
+                        // The draft is saved; an error here would invite a duplicate retry.
+                        result.replaceVerified = false;
+                        result.message = `Draft saved, but the replacement could not be verified (${e.message || e}). Check Drafts before saving again.`;
+                      }
+                    }
 
                     // Thunderbird can populate the identity's folder during save.
                     // Report it only if accessible; lookup errors may contain a

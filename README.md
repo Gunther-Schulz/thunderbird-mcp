@@ -90,7 +90,7 @@ Structured MIME extraction keeps the first body's representation outside multipa
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
-| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers and reports an accessible Drafts folder |
+| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers, reports the new draft's `messageId` and an accessible Drafts folder. A replacement is verified in the Drafts folder (`replaceVerified`); a previous draft Thunderbird left in place is moved to Trash once the new one is confirmed |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
