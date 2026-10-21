@@ -3,7 +3,7 @@
 [![CI](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml)
 [![Tools](https://img.shields.io/badge/40_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
-[![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
+[![Thunderbird](https://img.shields.io/badge/Thunderbird-128%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
 
 Give your AI assistant full access to Thunderbird -- search mail, compose messages, manage filters, and organize your inbox. All through the [Model Context Protocol](https://modelcontextprotocol.io/).
@@ -20,7 +20,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 40 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
-Mail sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. **By default, nothing is sent or created without your review.**
+Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. While enabled, meetings with attendees other than the calendar user are read-only through MCP, and adding attendees is blocked: calendar servers can email invitations, updates, or cancellations without review. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
 ---
 
@@ -34,6 +34,8 @@ Mail sends and event/task creation require review by default because **Block `sk
 
 The Thunderbird extension embeds a local HTTP server with session-scoped auth tokens. The Node.js bridge translates between MCP's stdio protocol and HTTP, discovering the port and token automatically via a connection file. The bridge handles MCP lifecycle methods (initialize, ping) locally, so clients can connect even before Thunderbird is fully loaded.
 
+The bridge starts when executed directly or loaded by a desktop client's Node bootstrap. Tests or library consumers that only need its exports must set `THUNDERBIRD_MCP_NO_AUTOSTART=1` before requiring `mcp-bridge.cjs`.
+
 ---
 
 ## What you can do
@@ -43,30 +45,75 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | Tool | Description |
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
-| `listFolders` | Browse folder tree with message counts -- filter by account or subtree |
+| `listFolders` | Browse folder tree with message counts and `isFavorite` in object or table format. Filter by account, subtree, or `favoritesOnly: true`; favorites nested under ordinary folders are included. |
 | `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Multi-word queries are AND-of-tokens (every word must appear somewhere). Prefix with `from:`, `subject:`, `to:`, or `cc:` to restrict to one field. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. By default, `dedupByMessageId` collapses the same RFC Message-ID found in multiple folders/labels into one row and reports the other folder paths in `dupLocations`; set `dedupByMessageId: false` to return every location. |
 | `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Set `includeInlineImages: true` to append supported inline CID images as MCP image blocks (PNG, JPEG, GIF, or WebP; max 1 MiB base64 per image and 4 MiB total). Skipped images are reported in attachment metadata. |
 | `getMessages` | Read full email content for up to the configured batch limit in one call (default 10, max 20). Uses the same `bodyFormat`, `rawSource`, and attachment options as `getMessage`; each item supplies `messageId` and `folderPath`. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
-| `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
-| `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
-| `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
+| `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode. Reads back the opened view and reports `displayedMessageId`; a view showing another message is an error |
+| `listTabs` | List what the GUI shows right now: tabs, message windows, and compose windows with their message or draft IDs |
+| `closeTabs` | Close message tabs/windows by view ID or by message ID; reports views that stayed open |
+| `editDraft` | Open a saved draft directly in a compose window for review and sending (nothing is sent); focuses the window if the draft is already open |
+| `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
+| `deleteMessages` | Delete messages -- drafts are safely moved to Trash. Message tabs/windows showing a deleted message are closed first instead of jumping to a neighbouring message |
 | `createFolder` | Create new subfolders to organize your mail |
 | `renameFolder` | Rename an existing mail folder |
 | `deleteFolder` | Delete a folder (moves to Trash, or permanently deletes if already in Trash) |
 | `moveFolder` | Move a folder to a new parent within the same account |
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
+| `saveMessage` | Save a message's `.eml` and/or its attachments into a directory you choose (unlike `saveAttachments`, which is temp-dir only). Runs on the bridge, so the path is on the machine running the MCP. **Disabled unless `THUNDERBIRD_MCP_SAVE_MESSAGE=1`** -- see [Security](#security). |
+
+`searchMessages` scans cooperatively with a best-effort 20-second budget. Header searches count and sort collected matches before pagination, including those beyond 10,000; only the returned page loads full result fields. Counts and totals are best-effort when folders change during a long search, even if no truncation is reported. Unscoped searches still request an IMAP refresh for each visited folder, but results use the locally available cache. Opening a native database and taking its key snapshot are synchronous and cannot be interrupted by this budget.
+
+Message results remain a plain array when `offset` is omitted or null, including incomplete searches and `searchBody: true`. To receive completeness information, provide `offset: 0` (or another offset) for a paginated object. Only object responses can include `truncated: true` and a `message` explaining why; `countOnly` retains its existing object response and can also include these fields. Partial counts and `totalMatches` cover only observed matches, and date ordering covers only that subset. `hasMore` describes additional pages within the collected results and becomes false at their end, even if `truncated` is true; an empty returned page also sets it false. To improve coverage, narrow the folder, date range, or query (or set `includeSubfolders: false`).
+
+For `searchBody: true`, object responses are conservatively marked `truncated: true`: Gloda returns candidates ranked by relevance and exposes no reliable completeness indicator. It applies its limit before removing stale index rows, so even a short result can omit other matches. Plain-array responses carry no completeness information. Narrowing the text query improves coverage; use header search when header/preview matching is sufficient.
+
+`updateMessage` takes tag **keys**, not display labels: for example, `addTags: ["my=20project"]` uses a key generated for a label with a space. Keys must be non-empty printable ASCII without spaces, parentheses, brackets, braces, `%`, `*`, double quotes, backslashes, `<`, `>`, or `;`. This follows [Thunderbird's keyword handling](https://searchfox.org/comm-central/source/mailnews/imap/public/nsIImapService.idl), including its extra restrictions beyond [RFC 3501 atoms](https://www.rfc-editor.org/rfc/rfc3501#section-9). `=` and legacy modified UTF-7 keys containing `&` are accepted. Invalid entries in either `addTags` or `removeTags` fail the entire call with an error naming those entries before any messages are changed.
+
+Use `copyTo: "<destination folder URI>"` to copy without removing the original. On Gmail, copying from Sent Mail to a project folder adds that label while preserving Sent Mail and existing labels. `copyTo`, `moveTo`, and `trash: true` are mutually exclusive. Both source and destination must be accessible. Copies and moves within or across accounts use the same Thunderbird native copy service call. On IMAP, completion is asynchronous and later failures are not reported back; success means only that the operation was submitted, so verify the destination. Tags applied together with a copy or move may not transfer on IMAP; verify the destination tags as well.
+
+Message body formats (`getMessage` and `getMessages`):
+
+- `markdown` (default) converts HTML to visible structure, allowing only `http:`, `https:`, and `mailto:` link destinations. Other HTML links become their visible text. HTML images become alt text (or nothing); their source URLs are omitted. Text nodes and alt text escape backslashes, backticks, brackets, angle brackets, and `!` before `[` to prevent literal links, images, or raw HTML. A literal `!` immediately before a generated link is also escaped, including across element boundaries. Other punctuation (including underscores, asterisks, hashes, pipes, and tildes) is preserved; HTML code spans and blocks use code formatting.
+- For plain-text MIME bodies, `markdown` escapes Markdown image openers (`![`) while preserving the rest of the text, apart from the existing invisible-character removal. This also applies to coerced text and raw-MIME recovery. Other Markdown, links, and literal HTML in plain-text bodies are **not sanitized**; clients must disable raw HTML and remote-content loading when rendering untrusted message text.
+- `text` extracts visible text. Both text formats remove hidden HTML content and invisible control characters.
+- For `text` and `markdown`, HTML input over 2 MiB (UTF-8) is truncated at a Unicode character boundary before being parsed with the same HTML privacy rules. The output ends with `[Message body truncated at 2 MiB]`. Content after the cut is omitted; retained content keeps the normal formatting and link rules. Oversized compose fragments use the same capped parsing path. Encryption checks inspect the full source: oversized HTML containing `-----BEGIN PGP MESSAGE-----` anywhere is withheld unless encrypted-message access is enabled, even when the marker is only quoted in prose.
+- `html` returns the original HTML unchanged. It is **untrusted** and may contain hidden content, scripts, unsafe links, and remote images; clients must sanitize it before rendering. `rawSource: true` also remains unchanged.
+
+Structured MIME extraction keeps the first body's representation outside multipart/alternative and joins later fragments of that same type in message order, including after inline attachments. A footer of another type cannot replace the main body. Alternatives select the requested representation; attached text files are excluded using Thunderbird's attachment metadata. Encryption checks also classify the joined content before exposing it.
+
+`includeInlineImages: true` is a separate opt-in for supported inline CID images as MCP image blocks; it does not add image URLs to the Markdown body.
 
 ### Compose
 
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
-| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block |
+| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers, reports the new draft's `messageId` and an accessible Drafts folder. A replacement is verified in the Drafts folder (`replaceVerified`); a previous draft Thunderbird left in place is moved to Trash once the new one is confirmed |
+| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
-All compose tools open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference; only then can it send directly. Attachments can be file paths or inline base64 objects.
+`sendMail`, `replyToMessage`, and `forwardMessage` open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference. Direct sends are also subject to the encryption checks under [Send Safety](#access-control). Attachments can be file paths or inline base64 objects.
+
+Direct sends go through Thunderbird's compose pipeline without opening a window, so provider senders such as Owl apply. The selected identity's Reply-To, automatic Cc/Bcc, return receipt, delivery status notification (DSN), and vCard settings apply too. Automatic Cc/Bcc recipients are not listed in tool results.
+
+Unreviewed sends are never encrypted or cryptographically signed, including for identities set to sign by default. The text signature controlled by `includeSignature` is separate from cryptographic signing. Use `skipReview: false` for the review window, where Thunderbird applies its own encryption and signing decisions.
+
+Direct sends report success only after delivery succeeds, and Thunderbird marks originals replied or forwarded. If Thunderbird's 120-second send timeout expires, the outcome is unknown: check Sent and the Outbox before retrying. The bridge waits 150 seconds for direct sends and draft saves, and 30 seconds for other calls. A timeout or lost connection after submitting a mail operation also reports an unknown outcome; check Sent/Outbox for sends or Drafts for saves before retrying.
+
+An explicit `isHtml: true` or `false` selects HTML or plain-text composition. Omitted or `null` uses the identity's compose-format preference, treating the supplied body as plain text. Concurrent review calls keep their own bodies, recipients, and attachments. Native forward reviews open in sequence until each window is identified. If an opening fails or times out before identification, the queue recovers automatically when that window initializes or closes, or after a 15-second recovery period. Late windows are left untouched and cannot receive another call's content.
+
+`replyToMessage` accepts `saveAsDraft: true` to build a native reply with quoted text, the identity's signature and threading headers, save it, and close the compose window without sending. This requires the `saveDraft` tool to be enabled and cannot be combined with `skipReview`. Encrypted originals require the **Allow MCP clients to read encrypted messages** opt-in. Before saving, the current compose identity's configured destination must be accessible under account restrictions and carry the Drafts flag. A timeout returns `saveOutcome: "uncertain"`: the outstanding save may still complete, so check Drafts before retrying. Failures and timeouts restore the window's prior close and save-dialog behavior.
+
+`saveDraft` supports these optional parameters:
+
+- `inReplyTo`: one bracketed Message-ID such as `<original@example.com>`. `references`: up to 100 such IDs, oldest first, separated by single ASCII spaces. Each ID is limited to 998 characters and the full References value to 16,384. Missing brackets, extra tokens, whitespace inside IDs, and control characters (including CR/LF) are rejected, never repaired. References defaults to `inReplyTo` when omitted, and may also be supplied independently. The caller supplies the subject and quoted text.
+- `replaceMessageId` and `replaceFolderPath`: replace an existing draft with the supplied content. The folder must be accessible under account restrictions, carry Thunderbird's Drafts flag, and match the selected `from` identity's configured drafts folder. Other folders and missing messages are rejected before saving. Supply all fields and attachments you want retained; content is not merged from the old draft.
+- `includeSignature`: append the identity's signature, defaulting to `true` for a new draft and `false` for a replacement so re-saving a fetched draft does not duplicate its signature. Set it explicitly when needed. `sendMail` with `skipReview: true` accepts the same option, defaulting to `true`; review windows use Thunderbird's own signature preferences. The separator honors the identity's "suppress signature separator" setting and is omitted when a separator line already exists in the signature's plain-text rendition. Signature files are limited to 1 MiB; missing, unreadable, oversized, or image signature files are omitted without falling back to inline signature text.
+
+On success, `saveDraft` returns `folderPath` when Thunderbird exposes the destination and that folder is accessible under account restrictions. Otherwise the save still succeeds without disclosing the folder URI. It does not return the saved message's ID; look up the draft in the returned folder when available.
 
 Compose tools validate the `from` identity strictly -- if the specified sender doesn't match any configured Thunderbird identity, the tool returns an error instead of silently substituting another account.
 
@@ -79,9 +126,21 @@ Compose tools validate the `from` identity strictly -- if the specified sender d
 | `updateFilter` | Modify a filter's name, enabled state, conditions, or actions |
 | `deleteFilter` | Remove a filter by index |
 | `reorderFilters` | Change filter execution priority |
-| `applyFilters` | Run filters on a folder on demand -- let your AI organize your inbox |
+| `applyFilters` | Start eligible enabled Manual filters on a folder; report submitted rules and skipped rules with reasons |
 
-Full control over Thunderbird's message filters. Changes persist immediately. Your AI can create sorting rules, adjust priorities, and run them on existing mail.
+Your AI can create sorting rules, adjust priorities, and run them on existing mail. Changes persist after validation; all updates, including name or enabled-state edits, validate a complete candidate before replacing the existing rule. Unparseable rules cannot be updated, but can still be deleted. Filter names, conditions, and action text reject control characters (U+0000–U+001F and U+007F) and backslashes. Custom add-on actions cannot be created, preserved by an update, or submitted for execution.
+
+Date conditions accept only `YYYY-MM-DD` as a local calendar day; date-times are rejected. `listFilters` reports a lone native ALL term as `matchAll: true` with an empty `terms` array. Compound rules retain their terms and Boolean operators, including ALL terms; an empty rule is not reported as matching all messages.
+
+**Allow automatic Forward/Reply filter actions** is off by default in the extension settings. While off, `createFilter` and `updateFilter` reject any resulting rule containing Forward or Reply, including disabled rules or edits that retain an existing sending action. An update that only sets `enabled: false` can still disable a sending rule, and deletion remains available. Enabling this setting permits automatic sends without a compose review window, independently of **Block `skipReview`**. Turning it off does not disable saved filters or stop Thunderbird's own automatic filtering.
+
+The sending-action setting governs rules MCP creates, modifies, or runs manually. Reordering or deleting a rule containing `StopExecution` can change which of your existing rules Thunderbird runs automatically, including Forward/Reply rules.
+
+Move/Copy destinations must remain accessible under the current account restrictions, including actions retained by an update. An update that only sets `enabled: false`, or deletion, remains available for rules with inaccessible destinations.
+
+New or replaced Move/Copy actions store the resolved folder's canonical URI, including when the supplied URI uses another accepted spelling.
+
+`applyFilters` submits only enabled, parseable rules with the Manual type flag and skips rules with inaccessible or Outbox Move/Copy destinations, rules with address book conditions while address books are restricted, and Forward/Reply rules while the setting is off. It returns `submittedFilters`, submitted rule names, and skipped rule names with reasons. An eligible rule containing a Custom action rejects the call before any rule is submitted. A successful submission means processing has started, not completed; if no rules are eligible, nothing is submitted.
 
 ### Contacts
 
@@ -97,14 +156,30 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 
 | Tool | Description |
 |------|-------------|
-| `listCalendars` | List all calendars with read-only, event, and task support flags |
-| `createEvent` | Create a calendar event -- opens a review dialog; direct creation via `skipReview` requires explicitly disabling the default safety block. Accepts `status: tentative \| confirmed \| cancelled` (VEVENT STATUS per iCal RFC 5545). |
-| `listEvents` | Query events by date range with recurring event expansion. Returns `status` on each event. |
-| `updateEvent` | Modify an event's title, dates, location, description, or `status` |
-| `deleteEvent` | Delete a calendar event by ID |
+| `listCalendars` | List all calendars with disabled, read-only, event, and task support flags |
+| `createEvent` | Create an event through a review dialog, optionally with RRULE recurrence. Direct creation and non-empty `attendees` require disabling **Block `skipReview`**. Accepts `status: tentative \| confirmed \| cancelled`. |
+| `listEvents` | Query events by date range with bounded recurrence expansion. Returns a plain array capped at `maxResults`, including status, recurrence, organizer, attendees, and your participation status. Series that cannot be expanded return a master marked `recurrenceNotExpanded: true`. |
+| `updateEvent` | Modify an event or series; `recurrenceId` selects one occurrence. Meetings with other attendees are read-only while **Block `skipReview`** is on, even when `attendees` is omitted. |
+| `deleteEvent` | Delete an event or series; `recurrenceId` excludes one occurrence. Meetings with other attendees cannot be deleted while **Block `skipReview`** is on. |
 | `createTask` | Open a pre-filled task dialog for review; direct creation via `skipReview` requires explicitly disabling the default safety block |
 | `listTasks` | List tasks/to-dos from calendars -- filter by completion status, due date, or calendar |
 | `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
+
+`recurrence` accepts a single RRULE, such as `FREQ=WEEKLY;BYDAY=MO,TU` or `RRULE:FREQ=DAILY;COUNT=10`. The optional prefix is case-insensitive. Control characters (including CR/LF), malformed rules, `SECONDLY`/`MINUTELY`, and `HOURLY` on all-day events are rejected; Thunderbird's recurrence parser validates the rule before saving. On update, `recurrence: ""` or `null` clears the rule. Replacing a rule discards existing EXDATEs and modified occurrences.
+
+Thunderbird creates the initial **Home** calendar disabled. Check `listCalendars[].disabled` and enable the calendar in Thunderbird's calendar properties before using it. Event and task tools report an error for an explicitly selected disabled calendar; listings and default direct creation use enabled calendars, and report an error if all calendars are disabled. MCP leaves the enabled/disabled setting unchanged.
+
+Use the `recurrenceId` returned by `listEvents` to update or delete one occurrence. Omitted or null IDs select the series; a non-null ID cannot be combined with `recurrence` on update. All-day occurrence IDs preserve their calendar date across timezones. Existing Date-compatible inputs remain accepted for event start/end dates; ISO 8601 is recommended.
+
+Attendees use `{ "email": "alice@example.com", "name": "Alice", "role": "optional" }`; new attendees default to `required`, and a `mailto:` email prefix is accepted. Email addresses must be single mailboxes without control characters or URI headers; names cannot contain control characters either. On update, omitted/null attendees preserve the list, while `[]` removes everyone. Retained attendees match by case-insensitive email and keep their participation status and provider metadata. Only supplied name/role fields change; omitted/null fields preserve existing values, and an empty name clears it. New attendees start with `NEEDS-ACTION`.
+
+Attendee management requires the calendar identity to match an existing organizer. Existing organizers are preserved; a missing organizer is initialized from the calendar identity, which may also set a missing calendar `organizerId` property. Creation with non-empty attendees requires disabling **Block `skipReview`**, even when `skipReview` is false: Exchange/Owl or CalDAV may email invitations containing the event title and description without review.
+
+`listEvents` returns a plain array, capped at `maxResults` (default 100, maximum 500). RRULE generation is limited to `maxResults + 1` candidates per series (hard ceiling 501) and 5,000 per request before expansion can allocate an unbounded occurrence array. Generation limits can leave fewer than `maxResults` results even when more occurrences exist, especially when exclusions remove generated candidates. Use narrower date ranges to reduce this effect.
+
+If a series cannot be expanded safely with a bounded count, expansion fails, or the shared generation budget is exhausted before that series, its master is included once with `recurrenceNotExpanded: true`, subject to the same output cap. This includes EXRULE series: incomplete exclusion expansion could expose excluded dates, so their rules are not expanded. A flagged master carries the series' original dates, which may be outside the requested range; it does not represent a matching occurrence. Ordinary EXDATEs and modified occurrences remain supported during bounded expansion.
+
+Each event includes `organizer: { id, commonName }`, up to 100 `attendees`, `attendeeCount` with the full count, and `myParticipationStatus` (empty when unavailable). Do not use a truncated attendee list as an update replacement, since that would remove the omitted attendees.
 
 ### Access Control
 
@@ -114,7 +189,19 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
-The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`; their review window or dialog still opens normally. `skipReview` is honored only after you explicitly disable this preference.
+The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`. It also blocks adding attendees and makes meetings with attendees other than the calendar user read-only through MCP: `updateEvent` and `deleteEvent` reject every write, including time/description/recurrence edits, attendee removal, and occurrence deletion, even when `attendees` is omitted. Occurrence writes check both the series and selected occurrence; series writes also check stored exceptions. Events without attendees and events whose only attendee is the identified calendar user remain editable. If the calendar identity cannot be established, existing attendees cannot be treated as self-only. Disabling the setting permits these writes, which may email updates or cancellations without review. Event/task creation review dialogs remain available without attendees.
+
+Even with **Block `skipReview`** disabled, unreviewed mail is refused before native composition when:
+
+- The sending identity's effective encryption policy is greater than zero, or its encryption settings cannot be read reliably. An absent identity policy inherits Thunderbird's default identity policy.
+- Thunderbird's automatic encryption setting (`mail.e2ee.auto_enable`) is on and the identity has an OpenPGP key or S/MIME encryption certificate configured. An unreadable automatic encryption setting also refuses for those identities; identities without a key or certificate are unaffected by that setting.
+- A reply or forward's original is encrypted or protected, including opaque-signed S/MIME, or its MIME classification is missing or unknown. This check never requests decryption and applies even when encrypted-message reads are enabled. Clear-signed mail remains allowed when the existing MIME checks establish that its contents are clear.
+
+These refusals direct callers to `skipReview: false`, where Thunderbird applies its own encryption in the review window. The checks do not reproduce every compose-window encryption decision. Signing by default, attaching a public key, draft encryption, and subject protection settings alone do not cause refusals. Review windows, `saveDraft`, and `replyToMessage(saveAsDraft: true)` retain their existing behavior, including the automatic reply draft's encrypted-message privacy gate.
+
+For an unreviewed reply or forward, the complete stored original must pass raw MIME checks before Thunderbird's structured parser runs. Preflight retrieves uncached IMAP originals as raw bytes without MIME conversion, allows at most 50 MiB of raw MIME and 50 MiB of structured body text, and refuses HTML above the existing 2 MiB parsing limit. If retrieval fails, use review or make the folder available offline and retry. Incomplete, truncated, oversized, or unclassifiable content requires review. Preflight has a 15-second deadline; a late parser callback cannot resume a refused call. Caller attachment files are accessed or created only after all encryption checks pass.
+
+The separate "Filter Send Actions" section controls **Allow automatic Forward/Reply filter actions**, which defaults to off. Only the user can change this preference in the settings page; MCP clients cannot enable it.
 
 ---
 
@@ -145,6 +232,20 @@ Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
 }
 ```
 
+#### Connecting HTTP-capable clients directly
+
+The extension serves MCP over HTTP itself (`POST /`: `initialize`, `tools/list`, `tools/call`, notifications), so clients that support HTTP transport can skip the bridge. Read the current `port` and `token` from `connection.json`, then replace `<port>` and `<token>` below:
+
+```bash
+claude mcp add --transport http thunderbird "http://127.0.0.1:<port>/" --header "Authorization: Bearer <token>"
+```
+
+- Read the port from `connection.json` after each server restart instead of pinning `8765`. The server tries ports 8765-8774; Options shows the selected port and a notice when it differs from the default.
+- A stable token can survive restarts, but does not make the port stable. On shared machines, use the stdio bridge with automatic discovery instead of a pinned port with a stable token.
+- Responses are plain JSON; there is no SSE stream and no `Mcp-Session-Id`, both optional in the Streamable HTTP spec.
+- Path attachments are then read by the extension itself, under the same attachment policy as the bridge, and inside the Snap/Flatpak sandbox where applicable (the bridge is what makes host paths work for sandboxed installs).
+- Keep this on localhost. For a client on another machine or container, prefer an SSH tunnel or a TLS proxy bound to loopback over "Listen on all interfaces": that mode is plain HTTP, so the token and mail content cross the network unencrypted.
+
 ### Sandbox-aware connection discovery
 
 The bridge re-discovers `connection.json` on every cache miss. It tries these locations in order:
@@ -153,9 +254,11 @@ The bridge re-discovers `connection.json` on every cache miss. It tries these lo
 2. Native temp dir: `<os.tmpdir()>/thunderbird-mcp/connection.json`
 3. macOS fallback: `/var/folders/*/*/T/thunderbird-mcp/connection.json` owned by the current user
 4. Linux Snap: Thunderbird's live `TMPDIR` from `/proc/<pid>/environ`, plus the official snap fallback under `~/Downloads/thunderbird.tmp`
-5. Linux Flatpak / Betterbird Flatpak: `$XDG_RUNTIME_DIR/app/*/thunderbird-mcp/connection.json`
+5. Linux Flatpak / Betterbird Flatpak: `$XDG_RUNTIME_DIR/app/<id>/thunderbird-mcp/connection.json` and `~/.var/app/<id>/cache/tmp/thunderbird-mcp/connection.json`
 
-This covers native installs, the official Thunderbird snap, Thunderbird Flatpak, Thunderbird Beta Flatpak, and Betterbird Flatpak without changing the extension side. If multiple sandbox candidates exist at once, the bridge tries the newest file first. Set `THUNDERBIRD_MCP_CONNECTION_FILE` to force a single explicit path.
+This covers native installs, the official Thunderbird snap, Thunderbird Flatpak, Thunderbird Beta Flatpak, and Betterbird Flatpak without changing the extension side. If multiple sandbox candidates exist at once, the bridge tries the newest file first. Flatpak discovery accepts only these application IDs: `org.mozilla.Thunderbird`, `org.mozilla.thunderbird`, `org.mozilla.thunderbird_esr`, `net.thunderbird.Thunderbird`, and `eu.betterbird.Betterbird`. Set `THUNDERBIRD_MCP_CONNECTION_FILE` to force a single explicit path.
+
+Every connection file, including an explicit pin, must be a regular file of at most 4 KiB with a valid port and token. On Linux and macOS it must also belong to the bridge's user, have no group/other permissions (normally `0600`), and must not be a symlink. Rejected files are reported, never repaired or deleted. An invalid explicit pin does not fall back to discovery.
 
 Example override:
 
@@ -177,14 +280,43 @@ That's it. Your AI can now access Thunderbird.
 
 ---
 
+### Outgoing attachments
+
+For `sendMail`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attachments` as a JSON array, not a JSON-encoded string. The stdio bridge reads file-path attachments on the host and sends inline base64 to Thunderbird. The existing bridge limit is **18 MiB per path attachment**, now also applied to `saveDraft`. The extension's direct-HTTP path limit remains 50 MiB; inline base64 remains limited to 25 MiB of encoded data. Both transports enforce at most 20 attachments and 50 MiB of decoded attachments per operation.
+
+UNC/network and device paths, dotfiles and dot-directories, application-data directories (Windows `AppData` and the macOS home `Library`), and credential/key filenames are refused. Windows alternate data streams and path components ending in dots or spaces are also refused. Files exported by `getMessage(saveAttachments: true)` can still be attached again, and ordinary local document paths continue to work. If any attachment is refused, missing, invalid, or over a limit, the entire operation fails before sending, saving a draft, or opening a review window. The error identifies refused entries; temporary files created during the failed conversion are removed. Callers that previously relied on partial attachment success must handle this error explicitly.
+
+Files in hidden or application-data folders, including macOS `~/Library` and its cloud folders, must be copied to an ordinary folder before they can be attached by path.
+
+External attachment links, including attachments removed with Thunderbird's **Detach** command and RSS/Atom feed enclosures, are refused by `getMessage` with `saveAttachments: true`, which reports "External attachment link refused" for the affected attachment. `includeInlineImages` also refuses them unless it can read a stored message part. A direct forward (`forwardMessage` with `skipReview: true`) is refused if the original includes one. Attachments stored in the message, including those from Exchange accounts, continue to work. A forward opened for review (`skipReview: false`) is built by Thunderbird and shows its attachments in the compose window.
+
 ## Security
 
 - **Auth tokens**: The HTTP server requires a session-scoped bearer token. Generated on startup, written to `<TmpD>/thunderbird-mcp/connection.json` with 0600 permissions. The bridge re-discovers that file automatically across native installs, Snap, Flatpak, Betterbird Flatpak, and macOS temp directories.
+- **Stable tokens**: Optional stable tokens persist across restarts. The stored token is cleared on uninstall only while the add-on is enabled (best effort). If you disable the add-on before uninstalling, regenerate the token before using it again.
 - **Dynamic port**: Tries ports 8765-8774, records the actual port in the connection file. No hardcoded port dependency.
-- **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately.
+- **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately. A corrupt stored setting is shown as blocked, and saving it unchanged does not lift the restriction.
+- **Calendars and address books under account restrictions**: While any account restriction is active, calendar and address-book tools (listing, lookups by ID, and writes) are blocked unless you enable "Allow all calendars" or "Allow all address books" in the settings page. Both are off by default and grant access to all calendars or all address books respectively. Without an account restriction, calendars and address books behave as before.
 - **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
+- **Encrypted-message access**: "Allow MCP clients to read encrypted messages" is off by default. It gates full-message bodies, attachments, inline images, raw-source reads, and automatic reply drafts; Thunderbird may still decrypt S/MIME locally. Enabling it does not permit unreviewed replies or forwards of encrypted or protected originals: use `skipReview: false` for those operations. Opaque-signed S/MIME messages are also withheld while this setting is off. Clear-signed mail (`multipart/signed` with an OpenPGP or S/MIME detached signature) is not encrypted and stays readable. When Thunderbird hides such a message's signed parts as encrypted, the extension reads it from the stored message instead and never asks Thunderbird to decrypt; the message is withheld if anything inside the signature is encrypted, and a direct forward of it is refused when it has attachments. While it is off, `searchMessages` and `getRecentMessages` return the outer subject without a preview for messages Thunderbird has recorded as OpenPGP-encrypted, searches (including `searchBody`) do not match them, and `displayMessage` refuses encrypted messages. This relies on Thunderbird's recorded OpenPGP status, so a message decrypted without that status being recorded may still show a cached decrypted subject. Thunderbird has no reliable encryption signal on every message header: OpenPGP's `enigmail` property is cached display status, while S/MIME's URI registry only tracks currently displayed decrypted messages. In particular, OpenPGP can [update a protected subject during background processing](https://searchfox.org/comm-central/source/mail/extensions/openpgp/content/modules/mimeDecrypt.sys.mjs#563) without the display callback that records that property; the [S/MIME registry is scoped to the current display](https://searchfox.org/comm-central/source/mailnews/base/public/nsIEncryptedMsgURIsService.idl).
 - **Localhost only**: By default, the server binds to localhost only. The "Listen on all interfaces" option in settings binds to all IPv4 interfaces for WSL, Docker, or remote access. **This exposes the MCP server to every device on your local network.** Only enable on trusted networks. Auth token is always required.
 - **Auto-update integrity**: Auto-update is a code-delivery channel whose integrity depends on continued control of the GitHub repository, the GitHub Actions token, and the `tomaszkasperczyk.name` registration.
+- **Filesystem writes are opt-in**: `saveMessage` writes caller-named files to a caller-named directory, which is an arbitrary-write primitive in the hands of whatever drives the MCP -- a prompt-injected tool call could aim it at `~/.bashrc`, `~/.ssh/`, or an autostart entry. It is therefore off by default: hidden from `tools/list` and refused at dispatch unless `THUNDERBIRD_MCP_SAVE_MESSAGE=1` is set in the MCP server environment. Set `THUNDERBIRD_MCP_SAVE_ROOT=/path/to/dir` as well to confine every write inside one directory; destinations are resolved through symlinks before the check, so a link cannot escape the root. Saved files are created `0600` and new directories `0700`, and existing files are never written through a symlink.
+
+  ```json
+  {
+    "mcpServers": {
+      "thunderbird": {
+        "command": "npx",
+        "args": ["-y", "thunderbird-mcp"],
+        "env": {
+          "THUNDERBIRD_MCP_SAVE_MESSAGE": "1",
+          "THUNDERBIRD_MCP_SAVE_ROOT": "/home/you/Documents/mail-exports"
+        }
+      }
+    }
+  }
+  ```
 
 ---
 
@@ -195,14 +327,25 @@ That's it. Your AI can now access Thunderbird.
 | Extension not loading | Check Tools > Add-ons and Themes. Errors: Tools > Developer Tools > Error Console |
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
 | Bridge can't find `connection.json` | Set `THUNDERBIRD_MCP_CONNECTION_FILE` explicitly if your environment uses a non-standard temp/runtime path |
+| Server uses a port other than 8765 | Check Options or read `port` from `connection.json`; update direct HTTP clients to that port. The stdio bridge discovers it automatically. |
+| AnkiConnect and Thunderbird MCP conflict | AnkiConnect also defaults to `127.0.0.1:8765`. Start Anki/AnkiConnect before Thunderbird so MCP can choose another port, then use the recorded MCP port or the stdio bridge. |
+| Bridge reports that a port is not answered by Thunderbird MCP | Check the server's current port in Options and `connection.json`, and whether another application is using that port. Reconnect the client after correcting its configuration. |
 | Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
 | `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
 | `rawSource` fails on IMAP | Requires local/offline message copy. Enable offline sync or click the message first to cache it. |
 
+### Release channel and Experiment API add-ons
+
+This add-on uses Thunderbird's Experiment APIs. The add-on team has [announced plans to disable them on the Release channel](https://thunderbird.topicbox.com/groups/addons/T5426c1d2b0ba520c); Thunderbird has since [reported a postponement](https://blog.thunderbird.net/2026/06/thunderbird-monthly-development-digest-june-2026/), so do not assume every Release version blocks them.
+
+If Thunderbird disables the add-on for this reason, use [Thunderbird ESR](https://www.thunderbird.net/thunderbird/all/) (Extended Support Release), which this add-on supports. It has been verified working on **140.16.0esr** and **153.3.1esr**. Check **Tools > Add-ons and Themes** to confirm the add-on is enabled, then open its Options page for the server status and any startup error.
+
 ---
 
 ## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build, isolated test, and pull request instructions.
 
 ```bash
 # Build the extension
@@ -223,7 +366,7 @@ curl -X POST http://127.0.0.1:$PORT \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-**Dev-only extension reload:** After changing extension source locally, remove the add-on from Thunderbird, restart, reinstall the XPI, and restart again. Thunderbird caches aggressively. Regular users should install v0.7.3 once and let auto-update handle later releases.
+**Dev-only extension reload:** After changing extension source locally, remove the add-on from Thunderbird, restart, reinstall the XPI, and restart again. Thunderbird caches aggressively. Regular users should install the latest release once and let auto-update handle later releases.
 
 ---
 
@@ -252,10 +395,9 @@ thunderbird-mcp/
 
 - IMAP folder databases can be stale until you click on them in Thunderbird
 - HTML-only emails are converted to plain text (original formatting is lost)
-- Recurring calendar event CRUD operates on the series, not individual occurrences
 - IMAP folder operations (rename, delete, move) are async -- verify with `listFolders` after
 - Combining tags with move/trash on IMAP may not preserve tags on the moved copy -- use separate calls
-- Pre-existing Thunderbird filters with cross-account move/copy targets are not restricted by account access control
+- Thunderbird itself still runs pre-existing filters with cross-account move/copy targets automatically; the MCP filter tools refuse to update such rules (except disabling or deleting them) and `applyFilters` skips them
 - `searchBody` on IMAP without offline sync only searches headers (Gloda limitation)
 - `rawSource` requires offline message copy for IMAP -- online-only messages will error
 
@@ -263,4 +405,4 @@ thunderbird-mcp/
 
 ## License
 
-MIT. The bundled `httpd.sys.mjs` is from Mozilla and licensed under MPL-2.0.
+This project uses the [MIT license](LICENSE). The bundled `extension/httpd.sys.mjs` is derived from Mozilla's HTTP server and remains under [MPL-2.0](https://mozilla.org/MPL/2.0/); its license notice is retained in the file.

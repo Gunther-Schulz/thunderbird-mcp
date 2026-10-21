@@ -6,26 +6,26 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-function loadConnectionInfoRefreshHelpers() {
+function loadConnectionInfoRefreshHelpers(overrides = {}) {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
-  const startMarker = "// BEGIN CONNECTION INFO REFRESH HELPERS";
-  const endMarker = "// END CONNECTION INFO REFRESH HELPERS";
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker);
-  assert.ok(start >= 0, "connection info refresh helper start marker missing");
-  assert.ok(end > start, "connection info refresh helper end marker missing");
-
-  const snippet = source.slice(start, end);
-  const sandbox = {};
+  const snippets = [];
+  for (const name of ["CONNECTION INFO REFRESH HELPERS", "CONNECTION INFO READER"]) {
+    const start = source.indexOf(`// BEGIN ${name}`);
+    const end = source.indexOf(`// END ${name}`, start);
+    assert.ok(start >= 0 && end > start, `Missing production marker: ${name}`);
+    snippets.push(source.slice(start, end));
+  }
+  const sandbox = { TextDecoder, ...overrides };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${snippet}
+    `${snippets.join("\n")}
 this.ensureFreshConnectionInfo = ensureFreshConnectionInfo;`,
     sandbox
   );
   return {
     ensureFreshConnectionInfo: sandbox.ensureFreshConnectionInfo,
+    readConnectionInfo: sandbox.readConnectionInfo,
   };
 }
 
@@ -42,6 +42,35 @@ function makeOptions(overrides) {
 }
 
 describe("connection info refresh decision", () => {
+  for (const profileRoots of [undefined, ["/profiles/Łukasz", "/profiles/郵件"]]) {
+    it(`reads UTF-8 connection data without unnecessary refresh: ${JSON.stringify(profileRoots)}`, () => {
+      const data = { port: 21000, token: "a".repeat(64), pid: 1234, profileRoots };
+      const bytes = Buffer.from(JSON.stringify(data), "utf8").toString("latin1");
+      let closed = false;
+      const file = { path: "/fixture/connection.json", append() {}, clone() { return this; }, exists: () => true };
+      const helpers = loadConnectionInfoRefreshHelpers({
+        Services: { dirsvc: { get: () => file } },
+        Ci: {},
+        Cc: {
+          "@mozilla.org/network/file-input-stream;1": { createInstance: () => ({ init() {} }) },
+          "@mozilla.org/scriptableinputstream;1": { createInstance: () => ({
+            init() {}, available: () => bytes.length,
+            read(length) { assert.equal(length, bytes.length); return bytes; },
+            close() { closed = true; },
+          }) },
+        },
+      });
+      const current = helpers.readConnectionInfo();
+      assert.deepEqual(JSON.parse(JSON.stringify(current.data)), JSON.parse(JSON.stringify(data)));
+      assert.equal(closed, true);
+      assert.equal(helpers.ensureFreshConnectionInfo({
+        port: data.port, token: data.token, expectedPid: data.pid, expectedProfileRoots: profileRoots,
+        readConnectionInfo: helpers.readConnectionInfo,
+        writeConnectionInfo() { assert.fail("Matching UTF-8 metadata must not cause a rewrite"); },
+      }), file.path);
+    });
+  }
+
   it("does not rewrite when connection.json already matches the running server", () => {
     const result = ensureFreshConnectionInfo(makeOptions({
       readConnectionInfo: () => ({
@@ -129,6 +158,47 @@ describe("connection info refresh decision", () => {
     assert.deepEqual(errors, [parseError]);
     assert.equal(writeCount, 1);
   });
+
+  const PROFILE_ROOTS = ["/profiles/current", "/storage/mail/current", "/config/thunderbird"];
+
+  it("does not rewrite when the profile metadata matches", () => {
+    const result = ensureFreshConnectionInfo(makeOptions({
+      expectedProfileRoots: PROFILE_ROOTS,
+      readConnectionInfo: () => ({
+        path: "/tmp/thunderbird-mcp/connection.json",
+        data: { port: 8765, token: "token", pid: 1234, profileRoots: [...PROFILE_ROOTS] },
+      }),
+      writeConnectionInfo() { assert.fail("Matching metadata must not cause a write"); },
+    }));
+
+    assert.equal(result, "/tmp/thunderbird-mcp/connection.json");
+  });
+
+  for (const [name, profileRoots] of [
+    ["missing", undefined],
+    ["stale", ["/profiles/old"]],
+    ["incomplete", PROFILE_ROOTS.slice(0, 1)],
+    ["malformed", PROFILE_ROOTS[0]],
+    ["null", null],
+  ]) {
+    it(`rewrites when profile metadata is ${name}`, () => {
+      const writes = [];
+      const result = ensureFreshConnectionInfo(makeOptions({
+        expectedProfileRoots: PROFILE_ROOTS,
+        readConnectionInfo: () => ({
+          path: "/tmp/thunderbird-mcp/connection.json",
+          data: { port: 8765, token: "token", pid: 1234, ...(profileRoots === undefined ? {} : { profileRoots }) },
+        }),
+        writeConnectionInfo(port, token) {
+          writes.push({ port, token });
+          return "/tmp/thunderbird-mcp/connection.json";
+        },
+      }));
+
+      assert.equal(result, "/tmp/thunderbird-mcp/connection.json");
+      assert.deepEqual(writes, [{ port: 8765, token: "token" }]);
+    });
+  }
 
   it("propagates write failures", () => {
     const writeError = new Error("disk full");

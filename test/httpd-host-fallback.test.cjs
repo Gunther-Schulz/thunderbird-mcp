@@ -163,4 +163,23 @@ describe("httpd Host header identity resolution", () => {
       port: 80,
     });
   });
+
+  it("rejects out-of-range ports before identity lookup in either mode", () => {
+    for (const boundHost of ["localhost", "0.0.0.0"]) {
+      const identity = makeIdentity({ boundHost });
+      identity.getScheme = () => assert.fail("malformed port reached ServerIdentity");
+      for (const host of ["localhost", "[::1]", "proxy.example"]) {
+        for (const port of ["65536", "99999", "9".repeat(400)]) {
+          assertBadRequest(resolveIdentityFromHostHeader(identity, `${host}:${port}`), "malformed");
+        }
+      }
+    }
+  });
+
+  it("accepts the upper port boundary", () => {
+    const identity = makeIdentity({ locations: [{ scheme: "http", host: "localhost", port: 65535 }] });
+    assertResolved(resolveIdentityFromHostHeader(identity, "localhost:65535"), {
+      scheme: "http", host: "localhost", port: 65535,
+    });
+  });
 });

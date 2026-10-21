@@ -31,3 +31,6 @@ scripts/default-profile
 node_modules/
 package-lock.json
 npm-debug.log*
+
+# Attachment-policy fixtures may fall back to the checkout on Windows.
+/tb-mcp-*/

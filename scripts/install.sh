@@ -25,12 +25,6 @@ profile_size() {
     du -sh "$profile_dir" 2>/dev/null | awk '{print $1}'
 }
 
-profile_name() {
-    local profile_dir="$1"
-
-    basename "$profile_dir"
-}
-
 platform_profile_roots() {
     case "$(uname -s)" in
     Darwin)
@@ -41,6 +35,7 @@ platform_profile_roots() {
     Linux)
         printf '%s\n' \
             "$HOME/.thunderbird" \
+            "$HOME/snap/thunderbird/common/.thunderbird" \
             "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
             "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
             "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
@@ -62,6 +57,7 @@ platform_profile_config_dirs() {
     Linux)
         printf '%s\n' \
             "$HOME/.thunderbird" \
+            "$HOME/snap/thunderbird/common/.thunderbird" \
             "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
             "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
             "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
@@ -282,7 +278,7 @@ select_profile() {
     for index in "${!profiles[@]}"; do
         printf '  %d) %s  size=%s  modified=%s\n' \
             "$((index + 1))" \
-            "$(profile_name "${profiles[$index]}")" \
+            "${profiles[$index]}" \
             "$(profile_size "${profiles[$index]}")" \
             "$(format_mtime "${profiles[$index]}")" >&2
     done

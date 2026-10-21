@@ -32,6 +32,7 @@
       margin-bottom: 8px;
     }
     .status-dot {
+      flex-shrink: 0;
       width: 10px;
       height: 10px;
       border-radius: 50%;
@@ -39,6 +40,7 @@
     }
     .status-dot.running { background: #30e60b; }
     .status-dot.stopped { background: #ff0039; }
+    #statusText { overflow-wrap: anywhere; }
     .info-label {
       color: #5b5b66;
       min-width: 110px;
@@ -190,12 +192,14 @@
   <h2>Server Status</h2>
   <div class="status-row">
     <span id="statusDot" class="status-dot stopped"></span>
-    <span id="statusText">Checking...</span>
+    <span id="statusText" role="status">Checking...</span>
+    <button id="retryServerBtn" type="button" hidden>Retry</button>
   </div>
   <div>
     <span class="info-label">Port:</span>
     <span id="serverPort" class="info-value">--</span>
   </div>
+  <p id="serverPortNotice" class="mode-note" hidden></p>
   <div>
     <span class="info-label">Connection file:</span>
     <span id="connFile" class="info-value">--</span>
@@ -213,7 +217,9 @@
     </li>
   </ul>
   <p class="mode-note" id="listenAllWarning" style="display:none; color: #d70022;">
-    Warning: this exposes the MCP server to every device on your local network. Enable only on trusted networks.
+    Warning: this exposes the MCP server to every device on your local network over plain HTTP.
+    The authentication token and mail content travel in clear text on the LAN and can be read by
+    anyone able to observe the traffic. Enable only on trusted networks.
   </p>
   <div class="save-row">
     <button id="saveListenAllBtn" disabled>Save</button>
@@ -224,7 +230,8 @@
 <div class="section">
   <h2>Account Access</h2>
   <p class="mode-note">
-    Select which accounts the MCP server can access. If none are checked, all accounts are accessible.
+    Select which accounts the MCP server can access. Saving a changed selection with all accounts
+    checked allows current and future accounts. Select at least one account before saving.
   </p>
   <ul id="accountList" class="account-list">
     <li>Loading...</li>
@@ -232,6 +239,53 @@
   <div class="save-row">
     <button id="saveBtn" disabled>Save</button>
     <span id="saveStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Privacy</h2>
+  <p class="mode-note">
+    Encrypted message bodies, attachments, and inline images are withheld from MCP clients by default.
+    Opaque-signed S/MIME messages are also withheld while encrypted message access is off.
+    Thunderbird may still decrypt S/MIME messages locally. Enabling encrypted message access exposes
+    decrypted content to MCP clients and their AI providers, and allows direct replies and forwards
+    when <code>skipReview</code> is permitted.
+    While it is off, search and recent-message tools show the outer subject without a preview for
+    messages Thunderbird has recorded as OpenPGP-encrypted, searches do not match them, and
+    displayMessage refuses encrypted messages. Thunderbird provides no reliable encryption marker for
+    all message headers, so some cached subjects may still contain decrypted protected headers.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowEncryptedMessages">
+        <span>Allow MCP clients to read encrypted messages</span>
+      </label>
+    </li>
+  </ul>
+  <p class="mode-note">
+    When mail account access is restricted, calendars and address books are blocked unless you
+    allow them below. These permissions allow access to all calendars or all address books,
+    including changes. With unrestricted mail account access, their behavior is unchanged.
+    These settings can only be changed here.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowAllCalendars">
+        <span>Allow all calendars</span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="allowAllAddressBooks">
+        <span>Allow all address books</span>
+      </label>
+    </li>
+  </ul>
+  <div class="save-row">
+    <button id="savePrivacyBtn" disabled>Save</button>
+    <span id="savePrivacyStatus" class="save-status"></span>
   </div>
 </div>
 
@@ -261,6 +315,8 @@
   <p class="mode-note warning-note">
     Stable token mode keeps the same token across restarts. If the connection file leaks,
     the token stays valid until you regenerate or clear it. Changes apply next time the MCP server starts.
+    The stored stable token is cleared on uninstall only while the add-on is enabled (best effort).
+    If you disable the add-on before uninstalling, regenerate the token before using it again.
   </p>
   <ul class="account-list">
     <li>
@@ -291,8 +347,12 @@
     This setting is enabled by default. While enabled, MCP clients requesting
     <code>skipReview: true</code> on sendMail, replyToMessage, forwardMessage,
     createEvent, or createTask are rejected; the review window or dialog remains
-    available. <code>skipReview</code> is honored only after you explicitly disable
-    this setting.
+    available. Adding event attendees is blocked. Events with attendees other
+    than the calendar user are read-only through MCP: updates and deletions,
+    including individual occurrences, are rejected even when attendees are
+    omitted from the request. Exchange/Owl or CalDAV may email invitations,
+    updates, or cancellations with the event title and description without
+    review. Disabling this setting allows these writes and <code>skipReview</code>.
   </p>
   <ul class="account-list">
     <li>
@@ -305,6 +365,32 @@
   <div class="save-row">
     <button id="saveSkipReviewBtn" disabled>Save</button>
     <span id="saveSkipReviewStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Filter Send Actions</h2>
+  <p class="mode-note">
+    Disabled by default. Enabling this lets MCP clients create, change, and run
+    filters that forward messages or reply from templates without a compose
+    review window. This setting is independent of Block <code>skipReview</code>.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowFilterSendActions" disabled>
+        <span>Allow automatic Forward/Reply filter actions</span>
+      </label>
+    </li>
+  </ul>
+  <p class="mode-note">
+    Turning this off does not disable saved filters or stop Thunderbird from
+    running them automatically. You can still disable or delete existing
+    Forward/Reply rules through MCP.
+  </p>
+  <div class="save-row">
+    <button id="saveFilterSendActionsBtn" disabled>Save</button>
+    <span id="saveFilterSendActionsStatus" class="save-status"></span>
   </div>
 </div>
 

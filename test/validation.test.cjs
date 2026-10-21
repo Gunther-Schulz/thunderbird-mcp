@@ -18,6 +18,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture } = require('./helpers/direct-send-prefs.cjs');
 
 const apiSource = fs.readFileSync(
   path.resolve(__dirname, '../extension/mcp_server/api.js'),
@@ -34,27 +35,56 @@ function getMarkedApiSnippet(startMarker, endMarker) {
 
 function loadProductionAttachmentValidation(overrides = {}) {
   const sandbox = {
+    ...clearOriginalRawFixture,
     getConfiguredGetMessagesLimit: () => 20,
+    _tempAttachFiles: new Set(),
+    _tempFileCounter: 0,
+    Cc: { '@mozilla.org/messengercompose/attachment;1': { createInstance: () => ({}) } },
+    Ci: {},
     ...overrides,
   };
   vm.createContext(sandbox);
   vm.runInContext([
     getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
+    getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
+    getMarkedApiSnippet('// BEGIN THUNDERBIRD PROFILE ROOTS', '// END THUNDERBIRD PROFILE ROOTS'),
+    getMarkedApiSnippet('// BEGIN NATIVE ATTACHMENT CONVERSION', '// END NATIVE ATTACHMENT CONVERSION'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND ENCRYPTION GUARD', '// END DIRECT SEND ENCRYPTION GUARD'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND ORIGINAL GUARD', '// END DIRECT SEND ORIGINAL GUARD'),
+    getMarkedApiSnippet('// BEGIN OUTBOUND MAIL TOOLS', '// END OUTBOUND MAIL TOOLS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
+    getMarkedApiSnippet('// BEGIN FILTER SEARCH TERM HELPERS', '// END FILTER SEARCH TERM HELPERS'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT CONVERSION', '// END OUTBOUND ATTACHMENT CONVERSION'),
+    getMarkedApiSnippet('// BEGIN ATTACHMENT EXPORT DIRECTORY', '// END ATTACHMENT EXPORT DIRECTORY'),
+    'Object.assign(this, { composeMail, saveDraft, replyToMessage, forwardMessage, isSensitiveFilePath, ensureAttachmentDir, descsToMsgAttachments, addAttachmentsToComposeWindow });',
     'this.isValidBase64 = isValidBase64;',
     'this.buildTools = buildTools;',
     'this.validateAgainstSchema = validateAgainstSchema;',
     'this.filePathsToAttachDescs = filePathsToAttachDescs;',
     'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
   ].join('\n'), sandbox);
+  if (sandbox.server) {
+    vm.runInContext([
+      getMarkedApiSnippet('// BEGIN INLINE IMAGE CONTENT HELPERS', '// END INLINE IMAGE CONTENT HELPERS'),
+      getMarkedApiSnippet('// BEGIN MCP TEXT SANITIZATION', '// END MCP TEXT SANITIZATION'),
+      getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'),
+      getMarkedApiSnippet('// BEGIN MCP HTTP HANDLER', '// END MCP HTTP HANDLER'),
+    ].join('\n'), sandbox);
+  }
   return sandbox;
 }
 
 const productionAttachmentValidation = loadProductionAttachmentValidation();
+
+const productionToolArgs = {
+  sendMail: { to: 'user@example.com', subject: 'test', body: 'hello' },
+  saveDraft: {},
+  replyToMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', body: 'hello' },
+  forwardMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', to: 'user@example.com' },
+};
 
 function validateProductionToolArgs(name, args) {
   const tool = productionAttachmentValidation.buildTools().find(t => t.name === name);
@@ -590,7 +620,16 @@ function makeMockLocalFile(attachmentPath, options = {}) {
   } = options;
   return {
     path: attachmentPath,
-    leafName: attachmentPath.split('/').pop(),
+    leafName: attachmentPath.split(/[\\/]/).pop(),
+    parent: options.parent || null,
+    clone() { return makeMockLocalFile(this.path, options); },
+    initWithPath(value) { this.path = value; },
+    isReadable() {
+      if (options.readError) throw options.readError;
+      this.resolved = true;
+      return true;
+    },
+    get target() { return this.resolved ? (options.target || this.path) : this.path; },
     exists() {
       return exists;
     },
@@ -620,7 +659,6 @@ function convertProductionFileAttachments(entries, files) {
       if (!file) throw new Error(`missing mock file: ${attachmentPath}`);
       return file;
     },
-    isSensitiveFilePath: () => false,
     Services: {
       io: {
         newFileURI: file => ({ spec: `file://${file.path}` }),
@@ -745,12 +783,7 @@ describe('Validation: attachment sending', () => {
     assert.match(errors[0], /must not be null/);
   });
 
-  const productionToolArgs = {
-    sendMail: { to: 'user@example.com', subject: 'test', body: 'hello' },
-    saveDraft: {},
-    replyToMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', body: 'hello' },
-    forwardMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', to: 'user@example.com' },
-  };
+
 
   for (const [toolName, requiredArgs] of Object.entries(productionToolArgs)) {
     it(`production ${toolName} schema rejects payload-less and empty inline attachments`, () => {
@@ -806,12 +839,9 @@ describe('Validation: attachment sending', () => {
   });
 
   it('production runtime rejects malformed base64 before decoding it', () => {
-    const result = productionAttachmentValidation.filePathsToAttachDescs([
+    assert.throws(() => productionAttachmentValidation.filePathsToAttachDescs([
       { name: 'garbage.bin', base64: '%%%%' },
-    ]);
-    assert.equal(result.descs.length, 0);
-    assert.equal(result.failed.length, 1);
-    assert.match(result.failed[0], /garbage\.bin \(invalid base64 data\)/);
+    ]), /garbage\.bin \(invalid base64 data\)/);
   });
 
   it('production schemas and runtime enforce the per-message attachment count cap', () => {
@@ -829,10 +859,8 @@ describe('Validation: attachment sending', () => {
     }
 
     const files = new Map(entries.map(entry => [entry, makeMockLocalFile(entry)]));
-    const { result } = convertProductionFileAttachments(entries, files);
-    assert.equal(result.descs.length, maxCount);
-    assert.equal(result.failed.length, 1);
-    assert.match(result.failed[0], new RegExp(`Attachment count ${maxCount + 1} exceeds the ${maxCount} attachment limit`));
+    assert.throws(() => convertProductionFileAttachments(entries, files),
+      new RegExp(`Attachment count ${maxCount + 1} exceeds the ${maxCount} attachment limit`));
   });
 
   it('production runtime enforces a 50MB aggregate attachment cap', () => {
@@ -843,12 +871,11 @@ describe('Validation: attachment sending', () => {
       [entries[1], makeMockLocalFile(entries[1], { size: 20 * mib })],
       [entries[2], makeMockLocalFile(entries[2], { size: 1 })],
     ]);
-    const { limits, result } = convertProductionFileAttachments(entries, files);
+    const { limits, result } = convertProductionFileAttachments(entries.slice(0, 2), files);
     assert.equal(limits.MAX_TOTAL_ATTACHMENT_BYTES, 50 * mib);
     assert.equal(result.descs.length, 2, 'attachments exactly at the aggregate cap should pass');
     assert.equal(result.descs.reduce((total, desc) => total + desc.size, 0), 50 * mib);
-    assert.equal(result.failed.length, 1);
-    assert.match(result.failed[0], /over\.bin \(exceeds 50MB aggregate attachment limit\)/);
+    assert.throws(() => convertProductionFileAttachments(entries, files), /over\.bin \(exceeds 50MB aggregate attachment limit\)/);
   });
 
   it('production runtime fails closed on normalization, type, and size checks', () => {
@@ -866,14 +893,14 @@ describe('Validation: attachment sending', () => {
       [entries[3], makeMockLocalFile(entries[3], { sizeError: new Error('stat failed') })],
       [entries[4], makeMockLocalFile(entries[4], { size: Number.NaN })],
     ]);
-    const { result } = convertProductionFileAttachments(entries, files);
-    assert.equal(result.descs.length, 0);
-    assert.equal(result.failed.length, entries.length);
-    assert.ok(result.failed.some(error => /normalize\.bin \(path normalization failed\)/.test(error)));
-    assert.ok(result.failed.some(error => /type\.bin \(file type check failed\)/.test(error)));
-    assert.ok(result.failed.some(error => /directory \(not a regular file\)/.test(error)));
-    assert.ok(result.failed.some(error => /size\.bin \(file size check failed\)/.test(error)));
-    assert.ok(result.failed.some(error => /invalid-size\.bin \(invalid file size\)/.test(error)));
+    assert.throws(() => convertProductionFileAttachments(entries, files), error => {
+      assert.match(error.message, /normalize\.bin \(path normalization failed\)/);
+      assert.match(error.message, /type\.bin \(file type check failed\)/);
+      assert.match(error.message, /directory \(not a regular file\)/);
+      assert.match(error.message, /size\.bin \(file size check failed\)/);
+      assert.match(error.message, /invalid-size\.bin \(invalid file size\)/);
+      return true;
+    });
   });
 
   it('production runtime rejects symlinks and fails closed when the check errors', () => {
@@ -883,13 +910,11 @@ describe('Validation: attachment sending', () => {
       [entries[1], makeMockLocalFile(entries[1], { symlinkError: new Error('check failed') })],
     ]);
 
-    const { result } = convertProductionFileAttachments(entries, files);
-
-    assert.equal(result.descs.length, 0);
-    assert.deepEqual(Array.from(result.failed), [
-      '/tmp/symlink.bin (symlinked path blocked)',
-      '/tmp/symlink-check.bin (symlink check failed)',
-    ]);
+    assert.throws(() => convertProductionFileAttachments(entries, files), error => {
+      assert.ok(error.message.includes('/tmp/symlink.bin (symlinked path blocked)'));
+      assert.ok(error.message.includes('/tmp/symlink-check.bin (symlink check failed)'));
+      return true;
+    });
   });
 });
 
@@ -1422,8 +1447,8 @@ describe('isSensitiveFilePath: benign paths pass through', () => {
     assert.equal(isSensitiveFilePath('/home/user/medical/pemphigus.txt'), false);
     // "etc" inside a path that doesn't start at /etc/
     assert.equal(isSensitiveFilePath('/home/user/etc-notes.md'), false);
-    // Profile-root names require a full path-component boundary.
-    assert.equal(isSensitiveFilePath('/home/user/.thunderbird-notes/report.txt'), false);
+    // All dot-directories are denied, including profile-like names.
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird-notes/report.txt'), true);
   });
 
   it('returns false on non-string / empty input rather than throwing', () => {
@@ -1445,5 +1470,662 @@ describe('isSensitiveFilePath: case insensitivity and slash normalization', () =
   it('treats backslashes and forward slashes as equivalent boundaries', () => {
     assert.equal(isSensitiveFilePath('C:/Users/x/.ssh/id_rsa'), true);
     assert.equal(isSensitiveFilePath('C:\\Users\\x\\.ssh\\id_rsa'), true);
+  });
+});
+
+// Regression: the previous STRICT_BASE64_PATTERN used a group quantifier
+// ((?:[...]{4})*) that pushed a backtrack frame per base64 quartet. On
+// SpiderMonkey (Thunderbird's engine) this threw "InternalError: too much
+// recursion" for inputs beyond a few hundred KB, so every real-world inline
+// attachment failed validation. The validator must stay character-class-only
+// (linear, no per-iteration backtrack frames) while keeping the exact
+// canonical RFC 4648 semantics. The recursion itself is engine-specific and
+// not reproducible on V8, so these tests pin the semantics and exercise a
+// multi-megabyte input through the exact production code path.
+describe('isValidBase64: canonical RFC 4648 semantics and large inputs', () => {
+  const { isValidBase64 } = productionAttachmentValidation;
+
+  it('accepts canonical base64 with and without padding', () => {
+    assert.equal(isValidBase64('AAAA'), true);
+    assert.equal(isValidBase64('ABCD'), true);
+    assert.equal(isValidBase64('AB=='), true);
+    assert.equal(isValidBase64('ABC='), true);
+    assert.equal(isValidBase64('ABCDAB=='), true);
+    assert.equal(isValidBase64('+/+/'), true);
+  });
+
+  it('rejects non-canonical shapes', () => {
+    assert.equal(isValidBase64(''), false);
+    assert.equal(isValidBase64('A'), false);
+    assert.equal(isValidBase64('AB'), false);
+    assert.equal(isValidBase64('ABC'), false);
+    assert.equal(isValidBase64('A==='), false);
+    assert.equal(isValidBase64('===='), false);
+    assert.equal(isValidBase64('AB=C'), false);
+    assert.equal(isValidBase64('=ABC'), false);
+    assert.equal(isValidBase64('ABCD=BCD'), false);
+    assert.equal(isValidBase64('AAA!'), false);
+    assert.equal(isValidBase64('AA A'), false);
+    assert.equal(isValidBase64('AAAA\n'), false);
+  });
+
+  it('rejects non-string values', () => {
+    assert.equal(isValidBase64(null), false);
+    assert.equal(isValidBase64(undefined), false);
+    assert.equal(isValidBase64(123), false);
+    assert.equal(isValidBase64({}), false);
+  });
+
+  it('validates a multi-megabyte attachment payload', () => {
+    const bytes = Buffer.alloc(5 * 1024 * 1024, 0x42);
+    const encoded = bytes.toString('base64');
+    assert.equal(isValidBase64(encoded), true);
+    assert.equal(isValidBase64(encoded.slice(0, -1) + '!'), false);
+  });
+});
+
+// Windows device names in any component, with or without an extension.
+const WINDOWS_RESERVED_NAME_PATHS = [
+  'C:\\Docs\\CON', 'C:\\Docs\\nul.txt', 'C:\\Docs\\Aux.tar.gz', 'C:\\Docs\\prn', 'C:\\Docs\\COM0',
+  'C:\\Docs\\com9.log', 'C:\\Docs\\LPT1', 'C:\\Docs\\lpt0.txt', 'C:\\Docs\\COM\u00b9', 'C:\\Docs\\com\u00b2.txt',
+  'C:\\Docs\\LPT\u00b3', 'C:\\Docs\\CONIN$', 'C:\\Docs\\conout$.txt', 'C:\\Docs\\con .txt', 'C:/aux/report.pdf',
+];
+// Windows short (8.3) name components outside the trusted temp prefix.
+const WINDOWS_SHORT_NAME_PATHS = [
+  'C:\\PROGRA~1\\report.pdf', 'C:\\Users\\ALICE~1\\Documents\\report.pdf',
+  'C:/Users/alice/Documents/REPORT~1.PDF', 'C:/Users/alice/Documents/REPOR~12',
+  'C:\\Users\\APPDAT~1\\report.pdf', 'C:\\Users\\alice\\SSH~1\\id', 'C:\\Users\\alice\\THUNDE~1\\report.pdf',
+  'C:\\Temp\\CONNEC~1.JSO', 'C:\\Docs\\ABCDE~12.TXT',
+];
+const WINDOWS_SHORT_TEMP = 'C:\\Users\\ALICE~1\\AppData\\Local\\Temp';
+
+describe('Attachment policy parity', () => {
+  const bridge = require('./helpers/bridge.cjs');
+  it('keeps the duplicated pattern lists and helpers identical', () => {
+    const bridgeSource = fs.readFileSync(path.resolve(__dirname, '../mcp-bridge.cjs'), 'utf8');
+    const patternList = /const SENSITIVE_ATTACHMENT_PATTERNS = \[[\s\S]*?\n\];/;
+    assert.equal(apiSource.match(patternList)[0], bridgeSource.match(patternList)[0]);
+    const helpers = /function getAttachmentExportPathInfo[\s\S]*?function isSensitiveFilePath[\s\S]*?\n}/;
+    assert.equal(apiSource.match(helpers)[0], bridgeSource.match(helpers)[0]);
+  });
+
+  for (const file of [
+    'C:\\Keys\\backup.pem::$DATA', 'C:\\Keys\\file.pem:stream', 'C:/Keys/secret.pem.',
+    'C:/Keys/secret.pem ', 'C:/Keys. /report.pdf', 'C:/Keys /report.pdf',
+    '.env', '/home/user/project/.env.local', '/home/user/.codex/auth.json',
+    '/home/user/.claude/.credentials.json', '/home/user/.git-credentials',
+    '/home/user/.bash_history', '/home/user/.zsh_history', '/home/user/.local/share/keyrings/login.keyring',
+    '/home/user/.hidden/report.pdf', '/Users/user/Library/Application Support/tool/auth.json',
+    'C:\\Users\\user\\AppData\\Local\\tool\\auth.json', '/tmp/private_key.txt', '/tmp/private-key',
+    '/tmp/id_custom', '/tmp/server.pem', '/tmp/private.key', '/tmp/a.p12', '/tmp/a.pfx', '/tmp/a.kdbx',
+    '/tmp/login.keychain-db', '/tmp/key4.db', '/tmp/logins.json', '/tmp/Web Data', '/tmp/Local State',
+    '/tmp/Login Data', '/tmp/signons.sqlite', '/tmp/prefs.js',
+    '/documents/server.ppk', '/documents/client.ovpn', '/documents/release.jks', '/documents/release.keystore',
+    '/documents/AuthKey.p8', '/documents/passwords.kdb', '/documents/wallet.dat',
+    '/home/user/snap/chromium/common/chromium/Default/Local Storage/data',
+    '\\\\server\\share\\file.txt', '//server/share/file.txt', '\\\\?\\C:\\file.txt', '\\\\.\\C:\\file.txt', '//?/C:/file.txt', '//./C:/file.txt',
+    ...WINDOWS_RESERVED_NAME_PATHS, ...WINDOWS_SHORT_NAME_PATHS,
+  ]) {
+    it(`denies ${file} in both runtimes`, () => {
+      assert.equal(isSensitiveFilePath(file, { windows: true }), true);
+      assert.equal(bridge.isSensitiveFilePath(file, { windows: true }), true);
+    });
+  }
+  it('allows names that only resemble Windows device or short names in both runtimes', () => {
+    for (const file of ['C:\\Docs\\console.txt', 'C:\\Docs\\com10.txt', 'C:\\Docs\\auxiliary.pdf', 'C:\\Docs\\lpt.txt',
+      'C:\\Docs\\conin.txt', 'C:\\Docs\\notes~draft.txt', 'C:\\Docs\\~1.txt', 'C:\\Docs\\v1~2.final.pdf',
+      'C:\\Docs\\Invoice~2024.pdf', 'C:\\Docs\\scan~001.jpeg', 'C:\\Docs\\IMG~12345678.heic', 'C:\\Docs\\ABCDEF~12.TXT']) {
+      assert.equal(isSensitiveFilePath(file, { windows: true }), false, file);
+      assert.equal(bridge.isSensitiveFilePath(file, { windows: true }), false, file);
+    }
+    // These are ordinary file names outside Windows.
+    for (const file of ['/home/user/Documents/con', '/home/user/Documents/nul.txt', '/home/user/Documents/REPORT~1.PDF']) {
+      assert.equal(isSensitiveFilePath(file), false, file);
+      assert.equal(bridge.isSensitiveFilePath(file), false, file);
+    }
+  });
+
+  it('accepts a short-form temp directory prefix but no short names below it in both runtimes', () => {
+    const policy = { windows: true, exportRoots: [WINDOWS_SHORT_TEMP + '\\thunderbird-mcp'] };
+    const exported = WINDOWS_SHORT_TEMP + '\\thunderbird-mcp\\message_1\\report.pdf';
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check(exported, policy), false);
+      assert.equal(check(exported.toLowerCase().replace(/\\/g, '/'), policy), false);
+      for (const file of [
+        WINDOWS_SHORT_TEMP + '\\thunderbird-mcp\\message_1\\REPORT~1.PDF',
+        WINDOWS_SHORT_TEMP + '\\THUNDE~1\\message_1\\report.pdf',
+        'C:\\Users\\ALICE~1\\Documents\\report.pdf',
+        'C:\\Users\\ALICE~1\\AppData\\Local\\Temp2\\report.pdf',
+      ]) {
+        assert.equal(check(file, policy), true, file);
+      }
+    }
+  });
+
+  it('allows ordinary Documents paths in both runtimes', () => {
+    for (const file of ['/home/user/Documents/report.pdf', '/Users/user/Documents/report.pdf', 'C:\\Users\\user\\Documents\\report.pdf',
+      '/home/user/Documents/Library/book.pdf', '/Users/user/Documents/Library/book.pdf', 'D:\\Scans\\library\\scan.pdf']) {
+      assert.equal(isSensitiveFilePath(file), false);
+      assert.equal(bridge.isSensitiveFilePath(file), false);
+    }
+  });
+
+  for (const windows of [false, true]) {
+    it(`protects runtime profile roots at component boundaries in both runtimes (windows=${windows})`, () => {
+      const base = windows ? 'D:/Custom' : '/custom';
+      const policy = { windows, profileRoots: [base + '/active', base + '/profiles/'] };
+      for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+        for (const file of ['/active', '/active/abook.sqlite', '/active/Mail/Inbox', '/profiles/another/abook.sqlite']) {
+          assert.equal(check(base + file, policy), true, file);
+        }
+        assert.equal(check(base + '/active-backup/report.pdf', policy), false);
+        assert.equal(check(base + '/profiles-other/report.pdf', policy), false);
+        assert.equal(check(base + '/documents/report.pdf', policy), false);
+        assert.equal(check(base.toUpperCase() + '/ACTIVE/abook.sqlite', policy), windows);
+        if (windows) assert.equal(check('d:\\Custom\\active\\abook.sqlite', policy), true);
+      }
+    });
+  }
+
+  it('never exempts a runtime profile merely because it has an export layout', () => {
+    const exportRoot = '/custom/profile/thunderbird-mcp';
+    const policy = { exportRoots: [exportRoot], profileRoots: ['/custom/profile'] };
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check(exportRoot + '/message_1/report.pdf', policy), true);
+    }
+  });
+
+  it('protects case variants on macOS without changing Linux or POSIX path syntax', () => {
+    const profileRoots = ['/custom/Profile'];
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check('/custom/profile/abook.sqlite', { profileRoots, profileCaseInsensitive: true }), true);
+      assert.equal(check('/custom/profile/report.pdf', { profileRoots, profileCaseInsensitive: false }), false);
+      assert.equal(check('/custom/profile-notes/report.pdf', { profileRoots, profileCaseInsensitive: true }), false);
+      assert.equal(check('/documents/report:2026.pdf', { profileRoots, profileCaseInsensitive: true }), false);
+    }
+  });
+
+  for (const profileRoots of [undefined, null, 'bad', {}, [null], ['relative'], ['/valid', 7], ['/valid/../other'], ['/valid\0bad']]) {
+    it(`retains static policy with absent or malformed profile metadata: ${JSON.stringify(profileRoots)}`, () => {
+      for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+        assert.equal(check('/documents/report.pdf', { profileRoots }), false);
+        assert.equal(check('/documents/secret.ppk', { profileRoots }), true);
+      }
+    });
+  }
+
+  it('keeps valid roots on either side of an unsupported entry in both runtimes', () => {
+    for (const windows of [false, true]) {
+      const base = windows ? 'D:/Mail' : '/mail';
+      for (const rejected of [null, 7, {}, '', 'relative', base + '/bad\0root', base + '/./bad',
+        base + '/other/../bad', '\\\\server\\share', '//server/share']) {
+        const policy = { windows, profileRoots: [base + '/first', rejected, base + '/last'] };
+        for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+          assert.equal(check(base + '/first/abook.sqlite', policy), true);
+          assert.equal(check(base + '/last/Mail/Inbox', policy), true);
+          assert.equal(check(base + '/documents/report.pdf', policy), false);
+          assert.equal(check(base + '/credential.ppk', policy), true);
+          assert.equal(check('//server/share/file.txt', policy), true);
+        }
+      }
+    }
+  });
+
+  it('does not refuse ordinary files that resemble newly protected names', () => {
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      for (const file of ['/documents/release.jks.txt', '/documents/wallet.dat.pdf',
+        '/documents/keystore-notes.txt', '/home/user/snap/chromium/common/chromium-notes/report.pdf']) {
+        assert.equal(check(file), false, file);
+      }
+    }
+  });
+});
+
+// Uses the production conversion and mail entry points with in-memory XPCOM
+// substitutes. No Thunderbird profile, server, or native compose window is used.
+function makeOutboundMailRuntime(options = {}) {
+  const state = { sent: 0, drafts: 0, windows: 0, fileCalls: 0, mimeReads: 0, dirCalls: 0, created: new Set(), removed: [], openStreams: 0 };
+  function tempFile(filePath) {
+    return {
+      ...makeMockLocalFile(filePath),
+      append(name) { this.path += '/' + name; },
+      create(type) { assert.equal(type, 1); },
+      normalize() { if (options.realTmpDir && this.path === options.tmpDir) this.path = options.realTmpDir; },
+      clone() { return tempFile(this.path); },
+      remove() {
+        assert.equal(state.openStreams, 0, 'streams must close before cleanup');
+        assert.ok(state.created.has(this.path), 'only this call\'s files may be removed');
+        state.created.delete(this.path);
+        state.removed.push(this.path);
+      },
+    };
+  }
+  const runtime = loadProductionAttachmentValidation({
+    console: { warn() {}, error() {} },
+    atob: data => Buffer.from(data, 'base64').toString('binary'),
+    createLocalFile(filePath) {
+      state.fileCalls++;
+      const normalizedPath = options.realTmpDir && filePath.startsWith(options.tmpDir + '/')
+        ? options.realTmpDir + filePath.slice(options.tmpDir.length) : filePath;
+      return options.files?.get(filePath) || makeMockLocalFile(filePath, { exists: !filePath.includes('missing'), normalizedPath });
+    },
+    Services: {
+      prefs: makeDirectSendPrefs(),
+      appinfo: { OS: options.os || 'Linux' },
+      dirsvc: { get(key) {
+        state.dirCalls++;
+        if (key === 'TmpD') return tempFile(options.tmpDir || '/temporary');
+        const directory = options.profileDirectories?.[key];
+        if (!directory) throw new Error('directory unavailable');
+        return directory.clone();
+      } },
+      io: { newFileURI: file => ({ spec: 'file://' + file.path }) },
+    },
+    Ci: {
+      nsIPrefBranch: prefTypes,
+      nsITimer: { TYPE_ONE_SHOT: 0 },
+      nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
+      nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 1 },
+      nsIFile: { DIRECTORY_TYPE: 1 },
+    },
+    Cc: {
+      '@mozilla.org/timer;1': { createInstance: () => ({ initWithCallback() {}, cancel() {} }) },
+      '@mozilla.org/messengercompose/attachment;1': { createInstance: () => new Proxy({}, {
+        set(target, prop, value) {
+          if (options.descriptorError && prop === 'name' && value === 'broken.pdf') throw new Error('invalid native attachment');
+          target[prop] = value;
+          return true;
+        },
+      }) },
+      '@mozilla.org/messengercompose/composeparams;1': { createInstance: () => ({}) },
+      '@mozilla.org/messengercompose/composefields;1': { createInstance: () => ({ addAttachment() {} }) },
+      '@mozilla.org/messengercompose;1': { getService: () => ({ OpenComposeWindowWithParams() { state.windows++; } }) },
+      '@mozilla.org/network/file-output-stream;1': { createInstance: () => ({
+        init(file, flags) {
+          assert.ok(flags & 0x80, 'temporary file creation must be exclusive');
+          state.created.add(file.path);
+          state.openStreams++;
+        },
+        close() { state.openStreams--; },
+      }) },
+      '@mozilla.org/binaryoutputstream;1': { createInstance: () => ({
+        setOutputStream() {},
+        writeByteArray() { if (options.writeError) throw new Error('write failed'); },
+        close() {},
+      }) },
+    },
+    server: options.dispatch ? { registerPathHandler(_path, handler) { state.dispatch = handler; } } : undefined,
+    authToken: 'fixture-token',
+    timingSafeEqual: (a, b) => a === b,
+    MAX_REQUEST_BODY: 1024 * 1024,
+    readRequestBody: req => req.body,
+    isToolEnabled: () => true,
+    isSkipReviewBlocked: () => false,
+    setComposeIdentity(params) { params.identity = { key: 'sender' }; },
+    resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
+    buildBodyWithSignature: body => body || '',
+    findMessage: () => ({ msgHdr: {}, folder: { server: {}, getUriForMsg: () => 'message://fixture' } }),
+    getDirectQuoteContent: () => ({ body: 'Original text' }),
+    sendMessageDirectly(_fields, _identity, _descs, _uri, _type, mode) {
+      if (mode === 1) state.drafts++; else state.sent++;
+      return Promise.resolve({ success: true });
+    },
+    openComposeWindowWithCustomizations() { state.windows++; return Promise.resolve({ success: true }); },
+    ChromeUtils: { importESModule() {
+      return {
+        MsgHdrToMimeMessage(msgHdr, _listener, callback) {
+          state.mimeReads++;
+          callback(msgHdr, { contentType: 'text/plain', body: 'Original text' });
+        },
+      };
+    } },
+  });
+  // Both send paths must trip the existing no-send assertions.
+  runtime.sendThroughCompose = runtime.sendMessageDirectly;
+  runtime._tempAttachFiles.add('/prior-call.txt');
+  return { runtime, state };
+}
+
+describe('Outbound attachment failures are atomic', () => {
+  it('observes a successful compose send with the same counter used by no-send assertions', async () => {
+    const { runtime, state } = makeOutboundMailRuntime();
+    const result = await runtime.composeMail('to@example.com', 'subject', 'body', null, null, false, null, [], true);
+    assert.equal(result.success, true);
+    assert.equal(state.sent, 1);
+    assert.equal(state.drafts + state.windows + state.mimeReads, 0);
+  });
+
+  const calls = [
+    ['sendMail direct', (r, a) => r.composeMail('to@example.com', 'subject', 'body', null, null, false, null, a, true)],
+    ['sendMail review', (r, a) => r.composeMail('to@example.com', 'subject', 'body', null, null, false, null, a, false)],
+    ['saveDraft', (r, a) => r.saveDraft('to@example.com', 'subject', 'body', null, null, false, null, a)],
+    ['replyToMessage direct', (r, a) => r.replyToMessage('id', 'folder', 'body', false, false, null, null, null, null, a, true)],
+    ['replyToMessage review', (r, a) => r.replyToMessage('id', 'folder', 'body', false, false, null, null, null, null, a, false)],
+    ['forwardMessage direct', (r, a) => r.forwardMessage('id', 'folder', 'to@example.com', 'body', false, null, null, null, a, true)],
+    ['forwardMessage review', (r, a) => r.forwardMessage('id', 'folder', 'to@example.com', 'body', false, null, null, null, a, false)],
+  ];
+  for (const [name, invoke] of calls) {
+    for (const invalid of ['/home/user/.env', '/home/user/missing.pdf', { name: 'invalid.bin', base64: '%%%%' }, null]) {
+      it(`${name} refuses ${JSON.stringify(invalid)} with no side effects and removes its temp files`, async () => {
+        const { runtime, state } = makeOutboundMailRuntime();
+        const result = await invoke(runtime, [
+          '/home/user/Documents/report.pdf',
+          { name: 'inline.txt', base64: 'QQ==' },
+          invalid,
+        ]);
+        assert.match(result.error, /Attachments refused:/);
+        assert.ok(result.error.includes(invalid?.name || String(invalid)));
+        assert.equal(state.sent, 0);
+        assert.equal(state.drafts, 0);
+        assert.equal(state.windows, 0);
+        assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
+        assert.equal(state.created.size, 0);
+        assert.equal(state.removed.length, 1);
+        assert.deepEqual(Array.from(runtime._tempAttachFiles), ['/prior-call.txt']);
+      });
+    }
+  }
+
+  for (const [name, invoke] of calls) {
+    it(`${name} refuses native descriptor conversion failures before side effects`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime({ descriptorError: true });
+      const result = await invoke(runtime, [
+        { name: 'inline.txt', base64: 'QQ==' }, '/home/user/Documents/broken.pdf',
+      ]);
+      assert.match(result.error, /broken.pdf.*invalid native attachment/);
+      assert.equal(state.sent + state.drafts + state.windows, 0);
+      assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
+      assert.equal(state.created.size, 0);
+      assert.equal(state.removed.length, 1);
+    });
+  }
+
+  it('reuses prepared native attachments and reports unavailable compose insertion', () => {
+    const { runtime } = makeOutboundMailRuntime();
+    const { descs } = runtime.filePathsToAttachDescs(['/home/user/Documents/report.pdf']);
+    assert.strictEqual(runtime.descsToMsgAttachments(descs)[0], descs[0].msgAttachment);
+    assert.throws(() => runtime.addAttachmentsToComposeWindow({}, descs), /Cannot add attachments/);
+  });
+
+  it('cleans partially written inline files when the stream fails', () => {
+    const { runtime, state } = makeOutboundMailRuntime({ writeError: true });
+    assert.throws(() => runtime.filePathsToAttachDescs([{ name: 'inline.txt', base64: 'QQ==' }]), /write failed/);
+    assert.equal(state.created.size, 0);
+    assert.equal(state.openStreams, 0);
+    assert.equal(state.removed.length, 1);
+  });
+
+  it('checks network/device paths before creating or inspecting an nsIFile on every platform', () => {
+    for (const os of ['Linux', 'Darwin', 'WINNT']) {
+      const { runtime, state } = makeOutboundMailRuntime({ os });
+      for (const file of ['\\\\server\\share\\file.txt', '//server/share/file.txt', '\\\\?\\C:\\file.txt', '\\\\.\\C:\\file.txt', '//?/C:/file.txt', '//./C:/file.txt']) {
+        assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/);
+      }
+      assert.equal(state.fileCalls, 0);
+      assert.equal(state.created.size, 0);
+    }
+  });
+
+  for (const os of ['Linux', 'Darwin', 'WINNT']) {
+    it(`keeps a local profile protected alongside a UNC profiles root on ${os}`, () => {
+      const profile = os === 'WINNT' ? 'D:/Mail/active' : '/mail/active';
+      for (const uncRoot of ['\\\\server\\share\\profiles', '//server/share/profiles']) {
+        const { runtime, state } = makeOutboundMailRuntime({ os, profileDirectories: {
+          ProfD: makeMockLocalFile(profile), DefProfRt: makeMockLocalFile(uncRoot),
+        } });
+        assert.throws(() => runtime.filePathsToAttachDescs([profile + '/abook.sqlite']), /sensitive path blocked/);
+        assert.throws(() => runtime.filePathsToAttachDescs([uncRoot + '/other/abook.sqlite']), /sensitive path blocked/);
+        assert.equal(state.fileCalls, 0);
+        assert.equal(state.sent + state.drafts + state.windows, 0);
+        assert.equal(runtime.filePathsToAttachDescs([profile + '-documents/report.pdf']).descs.length, 1);
+      }
+    });
+
+    it(`preserves valid profile entries around malformed ones during conversion on ${os}`, () => {
+      const base = os === 'WINNT' ? 'D:/Mail' : '/mail';
+      for (const rejected of [null, 7, {}, '', 'relative/profile', base + '/bad\0root',
+        base + '/other/../profile', base + '/./profile']) {
+        const { runtime, state } = makeOutboundMailRuntime({ os });
+        runtime.getThunderbirdProfileRoots = () => [base + '/first', rejected, base + '/last'];
+        for (const file of [base + '/first/abook.sqlite', base + '/last/Mail/Inbox', base + '/credential.ppk']) {
+          assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/,
+            `${file}, rejected=${JSON.stringify(rejected)}`);
+        }
+        assert.equal(state.fileCalls, 0);
+        assert.equal(runtime.filePathsToAttachDescs([base + '/documents/report.pdf']).descs.length, 1);
+      }
+    });
+
+    it(`refuses lexical and canonical runtime profiles through outbound conversion on ${os}`, () => {
+      const base = os === 'WINNT' ? 'D:/Custom' : '/custom';
+      const profile = base + '/profile';
+      const profiles = base + '/profiles';
+      const canonical = base + '/canonical';
+      const canonicalProfiles = base + '/canonical-profiles';
+      const profileDirectories = {
+        ProfD: makeMockLocalFile(profile, { normalizedPath: os === 'WINNT' ? profile : canonical, target: canonical }),
+        DefProfRt: makeMockLocalFile(profiles, { normalizedPath: os === 'WINNT' ? profiles : canonicalProfiles, target: canonicalProfiles }),
+      };
+      const { runtime, state } = makeOutboundMailRuntime({ os, profileDirectories });
+      for (const root of [profile, profiles, canonical, canonicalProfiles]) {
+        assert.throws(() => runtime.filePathsToAttachDescs([root + '/abook.sqlite']), /sensitive path blocked/);
+        if (os !== 'Linux') {
+          assert.throws(() => runtime.filePathsToAttachDescs([root.toUpperCase() + '/abook.sqlite']), /sensitive path blocked/);
+        }
+      }
+      assert.equal(state.fileCalls, 0);
+      assert.equal(state.sent + state.drafts + state.windows, 0);
+      assert.equal(runtime.filePathsToAttachDescs([profile + '-documents/report.pdf']).descs.length, 1);
+      const exported = runtime.ensureAttachmentDir('message_1');
+      exported.append('report.pdf');
+      assert.equal(runtime.filePathsToAttachDescs([exported.path]).descs.length, 1);
+    });
+  }
+
+  it('refuses a path that normalizes into a runtime profile', () => {
+    const profile = '/custom/profile';
+    const alias = '/documents/report.pdf';
+    const { runtime } = makeOutboundMailRuntime({
+      profileDirectories: { ProfD: makeMockLocalFile(profile) },
+      files: new Map([[alias, makeMockLocalFile(alias, { normalizedPath: profile + '/abook.sqlite' })]]),
+    });
+    assert.throws(() => runtime.filePathsToAttachDescs([alias]), /sensitive path blocked/);
+  });
+
+  it('rejects Windows streams and trailing dots/spaces before touching nsIFile or TmpD', () => {
+    for (const os of ['WINNT']) {
+      const { runtime, state } = makeOutboundMailRuntime({ os });
+      for (const file of [
+        'C:\\Keys\\backup.pem::$DATA', 'C:\\Keys\\file.pem:stream',
+        'C:/Keys/secret.pem.', 'C:/Keys/secret.pem ', 'C:/Keys. /report.pdf',
+        ...(os === 'WINNT' ? ['file.pem:stream', '/Keys/secret.pem.'] : []),
+      ]) {
+        assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/);
+      }
+      assert.equal(state.fileCalls, 0);
+      assert.equal(state.dirCalls, 0);
+    }
+  });
+
+  for (const [os, tmpDir] of [
+    ['WINNT', 'C:/Users/user/AppData/Local/Temp'],
+    ['Linux', '/home/user/.var/app/net.thunderbird.Thunderbird/cache/tmp'],
+  ]) {
+    it(`reattaches getMessage exports from ${tmpDir} and keeps the exemption narrow`, () => {
+      const { runtime } = makeOutboundMailRuntime({ os, tmpDir });
+      const exported = runtime.ensureAttachmentDir('message_1');
+      exported.append('report.pdf');
+      const { descs } = runtime.filePathsToAttachDescs([exported.path]);
+      assert.equal(descs.length, 1);
+      assert.equal(descs[0].url, 'file://' + exported.path);
+      const base = tmpDir + '/thunderbird-mcp';
+      for (const file of [
+        base + '/connection.json', base + '/other.txt', base + '/attachments/report.pdf',
+        base + '/message_1/secret.pem', base + '/message_1/.env', base + '/message_1/key4.db',
+        base + '/message_1/connection.json', base + '/message_1/../connection.json',
+        base + '/message_1/../message_1/report.pdf', base + '/message_1/../../report.pdf',
+        tmpDir + '/other-app/thunderbird-mcp/message_1/report.pdf',
+      ]) {
+        assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/, file);
+      }
+    });
+
+    it(`rejects normalized symlink redirects both into and out of ${os} exports`, () => {
+      const exported = tmpDir + '/thunderbird-mcp/message_1/report.pdf';
+      const outside = os === 'WINNT' ? 'C:/Users/user/Documents/report.pdf' : '/home/user/Documents/report.pdf';
+      for (const [original, target] of [[exported, outside], [outside, exported]]) {
+        const { runtime } = makeOutboundMailRuntime({ os, tmpDir, files: new Map([
+          [original, makeMockLocalFile(original, { normalizedPath: target })],
+        ]) });
+        assert.throws(() => runtime.filePathsToAttachDescs([original]), /export path is redirected/);
+      }
+    });
+  }
+
+  for (const os of ['Linux', 'Darwin']) {
+    it(`allows legal POSIX attachment names on ${os}`, () => {
+      const { runtime } = makeOutboundMailRuntime({ os });
+      for (const name of ['a:b:c.txt', 'report.txt.', 'report.txt ', 'file.pem:stream']) {
+        const file = '/home/user/Documents/' + name;
+        assert.equal(runtime.filePathsToAttachDescs([file]).descs[0].url, 'file://' + file);
+      }
+    });
+
+    it(`rejects crafted backslash filenames outside the ${os} export subtree`, () => {
+      const tmpDir = '/home/user/.var/app/net.thunderbird.Thunderbird/cache/tmp';
+      const { runtime, state } = makeOutboundMailRuntime({ os, tmpDir });
+      for (const suffix of ['thunderbird-mcp\\message_1\\auth.json', 'thunderbird-mcp\\message_1/auth.json']) {
+        assert.throws(() => runtime.filePathsToAttachDescs([tmpDir + '/' + suffix]), /sensitive path blocked/);
+      }
+      assert.equal(state.fileCalls, 0);
+    });
+
+    it(`allows a canonical ${os} TmpD alias but refuses redirects below it`, () => {
+      const tmpDir = '/var/folders/.temporary';
+      const realTmpDir = '/private/var/folders/.temporary';
+      const { runtime } = makeOutboundMailRuntime({ os, tmpDir, realTmpDir });
+      const exported = runtime.ensureAttachmentDir('message_1');
+      exported.append('report.pdf');
+      const expected = realTmpDir + '/thunderbird-mcp/message_1/report.pdf';
+      assert.equal(runtime.filePathsToAttachDescs([exported.path]).descs[0].url, 'file://' + expected);
+      assert.equal(runtime.filePathsToAttachDescs([expected]).descs[0].url, 'file://' + expected);
+      for (const target of [
+        realTmpDir + '/thunderbird-mcp/message_2/report.pdf',
+        realTmpDir + '/elsewhere/message_1/report.pdf',
+      ]) {
+        const redirected = makeOutboundMailRuntime({ os, tmpDir, realTmpDir, files: new Map([
+          [exported.path, makeMockLocalFile(exported.path, { normalizedPath: target })],
+        ]) });
+        assert.throws(() => redirected.runtime.filePathsToAttachDescs([exported.path]), /export path is redirected|sensitive path blocked/);
+      }
+    });
+  }
+
+  for (const name of ['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']) {
+    for (const skipReview of name === 'saveDraft' ? [undefined] : [false, true]) {
+      it(`HTTP dispatch coerces ${name} attachment strings and refuses the whole operation (skipReview=${skipReview})`, async () => {
+        const { state } = makeOutboundMailRuntime({ dispatch: true });
+        const body = JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {
+            ...productionToolArgs[name], skipReview,
+            attachments: JSON.stringify([
+              '/home/user/Documents/report.pdf', { name: 'inline.txt', base64: 'QQ==' }, '/home/user/.env',
+            ]),
+          } },
+        });
+        const response = await new Promise(resolve => {
+          let output = '';
+          state.dispatch({
+            method: 'POST', body,
+            getHeader: key => key === 'Authorization' ? 'Bearer fixture-token' : String(Buffer.byteLength(body)),
+          }, {
+            processAsync() {}, setStatusLine() {}, setHeader() {},
+            write(text) { output += text; },
+            finish() { resolve(JSON.parse(output)); },
+          });
+        });
+        assert.equal(response.error, undefined);
+        const result = JSON.parse(response.result.content[0].text);
+        assert.match(result.error, /Attachments refused:.*\/home\/user\/\.env/);
+        // Reaching both path conversion and inline temp creation proves coercion
+        // succeeded before the denied entry failed the production policy check.
+        assert.equal(state.fileCalls, 1);
+        assert.equal(state.removed.length, 1);
+        assert.equal(state.created.size, 0);
+        assert.equal(state.sent + state.drafts + state.windows, 0);
+        assert.equal(state.mimeReads, skipReview && ['replyToMessage', 'forwardMessage'].includes(name) ? 1 : 0);
+      });
+    }
+  }
+
+  it('refuses Windows device and short-name components before touching nsIFile', () => {
+    const { runtime, state } = makeOutboundMailRuntime({ os: 'WINNT' });
+    for (const file of [...WINDOWS_RESERVED_NAME_PATHS, ...WINDOWS_SHORT_NAME_PATHS]) {
+      assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/, file);
+    }
+    assert.equal(state.fileCalls, 0);
+  });
+
+  it('accepts Windows exports below a short-form TmpD', () => {
+    const tmpDir = WINDOWS_SHORT_TEMP.replace(/\\/g, '/');
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', tmpDir });
+    assert.equal(runtime.filePathsToAttachDescs([tmpDir + '/thunderbird-mcp/message_1/report.pdf']).descs.length, 1);
+    assert.throws(() => runtime.filePathsToAttachDescs([tmpDir + '/thunderbird-mcp/message_1/REPORT~1.PDF']), /sensitive path blocked/);
+  });
+
+  it('allows Windows exports through ordinary AppData ancestors but refuses redirected ones', () => {
+    const tmpDir = 'C:/Users/user/AppData/Local/Temp';
+    const file = tmpDir + '/thunderbird-mcp/message_1/report.pdf';
+    for (const redirected of [false, true]) {
+      const appData = makeMockLocalFile('C:/Users/user/AppData', redirected ? { target: 'C:/Elsewhere' } : {});
+      const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', tmpDir, files: new Map([
+        [file, makeMockLocalFile(file, { parent: appData })],
+      ]) });
+      if (redirected) assert.throws(() => runtime.filePathsToAttachDescs([file]), /junction path blocked/);
+      else assert.equal(runtime.filePathsToAttachDescs([file]).descs.length, 1);
+    }
+  });
+
+  it('checks the normalized nsIFile path against the policy', () => {
+    const original = '/home/user/Documents/report.pdf';
+    const { runtime } = makeOutboundMailRuntime({ files: new Map([[original,
+      makeMockLocalFile(original, { normalizedPath: '/home/user/.credentials/report.pdf' }),
+    ]]) });
+    assert.throws(() => runtime.filePathsToAttachDescs([original]), /sensitive path blocked/);
+  });
+
+  it('forces Windows ancestor resolution before reading target and refuses junctions', () => {
+    const original = 'C:\\Users\\user\\Documents\\report.pdf';
+    const parent = makeMockLocalFile('C:\\Users\\user\\Documents', { target: 'C:\\Users\\user\\AppData' });
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', files: new Map([[original,
+      makeMockLocalFile(original, { parent }),
+    ]]) });
+    assert.throws(() => runtime.filePathsToAttachDescs([original]), /junction path blocked/);
+  });
+
+  it('walks Windows parents through the drive root without normalizing it again', () => {
+    const drive = makeMockLocalFile('C:', { normalizeError: new Error('drive-relative normalization') });
+    const users = makeMockLocalFile('C:/Users', { parent: drive });
+    const user = makeMockLocalFile('C:/Users/user', { parent: users });
+    const documents = makeMockLocalFile('C:/Users/user/Documents', { parent: user });
+    const original = 'C:/Users/user/Documents/report.pdf';
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', files: new Map([[original,
+      makeMockLocalFile(original, { parent: documents }),
+    ]]) });
+    assert.equal(runtime.filePathsToAttachDescs([original]).descs.length, 1);
+    assert.equal(drive.resolved, true);
+  });
+
+  it('fails closed on Windows resolution failure and accepts ordinary Documents files', () => {
+    const original = 'C:\\Users\\user\\Documents\\report.pdf';
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', files: new Map([[original,
+      makeMockLocalFile(original, { readError: new Error('resolution failed') }),
+    ]]) });
+    assert.throws(() => runtime.filePathsToAttachDescs([original]), /resolution failed/);
+    for (const os of ['Linux', 'Darwin', 'WINNT']) {
+      const { runtime: allowed } = makeOutboundMailRuntime({ os });
+      const result = allowed.filePathsToAttachDescs([os === 'WINNT' ? original : '/home/user/Documents/report.pdf']);
+      assert.equal(result.descs.length, 1);
+    }
   });
 });
