@@ -1164,7 +1164,7 @@ async function inlineAttachmentPaths(args, options = {}) {
 // the extension.
 const SAVE_MESSAGE_TOOL = {
   name: 'saveMessage',
-  description: "Save a message to disk on the local machine: writes the full .eml and/or its attachments into a destination directory. Unlike saveAttachments (temp dir only), this writes to any path you choose. Runs on the bridge, so destDir is a path on the machine running the MCP.",
+  description: "Save a message to disk on the local machine: writes the full .eml and/or its attachments into a destination directory. Unlike saveAttachments (temp dir only), this writes to any path you choose. Runs on the bridge, so destDir is a path on the machine running the MCP. A multipart message missing its closing MIME boundary is refused and nothing is written; emlCompleteness reports verified, or unverifiable for single-part messages.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -1351,6 +1351,36 @@ function copyFileExclusive(srcPath, destDir, baseName, { usedNames, overwrite, f
 // response for a tools/call (forwardToThunderbird in production, a mock in
 // tests). Returns the inner data object { emlPath, attachments, skippedAttachments,
 // destDir }; the handleMessage caller wraps it into the MCP content envelope.
+/**
+ * Checks that a raw RFC 2822 source is the whole message before it is written.
+ * A source cut off mid-transfer is otherwise indistinguishable from a complete
+ * one: three .eml files were written at ~7.9 MB of a 15.2 MB message, each
+ * missing the MIME closing boundary (2026-10-21). Returns "verified" when a
+ * multipart message carries its closing delimiter, "unverifiable" for a
+ * single-part message (nothing marks its end); throws for an incomplete one.
+ */
+function checkRawSourceComplete(rawSource) {
+  const split = /\r?\n\r?\n/.exec(rawSource);
+  if (!split) {
+    throw new Error('Message source is incomplete: its header block never ends. Nothing was written; retry once Thunderbird has the whole message.');
+  }
+  // Unfold continuation lines so a folded Content-Type reads as one line.
+  const headerBlock = rawSource.slice(0, split.index).replace(/\r?\n[ \t]+/g, ' ');
+  const contentType = /^content-type:[ \t]*([^\r\n]*)/im.exec(headerBlock);
+  if (!contentType || !/^\s*multipart\//i.test(contentType[1])) return 'unverifiable';
+  const boundary = /;\s*boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType[1]);
+  if (!boundary) return 'unverifiable';
+  const value = (boundary[1] || boundary[2]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const closing = new RegExp(`(?:^|\\n)--${value}--[ \\t]*(?:\\r?\\n|$)`);
+  if (!closing.test(rawSource.slice(split.index))) {
+    throw new Error(
+      `Message source is incomplete: the closing MIME boundary is missing after ${rawSource.length} bytes. ` +
+      'Nothing was written; retry once Thunderbird has the whole message.'
+    );
+  }
+  return 'verified';
+}
+
 async function saveMessageToDisk({ args, fetchMessage, fsImpl = fs, pathImpl = path, env = process.env }) {
   args = args || {};
   if (!saveMessageEnabled(env)) {
@@ -1385,6 +1415,7 @@ async function saveMessageToDisk({ args, fetchMessage, fsImpl = fs, pathImpl = p
   // under the previous overwrite behavior an attachment could clobber.
   const usedNames = new Set();
   let emlPath = null;
+  let emlCompleteness;
 
   if (writeEml) {
     const resp = await fetchMessage({
@@ -1421,6 +1452,8 @@ async function saveMessageToDisk({ args, fetchMessage, fsImpl = fs, pathImpl = p
       filename += '.eml';
     }
 
+    emlCompleteness = checkRawSourceComplete(rawSource);
+
     // rawSource is a Latin-1 byte string: the extension reads the message as
     // bytes and hands each one over as a code point. Writing it as UTF-8 would
     // re-encode every byte above 0x7f into two, corrupting 8-bit bodies, MIME
@@ -1445,6 +1478,11 @@ async function saveMessageToDisk({ args, fetchMessage, fsImpl = fs, pathImpl = p
       }
       unlinkForOverwrite(fullPath, fsImpl);
       fsImpl.writeFileSync(fullPath, emlBytes, { flag: 'wx', mode: SAVE_FILE_MODE });
+    }
+    // Read back what landed: the write call returning says nothing about it.
+    const writtenBytes = fsImpl.statSync(fullPath).size;
+    if (writtenBytes !== emlBytes.length) {
+      throw new Error(`Wrote ${writtenBytes} of ${emlBytes.length} bytes to ${fullPath}; the .eml is incomplete`);
     }
     usedNames.add(filename);
     emlPath = fullPath;
@@ -1478,7 +1516,9 @@ async function saveMessageToDisk({ args, fetchMessage, fsImpl = fs, pathImpl = p
     }
   }
 
-  return { emlPath, attachments: writtenAttachments, skippedAttachments, destDir };
+  const result = { emlPath, attachments: writtenAttachments, skippedAttachments, destDir };
+  if (emlCompleteness) result.emlCompleteness = emlCompleteness;
+  return result;
 }
 
 /**

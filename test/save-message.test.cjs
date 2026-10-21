@@ -580,3 +580,78 @@ describe('sanitizeSaveFilename', () => {
     assert.throws(() => sanitizeSaveFilename(null), /Cannot derive/);
   });
 });
+
+describe('saveMessageToDisk completeness', () => {
+  const dirs = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+  function tempDir() {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tb-mcp-complete-')));
+    dirs.push(dir);
+    return dir;
+  }
+  // A folded, quoted boundary carrying regular-expression characters.
+  const BOUNDARY = '=_Part.1+(x)';
+  const FULL = [
+    'Subject: Offer',
+    'Content-Type: multipart/mixed;',
+    ` boundary="${BOUNDARY}"`,
+    '',
+    `--${BOUNDARY}`,
+    'Content-Type: text/plain',
+    '',
+    'Body',
+    `--${BOUNDARY}`,
+    'Content-Type: application/pdf',
+    'Content-Transfer-Encoding: base64',
+    '',
+    'JVBERi0xLjQK',
+    `--${BOUNDARY}--`,
+    '',
+  ].join('\r\n');
+
+  function saveRaw(rawSource, extra = {}) {
+    const dir = tempDir();
+    const fetchMessage = async () => makeEnvelope({ rawSource, subject: 'Offer' });
+    return { dir, run: () => saveMessageToDisk({ env: ENABLED, args: { messageId: 'm', folderPath: 'imap://x/INBOX', destDir: dir }, fetchMessage, ...extra }) };
+  }
+
+  it('writes a multipart message carrying its closing boundary and says it was verified', async () => {
+    const { dir, run } = saveRaw(FULL);
+    const result = await run();
+    assert.equal(result.emlCompleteness, 'verified');
+    assert.equal(fs.readFileSync(path.join(dir, 'Offer.eml'), 'latin1'), FULL);
+  });
+
+  it('refuses a multipart message cut off before its closing boundary and writes nothing', async () => {
+    const truncated = FULL.slice(0, FULL.indexOf(`--${BOUNDARY}--`) - 4);
+    const { dir, run } = saveRaw(truncated);
+    await assert.rejects(run(), /incomplete: the closing MIME boundary is missing .* Nothing was written/);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it('does not take an inner part boundary or a boundary-like body line for the closing one', async () => {
+    const inner = FULL.replace(`--${BOUNDARY}--\r\n`, 'x--' + BOUNDARY + '--\r\n');
+    const { dir, run } = saveRaw(inner);
+    await assert.rejects(run(), /closing MIME boundary is missing/);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it('refuses a source whose header block never ends', async () => {
+    const { dir, run } = saveRaw('Subject: Offer\r\nContent-Type: multipart/mixed; boundary=b');
+    await assert.rejects(run(), /header block never ends/);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it('writes a single-part message and marks it unverifiable rather than verified', async () => {
+    const { run } = saveRaw('Subject: Offer\r\nContent-Type: text/plain\r\n\r\nBody\r\n');
+    assert.equal((await run()).emlCompleteness, 'unverifiable');
+  });
+
+  it('reports a file that landed shorter than the bytes written', async () => {
+    const shortStat = { ...fs, statSync: (p) => ({ ...fs.statSync(p), size: fs.statSync(p).size - 1 }) };
+    const { run } = saveRaw(FULL, { fsImpl: shortStat });
+    await assert.rejects(run(), /the \.eml is incomplete/);
+  });
+});
