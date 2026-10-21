@@ -67,7 +67,13 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   Nachbar-Entwurf (Betreiber-Screenshot); sauber wiederholt mit allen
   Tabs geschlossen (Probe 2, gleicher Ausgang). Reichweite gemessen: NUR
   der Tab der gelöschten Nachricht springt — zwei Test-Entwürfe A/B je im
-  eigenen Tab, A gelöscht, Tab B zeigte weiter B (Betreiber-Sicht). Davor zweimal im Echtbetrieb: der
+  eigenen Tab, A gelöscht, Tab B zeigte weiter B (Betreiber-Sicht).
+  URSACHE + ABHILFE gefunden: Betterbird-Pref
+  `mail.close_message_window.on_delete` (Default false; mailCommon.js wählt
+  damit zwischen closeTab und Nachbar-Auswahl). Gesetzt über dotfiles
+  `betterbird/user.js` (`6dfd707`); nach Neustart Probe 4: Entwurf gelöscht
+  → Tab schließt sich (Betreiber-Sicht, Ausgang vorab benannt). Punkt 4
+  des Fixes ist damit Sicherheitsnetz für Profile ohne diese Pref. Davor zweimal im Echtbetrieb: der
   Tab des gesendeten Telekom-Entwurfs zeigte danach einen fremden
   Condor-Entwurf (session.json: dieselbe Tab-Position, `Drafts#3446`); am
   Vormittag zeigten mehrere Tabs fremde Mails, nachdem ihre Entwürfe per
