@@ -6,7 +6,6 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "thunderbird-mcp@tkasperczyk.dev",
-      "update_url": "https://updates.tomaszkasperczyk.name/thunderbird-mcp/updates.json",
       "strict_min_version": "128.0",
       "strict_max_version": "200.*"
     }
