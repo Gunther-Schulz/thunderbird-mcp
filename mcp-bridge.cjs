@@ -1371,10 +1371,16 @@ function checkRawSourceComplete(rawSource) {
   const boundary = /;\s*boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType[1]);
   if (!boundary) return 'unverifiable';
   const value = (boundary[1] || boundary[2]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const closing = new RegExp(`(?:^|\\n)--${value}--[ \\t]*(?:\\r?\\n|$)`);
-  if (!closing.test(rawSource.slice(split.index))) {
+  const body = rawSource.slice(split.index);
+  const closing = new RegExp(`(?:^|\\n)--${value}--[ \\t]*(?:\\r?\\n|$)`).exec(body);
+  // The closing delimiter ends the multipart: a part delimiter after it means
+  // the closing line came early and cannot vouch for the rest.
+  const delimiterAfter = closing &&
+    new RegExp(`(?:^|\\n)--${value}(?:--)?[ \\t]*(?:\\r?\\n|$)`).test(body.slice(closing.index + closing[0].length));
+  if (!closing || delimiterAfter) {
+    const what = closing ? 'a MIME part follows the closing boundary' : 'the closing MIME boundary is missing';
     throw new Error(
-      `Message source is incomplete: the closing MIME boundary is missing after ${rawSource.length} bytes. ` +
+      `Message source is incomplete: ${what} after ${rawSource.length} bytes. ` +
       'Nothing was written; retry once Thunderbird has the whole message.'
     );
   }
@@ -1703,12 +1709,24 @@ async function handleMessage(line, { forward = forwardToThunderbird, env = proce
 // BEGIN BRIDGE HTTP REQUEST HELPERS
 const REQUEST_TIMEOUT = 30000;
 const MAIL_OPERATION_TIMEOUT = 150000;
+// The extension streams an uncached IMAP message from the server for up to
+// 120 s (RAW_SERVER_FETCH_TIMEOUT_MS) before getMessage(rawSource) answers.
+const RAW_SOURCE_TIMEOUT = 150000;
+// A replacing saveDraft adds its Drafts check to the 120 s save: two folder
+// syncs of up to 15 s and a move of up to 30 s (DRAFT_SYNC_TIMEOUT_MS,
+// DRAFT_MOVE_TIMEOUT_MS) -- 180 s at most, plus margin.
+const DRAFT_REPLACE_TIMEOUT = 210000;
 
 function getThunderbirdRequestPolicy(message) {
   let checkFolders = null;
+  let timeoutMs = REQUEST_TIMEOUT;
   if (message?.method === 'tools/call') {
     const name = message.params?.name;
     const args = message.params?.arguments;
+    const rawSource = args?.rawSource === true || args?.rawSource === 'true';
+    if ((name === 'getMessage' || name === 'getMessages') && rawSource) {
+      timeoutMs = RAW_SOURCE_TIMEOUT;
+    }
     // Match coerceToolArgs in the extension: only the exact string "true"
     // becomes true before validation and dispatch.
     const saveAsDraft = args?.saveAsDraft === true || args?.saveAsDraft === 'true';
@@ -1719,10 +1737,13 @@ function getThunderbirdRequestPolicy(message) {
       checkFolders = 'the Sent folder and the Outbox';
     }
   }
-  return {
-    timeoutMs: checkFolders ? MAIL_OPERATION_TIMEOUT : REQUEST_TIMEOUT,
-    checkFolders,
-  };
+  if (checkFolders) {
+    const replacing = message.params.name === 'saveDraft' &&
+      typeof message.params.arguments?.replaceMessageId === 'string' &&
+      message.params.arguments.replaceMessageId.trim() !== '';
+    timeoutMs = replacing ? DRAFT_REPLACE_TIMEOUT : MAIL_OPERATION_TIMEOUT;
+  }
+  return { timeoutMs, checkFolders };
 }
 
 function tryRequest(hostname, postData, port, token, policy) {

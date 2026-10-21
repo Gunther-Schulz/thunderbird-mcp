@@ -113,6 +113,7 @@ const mailOperations = [
   ['replyToMessage', { skipReview: 'true' }, /Sent folder and the Outbox/],
   ['forwardMessage', { skipReview: 'true' }, /Sent folder and the Outbox/],
   ['saveDraft', {}, /Drafts/],
+  ['saveDraft', { replaceMessageId: '  ' }, /Drafts/],
   ['replyToMessage', { saveAsDraft: true }, /Drafts/],
   ['replyToMessage', { saveAsDraft: 'true' }, /Drafts/],
 ];
@@ -177,7 +178,25 @@ describe('bridge request outcomes', () => {
     });
   }
 
+  for (const [name, args, seconds] of [
+    ['getMessage', { rawSource: true }, 150],
+    ['getMessage', { rawSource: 'true' }, 150],
+    ['getMessages', { rawSource: true }, 150],
+    ['saveDraft', { replaceMessageId: 'old@example.test' }, 210],
+  ]) {
+    it(`${name} ${JSON.stringify(args)} outlasts the extension's own budget (${seconds} s)`, async () => {
+      const { runtime, requests } = loadRequests();
+      const pending = runtime.forwardToThunderbird(toolCall(name, args));
+      connect(requests[0]);
+      assert.equal(requests[0].timeoutMs, seconds * 1000);
+      requests[0].onTimeout();
+      await assert.rejects(pending, new RegExp(`timed out after ${seconds} seconds`));
+    });
+  }
+
   for (const message of [
+    toolCall('getMessage', { rawSource: false }),
+    toolCall('getMessage'),
     toolCall('listFolders'),
     toolCall('sendMail'),
     ...['sendMail', 'replyToMessage', 'forwardMessage'].flatMap((name) =>

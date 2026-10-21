@@ -638,6 +638,14 @@ describe('saveMessageToDisk completeness', () => {
     assert.deepEqual(fs.readdirSync(dir), []);
   });
 
+  it('does not let an early closing boundary vouch for parts after it', async () => {
+    const early = FULL.replace(`--${BOUNDARY}\r\nContent-Type: application/pdf`, `--${BOUNDARY}--\r\n--${BOUNDARY}\r\nContent-Type: application/pdf`)
+      .replace(`--${BOUNDARY}--\r\n`, `--${BOUNDARY}--\r\n`).slice(0, -(`--${BOUNDARY}--\r\n`.length));
+    const { dir, run } = saveRaw(early);
+    await assert.rejects(run(), /a MIME part follows the closing boundary/);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
   it('refuses a source whose header block never ends', async () => {
     const { dir, run } = saveRaw('Subject: Offer\r\nContent-Type: multipart/mixed; boundary=b');
     await assert.rejects(run(), /header block never ends/);
