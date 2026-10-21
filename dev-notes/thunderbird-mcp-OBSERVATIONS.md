@@ -143,6 +143,13 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   before writing, size read back); saveMessage carried over from
   feat/save-message as `4277523`, `f101aef`, test loader fix `8390fda`.
   8 countOnly = listing, scoped search waits for folder sync: `5913b9f`.
+  Fresh-context review (opus, on 3615872): 5 claim-wider-than-effect defects
+  and 2 bridge timeouts shorter than the extension's waits, fixed in
+  `6df2a91` (replace proof: no-Trash path, unreadable DB, failed sync),
+  `c37354c` (closeTabs mail tabs only; displayMessage "holds", not "shows"),
+  `eb1ea68` (bridge timeouts 150/210 s; early closing boundary refused).
+  Residual, inferred: Thunderbird's own removal of the old draft may still be
+  in flight when the replace check starts -- worst case a duplicate in Trash.
   OPEN until the live pairs ran (operator install + NEW session): per GUI verb
   one pair; for 6 the field `previousDraft` (gone / marked-deleted / present)
   settles WHY the predecessor survived on Kasserver.
