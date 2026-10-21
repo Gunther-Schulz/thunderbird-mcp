@@ -81,6 +81,7 @@ const ALL_TOOLS = [
   { name: "displayMessage", group: "messages", crud: "read" },
   { name: "listTabs", group: "messages", crud: "read" },
   { name: "closeTabs", group: "messages", crud: "update" },
+  { name: "editDraft", group: "messages", crud: "read" },
   { name: "sendMail", group: "messages", crud: "create" },
   { name: "replyToMessage", group: "messages", crud: "create" },
   { name: "forwardMessage", group: "messages", crud: "create" },

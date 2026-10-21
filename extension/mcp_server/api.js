@@ -2823,6 +2823,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "editDraft",
+        group: "messages", crud: "read",
+        title: "Edit Draft",
+        description: "Open a saved draft directly in a compose window for the user to review and send, like Thunderbird's Edit Draft command. Nothing is sent. A compose window already editing the draft is focused instead of opening a second one. The window is read back: success means a compose window for this draft exists (viewId, as in listTabs). Encrypted drafts are refused unless encrypted message access is enabled in the extension options.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The draft's message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The Drafts folder URI holding it (from searchMessages results)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
         name: "deleteMessages",
         group: "messages", crud: "delete",
         title: "Delete Messages",
@@ -11263,6 +11277,67 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               return closed;
             }
+
+            const COMPOSE_READBACK_TIMEOUT_MS = 15000;
+
+            function findComposeViewForDraft(msgHdr) {
+              return enumerateMessageViews().find(view =>
+                view.kind === "compose" && isSameMessage(getComposeDraftHeader(view.win), msgHdr)) || null;
+            }
+
+            /**
+             * Opens a saved draft straight in a compose window, so Send is there
+             * at once instead of a reading tab and its Edit button. Follows
+             * Thunderbird's own Edit Draft command (ComposeMessage in
+             * mailCommands.js): a compose window already editing the draft is
+             * focused rather than a second one opened. The window is read back
+             * by the draft it was opened from.
+             */
+            async function editDraft(messageId, folderPath) {
+              try {
+                const found = findMessage(messageId, folderPath);
+                if (found.error) return { error: found.error };
+                const { msgHdr, folder } = found;
+                let isDrafts = false;
+                try { isDrafts = folder.getFlag(Ci.nsMsgFolderFlags.Drafts); } catch { /* fail closed */ }
+                if (!isDrafts) {
+                  return { error: "editDraft opens messages from a folder with the Drafts flag only" };
+                }
+                // Opening decrypts the draft into the compose window.
+                if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasEncryptedOuterStructure(msgHdr)) {
+                  return { error: ENCRYPTED_DISPLAY_ERROR };
+                }
+
+                const existing = findComposeViewForDraft(msgHdr);
+                if (existing) {
+                  existing.win.focus();
+                  return { success: true, alreadyOpen: true, viewId: existing.id, draftMessageId: msgHdr.messageId };
+                }
+
+                let identity = null;
+                try {
+                  identity = folder.customIdentity || MailServices.accounts.getFirstIdentityForServer(folder.server);
+                } catch { /* the draft's own identity header still applies */ }
+                MailServices.compose.OpenComposeWindow(
+                  null,
+                  msgHdr,
+                  folder.getUriForMsg(msgHdr),
+                  Ci.nsIMsgCompType.Draft,
+                  Ci.nsIMsgCompFormat.Default,
+                  identity,
+                  null,
+                  null
+                );
+
+                const view = await waitForCondition(() => findComposeViewForDraft(msgHdr), COMPOSE_READBACK_TIMEOUT_MS);
+                if (!view) {
+                  return { error: `No compose window for the draft appeared within ${COMPOSE_READBACK_TIMEOUT_MS / 1000}s; whether one opens later is unconfirmed` };
+                }
+                return { success: true, viewId: view.id, draftMessageId: msgHdr.messageId };
+              } catch (e) {
+                return { error: `Failed to open draft: ${e.message || e}` };
+              }
+            }
             // END MESSAGE VIEW TOOLS
 
             function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
@@ -12555,6 +12630,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listTabs();
                 case "closeTabs":
                   return await closeTabs(args.viewIds, args.messageId, args.folderPath);
+                case "editDraft":
+                  return await editDraft(args.messageId, args.folderPath);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":

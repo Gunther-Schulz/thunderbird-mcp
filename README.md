@@ -53,6 +53,7 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode. Reads back the opened view and reports `displayedMessageId`; a view showing another message is an error |
 | `listTabs` | List what the GUI shows right now: tabs, message windows, and compose windows with their message or draft IDs |
 | `closeTabs` | Close message tabs/windows by view ID or by message ID; reports views that stayed open |
+| `editDraft` | Open a saved draft directly in a compose window for review and sending (nothing is sent); focuses the window if the draft is already open |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash. Message tabs/windows showing a deleted message are closed first instead of jumping to a neighbouring message |
 | `createFolder` | Create new subfolders to organize your mail |

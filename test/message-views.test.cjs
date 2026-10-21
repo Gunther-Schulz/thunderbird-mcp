@@ -79,24 +79,50 @@ function makeGui({ messageTabs = [], messageWindows = [], composeWindows = [], f
     };
     windows["mail:messageWindow"].push(win);
   }
-  for (const { draft, subject } of composeWindows) {
-    windows.msgcompose.push({
+  const addComposeWindow = ({ draft, subject }) => {
+    const win = {
       docShell: { outerWindowID: nextWindowId++ },
       gMsgCompose: { compFields: { draftId: draft ? `imap-message://${draft.folder.URI}#${draft.messageKey}?fetchCompleteMessage=true` : "" } },
       document: { getElementById: (id) => (id === "msgSubject" ? { value: subject } : null) },
+      focused: 0,
+      focus() { this.focused++; },
       close() { throw new Error("compose windows must not be closed"); },
-    });
-  }
+    };
+    windows.msgcompose.push(win);
+    return win;
+  };
+  composeWindows.forEach(addComposeWindow);
   const drafts = composeWindows.map(c => c.draft).filter(Boolean);
-  return { tabmail, windows, drafts };
+  return { tabmail, windows, drafts, addComposeWindow };
 }
 
-function loadViews(gui, { allowEncrypted = false } = {}) {
+function loadViews(gui, { allowEncrypted = false, messages = [], composeOpens = true } = {}) {
+  const composeCalls = [];
   const sandbox = {
+    composeCalls,
+    findMessage: (messageId, folderPath) => {
+      const msgHdr = messages.find(m => m.messageId === messageId && m.folder.URI === folderPath);
+      return msgHdr ? { msgHdr, folder: msgHdr.folder } : { error: `Message not found: ${messageId}` };
+    },
+    ENCRYPTED_DISPLAY_ERROR: "Encrypted messages cannot be displayed while encrypted message access is off.",
     Services: { wm: { getEnumerator: (type) => [...(gui.windows[type] || [])] } },
     Cc: { "@mozilla.org/timer;1": { createInstance: () => makeImmediateTimer() } },
-    Ci: { nsITimer: { TYPE_REPEATING_SLACK: 1 } },
+    Ci: {
+      nsITimer: { TYPE_REPEATING_SLACK: 1 },
+      nsMsgFolderFlags: { Drafts: 0x400 },
+      nsIMsgCompType: { Draft: 9 },
+      nsIMsgCompFormat: { Default: 0 },
+    },
     MailServices: {
+      accounts: { getFirstIdentityForServer: () => ({ key: "id1" }) },
+      compose: {
+        OpenComposeWindow(...args) {
+          composeCalls.push(args);
+          if (!composeOpens) return;
+          gui.drafts.push(args[1]);
+          gui.addComposeWindow({ draft: args[1], subject: args[1].mime2DecodedSubject });
+        },
+      },
       messageServiceFromURI: () => ({
         messageURIToMsgHdr: (uri) => {
           assert.doesNotMatch(uri, /\?/, "the query is stripped before the lookup");
@@ -215,5 +241,58 @@ describe("closeViewsShowingMessages", () => {
 
     assert.deepStrictEqual(closed, ["tab:7:2", "window:100"]);
     assert.deepStrictEqual(gui.tabmail.tabInfo.map(t => t.tabId), [0, 1, 3]);
+  });
+});
+
+describe("editDraft", () => {
+  function draftFolder() {
+    return { ...DRAFTS, getFlag: (flag) => flag === 0x400, getUriForMsg: (m) => `imap-message://${DRAFTS.URI}#${m.messageKey}` };
+  }
+
+  it("opens the draft in a compose window and reports the window read back", async () => {
+    const draft = hdr("d@x", draftFolder(), 9);
+    const gui = makeGui();
+    const api = loadViews(gui, { messages: [draft] });
+    const result = plain(await api.editDraft("d@x", DRAFTS.URI));
+
+    assert.deepStrictEqual(result, { success: true, viewId: "compose:100", draftMessageId: "d@x" });
+    assert.equal(api.composeCalls.length, 1);
+    const [, origHdr, uri, type, format, identity] = api.composeCalls[0];
+    assert.equal(origHdr, draft);
+    assert.equal(uri, `imap-message://${DRAFTS.URI}#9`);
+    assert.equal(type, 9);
+    assert.equal(format, 0);
+    assert.equal(identity.key, "id1");
+  });
+
+  it("focuses a compose window already editing the draft instead of opening another", async () => {
+    const draft = hdr("d@x", draftFolder(), 9);
+    const gui = makeGui({ composeWindows: [{ draft, subject: "Draft" }] });
+    const api = loadViews(gui, { messages: [draft] });
+    const result = plain(await api.editDraft("d@x", DRAFTS.URI));
+
+    assert.equal(result.alreadyOpen, true);
+    assert.equal(result.viewId, "compose:100");
+    assert.equal(api.composeCalls.length, 0);
+    assert.equal(gui.windows.msgcompose[0].focused, 1);
+  });
+
+  it("reports an unconfirmed state when no compose window appears", async () => {
+    const draft = hdr("d@x", draftFolder(), 9);
+    const api = loadViews(makeGui(), { messages: [draft], composeOpens: false });
+    const result = await api.editDraft("d@x", DRAFTS.URI);
+    assert.match(result.error, /No compose window .* unconfirmed/);
+  });
+
+  it("refuses messages outside a Drafts folder and encrypted drafts", async () => {
+    const inbox = { ...OPEN, getFlag: () => false };
+    const notDraft = hdr("m@x", inbox, 1);
+    const encrypted = { ...hdr("e@x", draftFolder(), 2), encrypted: true };
+    const api = loadViews(makeGui(), { messages: [notDraft, encrypted] });
+
+    assert.match((await api.editDraft("m@x", OPEN.URI)).error, /Drafts flag only/);
+    assert.match((await api.editDraft("e@x", DRAFTS.URI)).error, /Encrypted messages/);
+    assert.match((await api.editDraft("missing@x", DRAFTS.URI)).error, /Message not found/);
+    assert.equal(api.composeCalls.length, 0);
   });
 });
