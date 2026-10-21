@@ -163,11 +163,19 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   Fixed in `2cef933` (sync re-issued every 3 s for up to 30 s); re-run:
   confirmed sync, predecessor present, moved to Trash, verified gone,
   "Draft replaced" in 3.2 s. Drafts back to the pre-test total (183).
-  Still not run live: 7 (needs saveMessage enabled in the bridge env and a
-  large IMAP message without offline copy). The deleteMessages finding below
-  did not reproduce with one draft (n=1).
+  7 LIVE (bridge started like pbs-mail-poll, scratch SAVE_ROOT): the 15.2 MB
+  incident message saved as emlCompleteness "verified", byte-identical to
+  the poll's complete intake copy, Python parser: 6 parts, no defects. Its
+  offline copy is complete by now, so the server-fetch branch of
+  getMessage(rawSource) ran in mocks only -- an in-progress download cannot
+  be produced on demand.
 
 ## 2026-10-21 -- deleteMessages reports success before an IMAP move to Trash has happened
+
+- **Disposition: DROPPED 2026-10-21** -- not reproduced live on build
+  `0d14dfe`: deleting one draft (152 -> 151) and three drafts in one call
+  (151 -> 148) gave count = listing immediately, twice in a row. The two code
+  causes of the original 13-vs-7 are fixed in `5913b9f`.
 
 - **Incident + basis:** derived while fixing point 8 above (countOnly 13 vs
   listing 7 right after a delete), not measured. `deleteMessages` on a Drafts
