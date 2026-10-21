@@ -1307,6 +1307,8 @@ const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
 const SEARCH_YIELD_EVERY = 250;
 const SEARCH_TIME_BUDGET_MS = 20000;
+// A folder-scoped search waits this long for the folder's IMAP sync first.
+const SEARCH_SYNC_TIMEOUT_MS = 5000;
 const DEFAULT_GET_MESSAGES_LIMIT = 10;
 // 20 is a reasonable upper bound for now; adjust later if usage supports it.
 const MAX_GET_MESSAGES_LIMIT = 20;
@@ -2302,7 +2304,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
             tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
             includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
-            countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries." },
+            countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries. Counts exactly the rows a listing would return; with folderPath, both first wait up to 5 seconds for that folder's IMAP sync." },
             searchBody: { type: "boolean", description: "If true, search full message bodies using Thunderbird's Gloda index (slower but finds text beyond the ~200 char preview). Requires query. IMAP accounts need offline sync enabled for body indexing. Gloda supplies relevance-limited candidates without a completeness indicator; object responses report truncated:true. Without offset, message results remain a plain array without completeness information. Narrow the text query; use header search when header/preview matching is sufficient." },
             dedupByMessageId: { type: "boolean", description: "If false, return every folder/label location for messages found in multiple folders. Default: true, which collapses the same RFC Message-ID into one row and lists the other folder paths in dupLocations." },
           },
@@ -3428,7 +3430,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 ? dedupeSearchMessageResults(accessibleResults) : accessibleResults;
               let response;
               if (countOnly) {
-                response = { count: finalResults.length };
+                // Count exactly what a listing would return: the same per-row
+                // recheck as the page hydration below, over every row.
+                let count = 0;
+                for (const row of finalResults) {
+                  try {
+                    const msgHdr = getSearchHeader(folders.get(row.folderPath).msgDatabase, row._messageKey);
+                    if (msgHdr && msgHdr.messageId === row.id && !(msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
+                      count++;
+                      continue;
+                    }
+                  } catch { /* gone with its database: not counted */ }
+                  scan.truncated = true;
+                }
+                response = { count };
               } else {
                 finalResults.sort((a, b) => sortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
                 response = paginate(finalResults, offset, effectiveLimit);
@@ -3733,6 +3748,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
             }
+
+            // BEGIN FOLDER SYNC HELPER
+            /**
+             * Brings an IMAP folder's database up to date with the server.
+             * Resolves true once Thunderbird reports the update done, false on
+             * failure or timeout. Same listener as MailUtils.updateFolderAsync
+             * (not available on every supported Thunderbird), plus a timeout so
+             * an update that never reports back cannot hang the tool call.
+             * Local folders resolve at once: their database is the store.
+             */
+            function syncFolderDatabase(folder, timeoutMs) {
+              if (folder?.server?.type !== "imap") return Promise.resolve(true);
+              return new Promise((resolve) => {
+                let settled = false;
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                const settle = (ok) => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer.cancel(); } catch { /* already fired */ }
+                  resolve(ok);
+                };
+                timer.initWithCallback({ notify: () => settle(false) }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                try {
+                  folder.updateFolderWithListener(null, {
+                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(_url, status) { settle(Components.isSuccessCode(status)); },
+                  });
+                } catch {
+                  settle(false);
+                }
+              });
+            }
+            // END FOLDER SYNC HELPER
 
             function toColumnarTable(items, keys) {
               const columns = Array.from(keys).sort();
@@ -6057,6 +6106,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               let visitedFolders = 0;
+              let syncedFolder = null;
               async function searchFolder(folder) {
                 if (visitedFolders++ > 0) {
                   await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
@@ -6065,7 +6115,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!isFolderAccessible(folder)) { scan.truncated = true; return; }
 
                 try {
-                  refreshImapFolderSync(folder);
+                  if (folder !== syncedFolder) refreshImapFolderSync(folder);
                   if (!folder.isServer) {
                     // Snapshot primitive keys. A native database enumerator cannot
                     // safely survive event-loop yields or database closure/rebuild.
@@ -6117,6 +6167,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (folderPath) {
                 const result = getAccessibleFolder(folderPath);
                 if (result.error) return result;
+                // A started refresh lands after the scan, so a count taken right
+                // after a change could still see the old folder. Wait for the
+                // named folder's sync (bounded); subfolders keep the cheap refresh.
+                if (await syncFolderDatabase(result.folder, SEARCH_SYNC_TIMEOUT_MS)) syncedFolder = result.folder;
                 await searchFolder(result.folder);
               } else {
                 for (const account of getAccessibleAccounts()) {
@@ -10408,38 +10462,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const DRAFT_SYNC_TIMEOUT_MS = 15000;
             const DRAFT_MOVE_TIMEOUT_MS = 30000;
 
-            /**
-             * Brings an IMAP folder's database up to date with the server.
-             * Resolves true once Thunderbird reports the update done, false on
-             * failure or timeout. Same listener as MailUtils.updateFolderAsync
-             * (not available on every supported Thunderbird), plus a timeout so
-             * an update that never reports back cannot hang the tool call.
-             * Local folders resolve at once: their database is the store.
-             */
-            function syncFolderDatabase(folder, timeoutMs = DRAFT_SYNC_TIMEOUT_MS) {
-              if (folder?.server?.type !== "imap") return Promise.resolve(true);
-              return new Promise((resolve) => {
-                let settled = false;
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                const settle = (ok) => {
-                  if (settled) return;
-                  settled = true;
-                  try { timer.cancel(); } catch { /* already fired */ }
-                  resolve(ok);
-                };
-                timer.initWithCallback({ notify: () => settle(false) }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
-                try {
-                  folder.updateFolderWithListener(null, {
-                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
-                    OnStartRunningUrl() {},
-                    OnStopRunningUrl(_url, status) { settle(Components.isSuccessCode(status)); },
-                  });
-                } catch {
-                  settle(false);
-                }
-              });
-            }
-
             // "present", "marked-deleted" (IMAP \Deleted, awaiting expunge) or "gone".
             function getStoredMessageState(folder, messageKey, messageId) {
               let hdr = null;
@@ -10503,7 +10525,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             async function verifyDraftReplacement(folder, oldKey, oldMessageId, newMessageId) {
               const report = {};
-              if (!(await syncFolderDatabase(folder))) report.folderSyncConfirmed = false;
+              if (!(await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS))) report.folderSyncConfirmed = false;
               const newHdr = findStoredMessage(folder, newMessageId);
               let previous = getStoredMessageState(folder, oldKey, oldMessageId);
               if (!newHdr) {
@@ -10514,7 +10536,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               if (previous === "present") {
                 await moveDraftToTrash(folder, folder.msgDatabase.getMsgHdrForKey(oldKey));
-                await syncFolderDatabase(folder);
+                await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS);
                 previous = getStoredMessageState(folder, oldKey, oldMessageId);
                 report.previousDraftMovedToTrash = previous !== "present";
               }

@@ -150,7 +150,7 @@ function loadDraftTools(options = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
-    snippet("DRAFT HELPERS"), snippet("DRAFT REPLACE VERIFICATION"), snippet("SAVE DRAFT TOOL"),
+    snippet("FOLDER SYNC HELPER"), snippet("DRAFT HELPERS"), snippet("DRAFT REPLACE VERIFICATION"), snippet("SAVE DRAFT TOOL"),
     snippet("DIRECT SEND HELPER"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
   return {
