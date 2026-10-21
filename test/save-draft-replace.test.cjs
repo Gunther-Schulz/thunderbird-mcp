@@ -13,8 +13,45 @@ const Ci = {
   nsIMsgCompType: { New: 0, Draft: 9 },
   nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 4 },
   nsMsgFolderFlags: { Drafts: 0x400 },
+  nsMsgMessageFlags: { IMAPDeleted: 0x200000 },
   nsITimer: { TYPE_ONE_SHOT: 0 },
 };
+const NEW_DRAFT_ID = "new-draft-id@example.test";
+
+/**
+ * An IMAP Drafts folder whose local database catches up with the server only
+ * on updateFolderWithListener, as Thunderbird's does. serverEffects says what
+ * saving the new draft did on the server: store it (newStored) and what
+ * happened to the replaced draft ("expunged", "marked-deleted", "kept").
+ */
+function makeImapDrafts(calls, { newStored = true, oldOnServer = "expunged", moveRemovesOld = true, syncStatus = 0 } = {}) {
+  const local = new Map();
+  const server = new Map();
+  const folder = {
+    URI: DRAFTS_URI,
+    server: { type: "imap" },
+    getFlag(flag) { calls.flags.push(flag); return true; },
+    msgDatabase: {
+      containsKey: (key) => local.has(key),
+      getMsgHdrForKey: (key) => local.get(key) || null,
+      getMsgHdrForMessageID: (id) => [...local.values()].find(h => h.messageId === id) || null,
+    },
+    updateFolderWithListener(_window, listener) {
+      calls.syncs++;
+      local.clear();
+      for (const [key, h] of server) local.set(key, { ...h });
+      listener.OnStopRunningUrl(null, syncStatus);
+    },
+    store(hdr) { local.set(hdr.messageKey, hdr); server.set(hdr.messageKey, { ...hdr }); },
+    applySave() {
+      if (newStored) server.set(2, { messageKey: 2, messageId: NEW_DRAFT_ID, flags: 0 });
+      if (oldOnServer === "expunged") server.delete(1);
+      if (oldOnServer === "marked-deleted") server.get(1).flags |= Ci.nsMsgMessageFlags.IMAPDeleted;
+    },
+    applyMove(key) { if (moveRemovesOld) server.delete(key); },
+  };
+  return folder;
+}
 
 // Same source-marker sandbox pattern as privacy-messages.test.cjs. The complete
 // saveDraft -> sendMessageDirectly path runs, including modern/legacy send slots.
@@ -26,15 +63,13 @@ function snippet(name) {
 }
 
 function loadDraftTools(options = {}) {
-  const calls = { finds: [], accessible: [], flags: [], sends: [], attachments: [], bodies: [], timerCancels: 0 };
-  const folder = options.folder || {
-    URI: DRAFTS_URI,
-    getFlag(flag) { calls.flags.push(flag); return options.draftsFlag !== false; },
-  };
+  const calls = { finds: [], accessible: [], flags: [], sends: [], attachments: [], bodies: [], timerCancels: 0, syncs: 0, moves: [], closedViewsFor: [] };
+  const folder = options.folder || makeImapDrafts(calls, options.store);
   const hdr = {
-    messageId: "old-draft-id", subject: "Old subject", recipients: "old@example.test",
+    messageId: "old-draft-id", messageKey: 1, flags: 0, subject: "Old subject", recipients: "old@example.test",
     folder: Object.hasOwn(options, "headerFolder") ? options.headerFolder : folder,
   };
+  if (folder.store) folder.store(hdr);
   const identity = Object.hasOwn(options, "identity") ? options.identity : {
     key: "identity-1", email: "sender@example.test", fullName: "Sender", draftFolder: DRAFTS_URI,
   };
@@ -43,7 +78,16 @@ function loadDraftTools(options = {}) {
     Ci,
     Components: { isSuccessCode: status => status === 0 },
     ChromeUtils: { generateQI: () => () => {} },
-    MailServices: { accounts: { accounts: [{ key: "account-1", identities: [identity] }] } },
+    MailServices: {
+      accounts: { accounts: [{ key: "account-1", identities: [identity] }] },
+      copy: {
+        copyMessages(source, hdrs, destination, isMove, listener) {
+          calls.moves.push({ source, keys: hdrs.map(h => h.messageKey), destination, isMove });
+          source.applyMove(hdrs[0].messageKey);
+          listener.onStopCopy(0);
+        },
+      },
+    },
     console,
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
@@ -62,10 +106,19 @@ function loadDraftTools(options = {}) {
             throw Object.assign(new Error("Not enough arguments"), { result: 0x80570001 });
           }
           const listener = args[args.length === 16 ? 12 : 14];
+          // Like MimeMessage._gatherMimeHeaders, the send writes the
+          // generated Message-ID back into the fields it was given.
+          args[3].messageId = `<${NEW_DRAFT_ID}>`;
+          if (folder.applySave) folder.applySave();
           listener.onStopCopy(0);
         },
       }) },
     },
+    closeViewsShowingMessages(msgHdrs) {
+      calls.closedViewsFor.push(msgHdrs);
+      return options.openViewIds || [];
+    },
+    findTrashFolder: () => (options.noTrash ? null : { URI: "imap://user@example.test/Trash" }),
     findMessage(messageId, folderPath) {
       calls.finds.push({ messageId, folderPath });
       if (options.findThrows) throw options.findThrows;
@@ -97,7 +150,7 @@ function loadDraftTools(options = {}) {
   };
   vm.createContext(sandbox);
   vm.runInContext([
-    snippet("DRAFT HELPERS"), snippet("SAVE DRAFT TOOL"),
+    snippet("DRAFT HELPERS"), snippet("DRAFT REPLACE VERIFICATION"), snippet("SAVE DRAFT TOOL"),
     snippet("DIRECT SEND HELPER"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
   return {
@@ -116,6 +169,80 @@ function assertNoComposeSideEffects(calls) {
   assert.equal(calls.attachments.length, 0, "must reject before attachment processing");
   assert.equal(calls.bodies.length, 0, "must reject before reading or appending a signature");
 }
+
+describe("saveDraft replacement is proven in the Drafts folder", () => {
+  it("reports replaced only once the new draft is stored and the old one is gone", async () => {
+    const { save, calls, hdr } = loadDraftTools({ openViewIds: ["tab:1:3"] });
+    const result = await save();
+    assert.equal(result.success, true);
+    assert.equal(result.message, "Draft replaced");
+    assert.equal(result.messageId, NEW_DRAFT_ID);
+    assert.equal(result.replaceVerified, true);
+    assert.equal(result.previousDraft, "gone");
+    assert.equal(result.previousDraftMovedToTrash, undefined);
+    assert.equal(calls.moves.length, 0);
+    assert.equal(calls.syncs, 1);
+    assert.equal(calls.closedViewsFor[0][0], hdr);
+    assert.deepEqual([...result.closedViews], ["tab:1:3"]);
+  });
+
+  it("moves a predecessor Thunderbird left in place to Trash and says so", async () => {
+    const { save, calls } = loadDraftTools({ store: { oldOnServer: "kept" } });
+    const result = await save();
+    assert.equal(result.success, true);
+    assert.equal(result.replaceVerified, true);
+    assert.equal(result.previousDraft, "gone");
+    assert.equal(result.previousDraftMovedToTrash, true);
+    assert.match(result.message, /left the previous draft in place, so it was moved to Trash/);
+    assert.deepEqual(JSON.parse(JSON.stringify(calls.moves.map(m => ({ keys: m.keys, isMove: m.isMove, to: m.destination.URI })))),
+      [{ keys: [1], isMove: true, to: "imap://user@example.test/Trash" }]);
+  });
+
+  it("never touches the predecessor while the new draft is not confirmed", async () => {
+    const { save, calls } = loadDraftTools({ store: { newStored: false, oldOnServer: "kept" } });
+    const result = await save();
+    assert.equal(result.success, true, "the save itself was reported done by Thunderbird");
+    assert.equal(result.replaceVerified, false);
+    assert.equal(result.previousDraft, "present");
+    assert.match(result.message, /new draft was not found .* previous draft was left untouched/);
+    assert.doesNotMatch(result.message, /replaced/);
+    assert.equal(calls.moves.length, 0);
+  });
+
+  it("reports a predecessor that is only marked deleted without moving it", async () => {
+    const { save, calls } = loadDraftTools({ store: { oldOnServer: "marked-deleted" } });
+    const result = await save();
+    assert.equal(result.replaceVerified, true);
+    assert.equal(result.previousDraft, "marked-deleted");
+    assert.match(result.message, /marked deleted/);
+    assert.equal(calls.moves.length, 0);
+  });
+
+  it("does not claim a replacement when the predecessor survives the move", async () => {
+    const { save } = loadDraftTools({ store: { oldOnServer: "kept", moveRemovesOld: false } });
+    const result = await save();
+    assert.equal(result.success, true);
+    assert.equal(result.replaceVerified, false);
+    assert.equal(result.previousDraft, "present");
+    assert.match(result.message, /still in the Drafts folder/);
+  });
+
+  it("flags an unconfirmed folder sync", async () => {
+    const { save } = loadDraftTools({ store: { syncStatus: 0x80004005 } });
+    const result = await save();
+    assert.equal(result.folderSyncConfirmed, false);
+  });
+
+  it("reports the new draft's Message-ID for plain saves without syncing", async () => {
+    const { save, calls } = loadDraftTools();
+    const result = await save({ replaceMessageId: undefined, replaceFolderPath: undefined });
+    assert.equal(result.message, "Draft saved");
+    assert.equal(result.messageId, NEW_DRAFT_ID);
+    assert.equal(result.replaceVerified, undefined);
+    assert.equal(calls.syncs, 0);
+    assert.equal(calls.closedViewsFor.length, 0);
+  });
+});
 
 describe("saveDraft replacement", () => {
   for (const legacy of [false, true]) {
@@ -140,7 +267,8 @@ describe("saveDraft replacement", () => {
       assert.equal(args[9], "New body");
       assert.equal(args.at(-1), Ci.nsIMsgCompType.Draft);
       assert.equal(calls.bodies[0].includeSignature, false);
-      assert.equal(calls.timerCancels, 1);
+      // The send timeout, then the Drafts sync of the replacement check.
+      assert.equal(calls.timerCancels, 2);
     });
   }
 

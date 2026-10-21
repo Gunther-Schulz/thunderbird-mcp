@@ -109,6 +109,7 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
     descsToMsgAttachments: () => [],
     getAccessibleFolder: () => ({ folder }),
     findMessage: () => ({ folder, msgHdr: { folder } }),
+    closeViewsShowingMessages: () => [],
     isSkipReviewBlocked: () => options.blocked === true,
     sendMessageDirectly: async (fields, _identity, _descs, _uri, compType, deliverMode) => {
       calls.sends.push({ fields, compType, deliverMode });
