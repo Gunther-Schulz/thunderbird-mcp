@@ -3757,9 +3757,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * (not available on every supported Thunderbird), plus a timeout so
              * an update that never reports back cannot hang the tool call.
              * Local folders resolve at once: their database is the store.
+             *
+             * With attemptMs below timeoutMs the request is re-issued after each
+             * unanswered attempt: right after a draft save Thunderbird answers no
+             * update request for about ten seconds, and a request made in that
+             * window is never answered at all (measured live on IMAP 2026-10-21:
+             * two requests unanswered at t+0 s and t+5 s, the next answered in
+             * 0.04 s at t+10 s). A single long wait would never see an answer.
              */
-            function syncFolderDatabase(folder, timeoutMs) {
-              if (folder?.server?.type !== "imap") return Promise.resolve(true);
+            async function syncFolderDatabase(folder, timeoutMs, attemptMs = timeoutMs) {
+              if (folder?.server?.type !== "imap") return true;
+              for (let remaining = timeoutMs; remaining > 0; remaining -= attemptMs) {
+                if (await requestFolderUpdate(folder, Math.min(attemptMs, remaining))) return true;
+              }
+              return false;
+            }
+
+            function requestFolderUpdate(folder, timeoutMs) {
               return new Promise((resolve) => {
                 let settled = false;
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -10534,7 +10548,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END DRAFT HELPERS
 
             // BEGIN DRAFT REPLACE VERIFICATION
-            const DRAFT_SYNC_TIMEOUT_MS = 15000;
+            // Re-issued every 3 s for up to 30 s: see syncFolderDatabase.
+            const DRAFT_SYNC_TIMEOUT_MS = 30000;
+            const DRAFT_SYNC_ATTEMPT_MS = 3000;
             const DRAFT_MOVE_TIMEOUT_MS = 30000;
 
             // Where the replaced draft stands now: { state, hdr }. state is
@@ -10613,7 +10629,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             async function verifyDraftReplacement(folder, oldKey, oldMessageId, newMessageId) {
               const report = {};
-              const synced = await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS);
+              const synced = await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS, DRAFT_SYNC_ATTEMPT_MS);
               if (!synced) report.folderSyncConfirmed = false;
               const newHdr = findStoredMessage(folder, newMessageId);
               let previous = readStoredMessage(folder, oldKey, oldMessageId);
@@ -10629,7 +10645,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               if (previous.state === "present") {
                 const route = await moveDraftToTrash(folder, previous.hdr);
-                if (!(await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS))) report.folderSyncConfirmed = false;
+                if (!(await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS, DRAFT_SYNC_ATTEMPT_MS))) report.folderSyncConfirmed = false;
                 previous = readStoredMessage(folder, oldKey, oldMessageId);
                 if (route === "trash" && previous.state === "gone" && report.folderSyncConfirmed !== false) {
                   report.previousDraftMovedToTrash = true;

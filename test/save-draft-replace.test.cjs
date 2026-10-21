@@ -24,7 +24,7 @@ const NEW_DRAFT_ID = "new-draft-id@example.test";
  * saving the new draft did on the server: store it (newStored) and what
  * happened to the replaced draft ("expunged", "marked-deleted", "kept").
  */
-function makeImapDrafts(calls, { newStored = true, oldOnServer = "expunged", moveRemovesOld = true, syncStatus = 0, syncStatuses = null, dbThrowsAfterSyncs = null } = {}) {
+function makeImapDrafts(calls, { newStored = true, oldOnServer = "expunged", moveRemovesOld = true, syncStatus = 0, syncStatuses = null, dbThrowsAfterSyncs = null, droppedSyncs = 0 } = {}) {
   const local = new Map();
   const server = new Map();
   let syncCount = 0;
@@ -43,6 +43,8 @@ function makeImapDrafts(calls, { newStored = true, oldOnServer = "expunged", mov
     },
     updateFolderWithListener(_window, listener) {
       calls.syncs++;
+      // Measured live: requests right after a save are never answered.
+      if (calls.syncs <= droppedSyncs) return;
       const status = syncStatuses ? syncStatuses[syncCount] ?? 0 : syncStatus;
       syncCount++;
       if (status === 0) {
@@ -116,9 +118,18 @@ function loadDraftTools(options = {}) {
         setHeader(name, value) { this.headers.set(name, value); },
         addAttachment(value) { this.attachments.push(value); },
       }) },
-      "@mozilla.org/timer;1": { createInstance: () => ({
-        initWithCallback() {}, cancel() { calls.timerCancels++; },
-      }) },
+      "@mozilla.org/timer;1": { createInstance: () => {
+        const timer = {
+          cancelled: false,
+          // With timersFire, a one-shot timer fires on the next turn unless
+          // cancelled first; otherwise timers never fire.
+          initWithCallback(callback) {
+            if (options.timersFire) setImmediate(() => { if (!timer.cancelled) callback.notify(); });
+          },
+          cancel() { timer.cancelled = true; calls.timerCancels++; },
+        };
+        return timer;
+      } },
       "@mozilla.org/messengercompose/send;1": { createInstance: () => ({
         createAndSendMessage(...args) {
           calls.sends.push(args);
@@ -257,6 +268,25 @@ describe("saveDraft replacement is proven in the Drafts folder", () => {
     assert.equal(calls.moves.length, 0);
   });
 
+  it("re-issues the sync request until one is answered, then proves and completes the replacement", async () => {
+    const { save, calls } = loadDraftTools({ timersFire: true, store: { oldOnServer: "kept", droppedSyncs: 3 } });
+    const result = await save();
+    assert.equal(calls.syncs, 5, "three dropped requests, one answered before the check, one after the move");
+    assert.equal(result.folderSyncConfirmed, undefined);
+    assert.equal(result.previousDraftMovedToTrash, true);
+    assert.equal(result.replaceVerified, true);
+    assert.equal(calls.moves.length, 1);
+  });
+
+  it("gives up after its budget when no request is ever answered", async () => {
+    const { save, calls } = loadDraftTools({ timersFire: true, store: { oldOnServer: "kept", droppedSyncs: 1000 } });
+    const result = await save();
+    assert.equal(calls.syncs, 10, "30 s budget in 3 s attempts");
+    assert.equal(result.folderSyncConfirmed, false);
+    assert.equal(result.replaceVerified, false);
+    assert.equal(calls.moves.length, 0);
+  });
+
   it("does not report a move to Trash when, without a Trash folder, the draft was only marked deleted", async () => {
     const { save, calls } = loadDraftTools({ noTrash: true, store: { oldOnServer: "kept" } });
     const result = await save();
@@ -284,8 +314,8 @@ describe("saveDraft replacement is proven in the Drafts folder", () => {
     assert.equal(result.replaceVerified, true);
   });
 
-  it("does not confirm a move whose follow-up sync failed", async () => {
-    const { save } = loadDraftTools({ store: { oldOnServer: "kept", syncStatuses: [0, 0x80004005] } });
+  it("does not confirm a move whose follow-up sync fails on every attempt", async () => {
+    const { save } = loadDraftTools({ store: { oldOnServer: "kept", syncStatuses: [0, ...Array(10).fill(0x80004005)] } });
     const result = await save();
     assert.equal(result.folderSyncConfirmed, false);
     assert.equal(result.replaceVerified, false);

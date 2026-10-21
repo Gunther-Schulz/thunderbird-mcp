@@ -1713,9 +1713,9 @@ const MAIL_OPERATION_TIMEOUT = 150000;
 // 120 s (RAW_SERVER_FETCH_TIMEOUT_MS) before getMessage(rawSource) answers.
 const RAW_SOURCE_TIMEOUT = 150000;
 // A replacing saveDraft adds its Drafts check to the 120 s save: two folder
-// syncs of up to 15 s and a move of up to 30 s (DRAFT_SYNC_TIMEOUT_MS,
-// DRAFT_MOVE_TIMEOUT_MS) -- 180 s at most, plus margin.
-const DRAFT_REPLACE_TIMEOUT = 210000;
+// syncs of up to 30 s and a move of up to 30 s (DRAFT_SYNC_TIMEOUT_MS,
+// DRAFT_MOVE_TIMEOUT_MS) -- 210 s at most, plus margin.
+const DRAFT_REPLACE_TIMEOUT = 240000;
 
 function getThunderbirdRequestPolicy(message) {
   let checkFolders = null;

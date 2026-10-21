@@ -182,7 +182,7 @@ describe('bridge request outcomes', () => {
     ['getMessage', { rawSource: true }, 150],
     ['getMessage', { rawSource: 'true' }, 150],
     ['getMessages', { rawSource: true }, 150],
-    ['saveDraft', { replaceMessageId: 'old@example.test' }, 210],
+    ['saveDraft', { replaceMessageId: 'old@example.test' }, 240],
   ]) {
     it(`${name} ${JSON.stringify(args)} outlasts the extension's own budget (${seconds} s)`, async () => {
       const { runtime, requests } = loadRequests();
