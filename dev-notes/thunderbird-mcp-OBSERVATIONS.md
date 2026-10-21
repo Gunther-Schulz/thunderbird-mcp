@@ -150,9 +150,22 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   `eb1ea68` (bridge timeouts 150/210 s; early closing boundary refused).
   Residual, inferred: Thunderbird's own removal of the old draft may still be
   in flight when the replace check starts -- worst case a duplicate in Trash.
-  OPEN until the live pairs ran (operator install + NEW session): per GUI verb
-  one pair; for 6 the field `previousDraft` (gone / marked-deleted / present)
-  settles WHY the predecessor survived on Kasserver.
+  LIVE (2026-10-21, Betterbird 153.3.0esr-bb9, Kasserver IMAP, test drafts
+  `LIVE-120037 *` only, via `scripts/tb-rpc.cjs`): 1-5 and 8 pass -- listTabs
+  shows the operator's tabs; displayMessage read-back returns the requested
+  id; closeTabs(messageId) closed only the test tab; editDraft opened the
+  compose window and a repeat only focused it; deleteMessages closed the
+  test tab (gone, no tab left on another id) and count = listing at once
+  (152 -> 151). 6 first FAILED honestly: Thunderbird does NOT remove the
+  replaced draft on this account (2 of 2), and the check's single 15 s sync
+  was never answered -- update requests within ~10 s after a save are
+  dropped (probe: t+0 s and t+5 s unanswered, t+10 s answered in 0.04 s).
+  Fixed in `2cef933` (sync re-issued every 3 s for up to 30 s); re-run:
+  confirmed sync, predecessor present, moved to Trash, verified gone,
+  "Draft replaced" in 3.2 s. Drafts back to the pre-test total (183).
+  Still not run live: 7 (needs saveMessage enabled in the bridge env and a
+  large IMAP message without offline copy). The deleteMessages finding below
+  did not reproduce with one draft (n=1).
 
 ## 2026-10-21 -- deleteMessages reports success before an IMAP move to Trash has happened
 
