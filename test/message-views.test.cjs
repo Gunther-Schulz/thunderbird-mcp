@@ -204,15 +204,17 @@ describe("closeTabs", () => {
 
   it("closes by id and explains every id it did not close", async () => {
     const gui = makeGui({ messageTabs: [hdr("a@x", OPEN, 1), hdr("s@x", RESTRICTED, 2)], composeWindows: [{ subject: "x" }] });
-    const result = plain(await loadViews(gui).closeTabs(["tab:7:1", "tab:7:0", "tab:7:2", "compose:100", "tab:9:9"]));
+    const result = plain(await loadViews(gui).closeTabs(["tab:7:1", "tab:7:0", "tab:7:2", "tab:7:3", "compose:100", "tab:9:9"]));
 
     assert.deepStrictEqual(result.closed, ["tab:7:1"]);
     assert.deepStrictEqual(result.skipped, [
       { id: "tab:7:0", reason: "tab cannot be closed" },
       { id: "tab:7:2", reason: "account not accessible" },
+      { id: "tab:7:3", reason: "only mail tabs and message windows are closed by this tool" },
       { id: "compose:100", reason: "compose windows are not closed by this tool" },
       { id: "tab:9:9", reason: "not found" },
     ]);
+    assert.ok(gui.tabmail.tabInfo.some(t => t.mode.name === "calendar"), "the calendar tab stays open");
   });
 
   it("reports a view that is still open after closing as stillOpen, never as closed", async () => {

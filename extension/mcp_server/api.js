@@ -2791,7 +2791,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "displayMessage",
         group: "messages", crud: "read",
         title: "Display Message",
-        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window. The opened view is read back: success means it shows the requested message (displayedMessageId); a view showing another message, or none within 5 seconds, is an error. Encrypted messages are refused unless encrypted message access is enabled in the extension options.",
+        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window. The opened view is read back: success means the view holds the requested message (displayedMessageId); a view holding another message, or none within 5 seconds, is an error. Whether the message body finished rendering is not checked. Encrypted messages are refused unless encrypted message access is enabled in the extension options.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2813,7 +2813,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "closeTabs",
         group: "messages", crud: "update",
         title: "Close Tabs",
-        description: "Close message tabs and windows, either by view id (from listTabs) or every message tab/window showing a messageId. Folder tabs are only closed by id; compose windows are never closed by this tool. Closing is read back: ids still open afterwards are reported in stillOpen.",
+        description: "Close message tabs and windows, either by view id (from listTabs) or every message tab/window showing a messageId. Folder tabs are only closed by id. Other tabs (calendar, address book, web content) and compose windows are never closed by this tool: they can hold unsaved input. Closing is read back: ids still open afterwards are reported in stillOpen.",
         inputSchema: {
           type: "object",
           properties: {
@@ -11457,8 +11457,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             /**
              * Closes views by id, or every message tab/window showing messageId.
-             * Compose windows are never closed here: closing one can raise a
-             * save prompt. Closing is read back: an id still present after the
+             * Only mail tabs and message windows: compose windows can raise a
+             * save prompt, and other tabs can drop unsaved input silently. Closing is read back: an id still present after the
              * wait is reported in stillOpen, never as closed.
              */
             async function closeTabs(viewIds, messageId, folderPath) {
@@ -11487,6 +11487,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (!view) { skipped.push({ id, reason: "not found" }); continue; }
                     if (describeMessageView(view).restricted) { skipped.push({ id, reason: "account not accessible" }); continue; }
                     if (view.kind === "compose") { skipped.push({ id, reason: "compose windows are not closed by this tool" }); continue; }
+                    // Other tab types can hold unsaved input (an address book
+                    // edit closes without a prompt), and are not mail views.
+                    if (view.kind === "tab" && view.mode !== "mailMessageTab" && view.mode !== "mail3PaneTab") {
+                      skipped.push({ id, reason: "only mail tabs and message windows are closed by this tool" });
+                      continue;
+                    }
                     if (view.kind === "tab" && !view.tab.canClose) { skipped.push({ id, reason: "tab cannot be closed" }); continue; }
                     targets.push(view);
                   }
