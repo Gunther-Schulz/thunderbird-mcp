@@ -64,7 +64,10 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   Ordners, sobald der Entwurf gesendet oder gelöscht wird — ohne Meldung.
   Belegt mit vorab benannter Prognose: Test-Entwurf per `displayMessage`
   (tab) geöffnet, per `deleteMessages` gelöscht → der Tab zeigte danach den
-  Nachbar-Entwurf (Betreiber-Screenshot). Davor zweimal im Echtbetrieb: der
+  Nachbar-Entwurf (Betreiber-Screenshot); sauber wiederholt mit allen
+  Tabs geschlossen (Probe 2, gleicher Ausgang). Reichweite gemessen: NUR
+  der Tab der gelöschten Nachricht springt — zwei Test-Entwürfe A/B je im
+  eigenen Tab, A gelöscht, Tab B zeigte weiter B (Betreiber-Sicht). Davor zweimal im Echtbetrieb: der
   Tab des gesendeten Telekom-Entwurfs zeigte danach einen fremden
   Condor-Entwurf (session.json: dieselbe Tab-Position, `Drafts#3446`); am
   Vormittag zeigten mehrere Tabs fremde Mails, nachdem ihre Entwürfe per
