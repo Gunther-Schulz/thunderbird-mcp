@@ -163,6 +163,14 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   Fixed in `2cef933` (sync re-issued every 3 s for up to 30 s); re-run:
   confirmed sync, predecessor present, moved to Trash, verified gone,
   "Draft replaced" in 3.2 s. Drafts back to the pre-test total (183).
+  UPSTREAM PRs (2026-10-21, split from the fork work, each red-first and
+  suite-green on upstream v0.9.3): #256 listTabs/closeTabs/editDraft/
+  displayMessage read-back (points 1-5); #257 countOnly + scoped sync
+  (point 8); #258 complete raw source (point 7, extension); #259 verified
+  draft replacement (point 6), stacked on #256 + #257; #184 saveMessage
+  rebased per the maintainer's 2026-09-28 request, with the completeness
+  check (point 7, bridge). Fork-only and never upstream: update_url removal
+  `545519e`, dev-notes, scripts/tb-rpc.cjs, XPI builds.
   7 LIVE (bridge started like pbs-mail-poll, scratch SAVE_ROOT): the 15.2 MB
   incident message saved as emlCompleteness "verified", byte-identical to
   the poll's complete intake copy, Python parser: 6 parts, no defects. Its
