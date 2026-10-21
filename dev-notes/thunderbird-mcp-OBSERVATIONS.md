@@ -214,3 +214,28 @@ Entwürfe ab jetzt in Thunderbird-Tabs statt im Chat (pbs-office R10 Nr. 1).
   `5913b9f` build -- a count still including the draft indicts this path.
 - **Consumer/drain:** the next build session on this repo, after the live
   pairs of the entry above; drain by commit ref or a one-line drop.
+
+## 2026-10-21 -- saveDraft replace never confirms on the mail@guntherschulz.de account
+
+- **Incident + basis:** session `session_016Bp6Z4wB2egdnrJwgbiHnp`, build
+  installed as of 21.10. afternoon. `saveDraft` with `replaceMessageId` on
+  account mail@guntherschulz.de (Drafts
+  `imap://mail%40guntherschulz.de@w01c3d71.kasserver.com/Drafts`) returned
+  `folderSyncConfirmed:false, replaceVerified:false, previousDraft:"present"`
+  three times in a row (new ids f3954904…, 14e6f602…, fa4d33f7…); each time a
+  Drafts listing showed BOTH drafts, and the predecessor had to be removed with
+  `deleteMessages`. The same call on account mail@planungsbuero-schulz.de
+  returned `replaceVerified:true, previousDraftMovedToTrash:true` four of four
+  times the same day. The tool reported honestly -- no false success.
+- **Class:** account-dependent folder sync; the replace path is only as good as
+  the folder refresh it waits on.
+- **Pre-formulated fix:** first a discriminating probe: compare the two
+  accounts' Drafts folder flags and offline/sync settings (`folder.flags`,
+  `server.offlineDownload`, `folder.getFlag(Ci.nsMsgFolderFlags.Offline)`);
+  if the private account's Drafts is not offline-enabled, the refresh listener
+  never fires. Then either refresh via `updateFolderWithListener` with a
+  bounded retry, or, when the sync stays unconfirmed but the predecessor id is
+  known and still listed, delete it by id inside the tool and report
+  `previousDraftMovedToTrash` from that act.
+- **Consumer/drain:** the next build session on this repo; drain by commit ref
+  or a one-line drop.
